@@ -1,0 +1,947 @@
+---
+title: "LAD changes after H3K27me3 depletion"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+I have previously looked at LAD changes after the depletion experiments. Now I 
+want to make a few similar plots after H3K27me3 and a double depletion. 
+
+
+### Method
+
+Use LAD domains as defined previously. 
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(UpSetR))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(caTools))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(corrr))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(colorspace))
+suppressPackageStartupMessages(library(ggrastr))
+
+# Prepare output 
+output.dir <- "ts220121_LAD_changes_after_H3K27me3_depletion"
+dir.create(output.dir, showWarnings = FALSE)
+
+```
+
+Knitr setup.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, cache = T,
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output.dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+List functions.
+
+```{r functions}
+
+LoadDamID <- function(metadata, damid.dir, column = "file") {
+  
+  # Load data
+  tib <- purrr::reduce(lapply(1:nrow(metadata),
+                              function(i) {
+                                f <- metadata[i, ] %>% pull(column)
+                                s <- as.character(metadata$sample)[i]
+                                tmp <- read_tsv(file.path(damid.dir, f), 
+                                                col_names = c("seqnames", "start", "end", s))
+                              }),
+                       full_join)
+  
+  # Convert to GRanges
+  tib$start <- tib$start + 1
+  gr <- as(tib, "GRanges")
+  
+  # Filter chromosomes
+  gr <- gr[seqnames(gr) %in% c(paste0("chr", 1:22), "chrX")]
+  gr
+  
+}
+
+ScaleDamID <- function(damid) {
+  tib <- as_tibble(mcols(damid))
+  tib.scaled <- as_tibble(scale(tib))
+  mcols(damid) <- tib.scaled
+  damid
+}
+
+LADScores <- function(damid, gr, samples) {
+  # Calculate mean scores per LAD, given a LAD model
+  
+  # Find overlaps
+  ovl <- findOverlaps(damid, gr, select = "first")
+  
+  # Calculation
+  tib <- as_tibble(mcols(damid)) %>%
+    dplyr::select(samples) %>%
+    add_column(LAD = ovl) %>%
+    drop_na(LAD) %>%
+    group_by(LAD) %>%
+    summarise_all(mean, na.rm = T) %>%
+    dplyr::select(-LAD)
+  
+  mcols(gr) <- tib
+  gr
+  
+}
+
+# From Fede:
+# ggpairs custom functions
+corColor <- function(data, mapping, color = I("black"), sizeRange = c(1, 3), ...) {
+
+  x   <- eval_data_col(data, mapping$x)
+  y   <- eval_data_col(data, mapping$y)
+  r   <- cor(x, y)
+  rt  <- format(r, digits = 3)
+  tt  <- as.character(rt)
+  cex <- max(sizeRange)
+
+  # helper function to calculate a useable size
+  percent_of_range <- function(percent, range) {
+    percent * diff(range) + min(range, na.rm = TRUE)
+  }
+
+  # plot correlation coefficient
+  p <- ggally_text(label = tt, mapping = aes(), xP = 0.5, yP = 0.5,
+                   # size = I(percent_of_range(cex * abs(r), sizeRange)), 
+                   size = 6, 
+                   color = color, ...) +
+    theme(panel.grid.minor=element_blank(),
+          panel.grid.major=element_blank())
+
+  corColors <- RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")[2:6]
+
+  if (r <= boundaries[1]) {
+    corCol <- corColors[1]
+  } else if (r <= boundaries[2]) {
+    corCol <- corColors[2]
+  } else if (r < boundaries[3]) {
+    corCol <- corColors[3]
+  } else if (r < boundaries[4]) {
+    corCol <- corColors[4]
+  } else {
+    corCol <- corColors[5]
+  }
+
+  p <- p +
+    theme(panel.background = element_rect(fill = corCol))
+
+  return(p)
+}
+
+customScatter <- function (data, mapping) 
+{
+    p <- ggplot(data = data, mapping) + 
+      rasterize(geom_point(size = 0.25, alpha = 0.25),
+                dpi = 300) +
+      #geom_smooth(method = "lm", se = T, col = "red") +
+      theme_bw()
+    
+    p 
+}
+
+```
+
+
+
+
+### 0. H3K27me3 depletion
+
+Make a plot in R for the H3K27me3 depletion as estimated by western blot 
+(by Ste).
+
+```{r h3k27me3 depletion, fig.width = 5, fig.height = 3.5}
+
+# Data input
+h3k27me3_depletion <- tibble(sample = paste(rep(c("DMSO_control",
+                                                  "EED_control",
+                                                  "GSK_control",
+                                                  "DMSO_IAA",
+                                                  "EED_IAA",
+                                                  "GSK_IAA"),
+                                                times = 2),
+                                            rep(c("r2", "r1"), 
+                                                each = 6),
+                                            sep = "_"),
+                             absolute = c(0.914084372,
+                                          0.048421751,
+                                          0.065179744,
+                                          0.436338494,
+                                          0.025772122,
+                                          0.040758301,
+                                          0.225226237,
+                                          0.086944998,
+                                          0.062907913,
+                                          1.102112394,
+                                          0.062982975,
+                                          0.081537619)) %>%
+  separate(sample, c("treatment", "depletion", "replicate"), remove = F) %>%
+  mutate(treatment = factor(treatment, c("DMSO", "GSK", "EED")),
+         depletion = factor(depletion, c("control", "IAA")),
+         replicate = factor(replicate, c("r1", "r2"))) %>%
+  arrange(replicate, treatment, depletion)
+
+# Plot
+h3k27me3_depletion %>%
+  ggplot(aes(x = treatment, y = absolute, col = replicate)) +
+  stat_summary(fun = mean, aes(group = interaction(treatment, depletion)),
+               geom = "bar", fill = "grey50") +
+  geom_point(size = 3) +
+  facet_grid(. ~ depletion) +
+  xlab("Treatment") +
+  ylab("H3K27me3 level") +
+  theme_bw() +
+  theme(aspect.ratio = 2)
+
+```
+
+
+
+
+### 1. Load data
+
+Load the required data.
+
+#### 1.1 Previous objects
+
+First, simply objects from previous documents.
+
+```{r load previous data, cache = T}
+
+# Read .rds files
+input.dir <- "ts220113_DamID_changes_versus_LAD_size_and_score"
+#LADs_consensus <- readRDS(file.path(input.dir, "LADs_consensus.rds"))
+LADs_consensus <- readRDS(file.path(input.dir, "LADs_list_individual.rds"))[["CTCFEL"]]
+
+```
+
+#### 1.2 DamID
+
+Read the DamID data - only combined objects.
+
+```{r load damid, cache = T, warning = F, message = F}
+
+# First, prepare metadata
+metadata_h3k27me3 <- tibble(file = dir("../results_NQ/normalized/bin-10kb/",
+                                       pattern = "EL_.*combined")) %>%
+  mutate(sample = str_remove(file, "-10.*"),
+         sample = str_remove(sample, "pADamID_"),
+         sample = str_replace_all(sample, "-", "")) %>%
+  # add conditions
+  mutate(condition = case_when(grepl("DMSO", sample) ~ "DMSO",
+                               grepl("GSK", sample) ~ "GSK",
+                               grepl("EED", sample) ~ "EED",
+                               T ~ "control"),
+         condition = factor(condition, c("control", "DMSO", "GSK", "EED")),
+         timepoint = case_when(grepl("IAA", sample) ~ "24h",
+                               T ~ str_remove(sample, ".*_"))) %>%
+  # filter samples
+  filter(timepoint %in% c("0h", "24h")) %>%
+  # rename samples
+  mutate(sample = paste(condition, timepoint, sep = "_"))
+
+# Then, load DamID
+damid_h3k27me3 <- LoadDamID(metadata = metadata_h3k27me3, 
+                            damid.dir = "../results_NQ/normalized/bin-10kb/")
+damid_h3k27me3 <- ScaleDamID(damid_h3k27me3)
+
+```
+
+Finally, determine LAD scores - mean score per LAD per condition.
+
+```{r lad scores, cache = T, warning = F, message = F}
+
+# Determine LAD scores
+lad_scores <- LADScores(damid = damid_h3k27me3, gr = LADs_consensus,
+                        samples = metadata_h3k27me3$sample)
+
+```
+
+
+### 2. LAD differences with control and over time
+
+I have now generated data in control cells (no treatment), DMSO (negative
+control) and two H3K27me3 inhibitors. I will try various ways to plot the data,
+and select the one that summarizes the observations best.
+
+First, I looked at the differences between undepleted conditions.
+
+```{r lad differences with control, fig.width = 5, fig.height = 3.5}
+
+# Include st-dev in the plot
+sd_fun <- function(x){
+    return(data.frame(y = 1.25, label = round(sd(x), 2)))
+}
+
+# lad differences with control - should be small
+tib <- as_tibble(lad_scores)
+
+tib %>%
+  mutate(DMSO = DMSO_0h - control_0h,
+         GSK = GSK_0h - control_0h,
+         EED = EED_0h - control_0h) %>%
+  dplyr::select(-ends_with("h"), -start, -end, -strand) %>%
+  gather(key, value, -seqnames) %>%
+  ggplot(aes(x = key, y = value, col = key)) +
+  geom_quasirandom() +
+  geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+  stat_summary(fun.data = sd_fun, geom = "text", col = "black") +
+  geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+  xlab("") +
+  ylab("LAD difference (z-score)") +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# lad differences with dmso - should be small
+tib %>%
+  mutate(GSK = GSK_0h - DMSO_0h,
+         EED = EED_0h - DMSO_0h) %>%
+  dplyr::select(-ends_with("h"), -start, -end, -strand) %>%
+  gather(key, value, -seqnames) %>%
+  ggplot(aes(x = key, y = value, col = key)) +
+  geom_quasirandom() +
+  geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+  stat_summary(fun.data = sd_fun, geom = "text", col = "black") +
+  geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+  xlab("") +
+  ylab("LAD difference (z-score)") +
+  scale_color_brewer(palette = "Dark2") +
+  coord_cartesian(ylim = c(-1.5, 1.5)) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Heatmap of all correlations
+tib %>%
+  dplyr::select(contains("DMSO"),
+                contains("GSK"),
+                contains("EED")) %>%
+  dplyr::select(1, 3, 5, 2, 4, 6) %>%
+  correlate(method = "spearman", diagonal = 1) %>%
+  gather(partner, value, -term) %>%
+  mutate(term = factor(term, unique(term)),
+         partner = factor(partner, rev(levels(term)))) %>%
+  ggplot(aes(x = term, y = partner, fill = value)) +
+  geom_tile() +
+  scale_fill_gradientn(colors = colorRampPalette(rev(brewer.pal(n = 7, 
+                                                                name = "RdYlBu")))(100),
+                       limits = c(0, 1),
+                       name = "Spearman correlation") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+  
+  
+
+```
+
+As expected, the control experiment was done independently from these H3K27me3 
+experiments. As a result, there is significant variation between these 0 h 
+samples and the control 0 h sample.
+
+The correlation plots below summarize a lot of the new data. They nicely 
+illustrate that treatment (24 h after auxin) conditions are very similar. There
+is not clear indiciation that the two H3K27me3 inhibitor experiments are 
+different from the DMSO condition. This indicates that H3K27me3 depletion does
+not affect NL interactions.
+
+```{r correlation plots, fig.width = 6, fig.height = 6}
+
+# ggpairs
+# Use GGally to make correlation plots
+boundaries <- seq(from = 0.95, to = 0.98, length.out = 4) 
+
+# Replicates
+tib_ggpairs <- tib %>%
+  dplyr::select(# contains("control"), 
+                contains("DMSO"), 
+                contains("GSK"), contains("EED")) %>%
+  drop_na()
+
+plt <- ggpairs(tib_ggpairs[, c(1, 3, 5, 2, 4, 6)],
+               upper = list(continuous = corColor),
+               lower = list(continuous = customScatter),
+               diag = list(continuous = function(data, mapping, ...) {
+                   ggally_densityDiag(data = data, mapping = mapping, alpha = 0.3, fill = "red") +
+                   theme_bw()})) +
+  ggtitle("Correlating all data") +
+  xlab("") +
+  ylab("") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+print(plt)
+
+
+# Also, only t=0h 
+#boundaries <- seq(from = 0.1, to = 0.98, length.out = 4)
+
+# Replicates  
+tib_ggpairs <- tib %>%
+  dplyr::select(contains("0h")) %>%
+  drop_na()
+
+plt <- ggpairs(tib_ggpairs,
+               upper = list(continuous = corColor),
+               lower = list(continuous = customScatter),
+               diag = list(continuous = function(data, mapping, ...) {
+                   ggally_densityDiag(data = data, mapping = mapping, alpha = 0.3, fill = "red") +
+                   theme_bw()})) +
+  ggtitle("Correlating all data") +
+  xlab("") +
+  ylab("") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+print(plt)
+
+ 
+
+
+
+
+```
+
+I also tried to plot the LAD differences over time (24 h versus 0 h). As 
+expected, auxin treatment results in similar differences in all conditions.
+
+```{r lad differences with over time, fig.width = 8, fig.height = 3.5}
+
+# lad differences with control - should be small
+tib %>%
+  mutate(control = control_24h - control_0h,
+         DMSO = DMSO_24h - DMSO_0h,
+         GSK = GSK_24h - GSK_0h,
+         EED = EED_24h - EED_0h) %>%
+  dplyr::select(-ends_with("h"), -start, -end, -strand) %>%
+  gather(key, value, -seqnames) %>%
+  ggplot(aes(x = key, y = value, col = key)) +
+  geom_quasirandom() +
+  geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+  stat_summary(fun.data = sd_fun, geom = "text", col = "black") +
+  geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+  xlab("") +
+  ylab("LAD difference (z-score)") +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Correlation plot
+tib_cor <- tib %>%
+  mutate(control = control_24h - control_0h,
+         DMSO = DMSO_24h - DMSO_0h,
+         GSK = GSK_24h - GSK_0h,
+         EED = EED_24h - EED_0h) %>%
+  dplyr::select(-ends_with("h"), -start, -end, -strand, -seqnames) %>%
+  drop_na() %>%
+  correlate(method = "spearman") %>%
+  gather(key, value, -term) %>%
+  mutate(value = replace_na(value, 1)) %>%
+  mutate(n1 = factor(term, levels(metadata_h3k27me3$condition)),
+         n2 = factor(key, rev(levels(metadata_h3k27me3$condition))))
+
+# Plot
+plt <- tib_cor %>%
+  ggplot(aes(x = n1, y = n2, fill = value, label = round(value, 2))) +
+  geom_tile() +
+  geom_text() +
+  xlab("") + ylab("") +
+  scale_fill_gradientn(colors = colorRampPalette(rev(brewer.pal(n = 7, 
+                                                                name = "RdYlBu")))(100),
+                       limits = c(min(-1, tib_cor$value), 1),
+                       name = "Spearman correlation") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+```
+
+The plot above also illustrates that the differences in control cells are very
+similar to the differences between DMSO / H3K27me3 inhibitors. 
+
+
+### 3. Example tracks
+
+For presentation purposes, also generate some nice data tracks.
+
+First load the H3K27me3 ChIP-seq data.
+
+```{r h3k27me3 binned}
+
+# First, add binned h3k27me3 for data tracks
+h3k27me3 <- import.bw("Data_NQ/ChIP_NQ/HistoneModifications/Public_2i_ChIP/E14_2i_H3K27me3_GSM2779214_SRR6025412-5_MQ15_sample.bw")
+
+tmp <- tibble(bin = findOverlaps(h3k27me3, damid_h3k27me3, 
+                                 select = "first")) %>%
+  mutate(score = h3k27me3$score,
+         width = width(h3k27me3)) %>%
+  # limit width to bin size
+  mutate(width = ifelse(width > 10000, 10000, width)) %>%
+  group_by(bin) %>%
+  dplyr::summarise(mean = weighted.mean(score, width)) %>%
+  ungroup() %>%
+  drop_na()
+
+# Prepare tibble
+tib_damid <- as_tibble(damid_h3k27me3)
+tib_damid$h3k27me3 <- NA
+tib_damid$h3k27me3[tmp$bin] <- tmp$mean
+
+
+
+# ts220208 - change the H3K27me3 tracks to the new data generated by NQ
+GetBinnedH3K27me3 <- function(x) {
+  
+  h3k27me3 <- import.bw(x)
+  
+  tmp <- tibble(bin = findOverlaps(h3k27me3, damid_h3k27me3, 
+                                   select = "first")) %>%
+    mutate(score = h3k27me3$score,
+           width = width(h3k27me3)) %>%
+    # limit width to bin size
+    mutate(width = ifelse(width > 10000, 10000, width)) %>%
+    group_by(bin) %>%
+    dplyr::summarise(mean = weighted.mean(score, width)) %>%
+    ungroup() %>%
+    drop_na()
+  
+  # Prepare tibble
+  tib_damid <- as_tibble(damid_h3k27me3)
+  tib_damid$h3k27me3 <- NA
+  tib_damid$h3k27me3[tmp$bin] <- tmp$mean
+  
+  tib_damid
+  
+}
+
+tracks_h3k27me3 <- c("Data_NQ/ChIP_NQ/CTCF_depletion_H3K27me3/CTCF-AID_0h_r1_antiH3K27me3_sample.bw",
+                     "Data_NQ/ChIP_NQ/CTCF_depletion_H3K27me3/CTCF-AID_0h_r2_antiH3K27me3_sample.bw",
+                     "Data_NQ/ChIP_NQ/CTCF_depletion_H3K27me3/CTCF-AID_24h_r1_antiH3K27me3_sample.bw",
+                     "Data_NQ/ChIP_NQ/CTCF_depletion_H3K27me3/CTCF-AID_24h_r2_antiH3K27me3_sample.bw")
+tib_h3k27me3 <- purrr::map(tracks_h3k27me3,
+                          GetBinnedH3K27me3)
+
+# Combine these objects
+tib_damid <- as_tibble(damid_h3k27me3) %>%
+  add_column(h3k27me3_0h_r1 = tib_h3k27me3[[1]]$h3k27me3,
+             h3k27me3_0h_r2 = tib_h3k27me3[[2]]$h3k27me3,
+             h3k27me3_24h_r1 = tib_h3k27me3[[3]]$h3k27me3,
+             h3k27me3_24h_r2 = tib_h3k27me3[[4]]$h3k27me3)
+
+tib_damid$h3k27me3_0h <- rowMeans(tib_damid %>%
+                                    dplyr::select(contains("h3k27me3_0h")),
+                                  na.rm = T)
+tib_damid$h3k27me3_24h <- rowMeans(tib_damid %>%
+                                     dplyr::select(contains("h3k27me3_24h")),
+                                   na.rm = T)
+
+tib_damid <- tib_damid %>%
+  dplyr::select(-contains("_r"))
+
+
+```
+
+
+
+And plot.
+
+```{r example tracks, fig.width = 6, fig.height = 5}
+
+PlotDataTracksLight <- function(input_tib, exp_names, centromeres, 
+                                color_groups, plot_chr = "chr1", 
+                                plot_start = 1, plot_end = 500e6,
+                                smooth = 1, color_list = NULL,
+                                fix_yaxis = F, aspect_ratio = NULL,
+                                lighten_negative = T, raster = T) {
+  
+  # Get the scores for the samples
+  tib_plot <- input_tib %>%
+    dplyr::select(seqnames, start, end, 
+                  all_of(exp_names))
+  
+  if (smooth > 1) {
+    tib_plot <- tib_plot %>%
+      mutate_at(vars(matches("_|h3k27me3")), 
+                runmean, k = smooth)
+  }
+  
+  # Filter for plotting window
+  tib_plot <- tib_plot %>%
+    filter(seqnames == plot_chr,
+           start >= plot_start,
+           end <= plot_end)
+  
+  # Gather
+  tib_gather <- tib_plot %>%
+    gather(key, value, -seqnames, -start, -end) %>%
+    mutate(key = factor(key, levels = exp_names),
+           fill_column = color_groups[match(key, names(color_groups))],
+           fill_column = factor(fill_column, levels = unique(color_groups)))
+  
+  # If desired, make negative values a lighter shade to improve visualization
+  if (lighten_negative) {
+    tib_gather <- tib_gather %>%
+      mutate(fill_column = interaction(fill_column,
+                                       value < 0))
+  }
+  
+  
+  # Plot
+  ylimits <- quantile(tib_gather$value, c(0.001, 0.999), na.rm = T)
+  fill_column <- NULL
+  
+  plt <- tib_gather %>% 
+    ggplot(aes(fill = fill_column))
+  
+  
+  # Rasterize plot to prevent Illustrator overload
+  if (raster) {
+    plt <- plt + 
+      rasterize(geom_rect(aes(xmin = start / 1e6, xmax = end / 1e6, 
+                              ymin = 0, ymax = value)),
+                dpi = 300)
+  } else {
+    plt <- plt + 
+      geom_rect(aes(xmin = start / 1e6, xmax = end / 1e6, 
+                    ymin = 0, ymax = value))
+  }
+  
+  plt <- plt + 
+    geom_hline(yintercept = 0, size = 0.5) +
+    facet_grid(key ~ ., scales = "free_y") +
+    xlab(paste0(plot_chr, " (Mb)")) +
+    ylab("Score") +
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0.025, 0.025)) +
+    theme_classic()
+  
+  if (! is.null(color_list)) {
+    
+    if (lighten_negative) {
+      color_list <- c(color_list,
+                      lighten(color_list, amount = 0.5))
+    }
+    
+    colors <- levels(tib_gather$fill_column)
+    
+    color_list <- color_list[1:length(colors)]
+    names(color_list) <- colors
+    #colors <- recode(colors, !!!color_list)
+    
+    plt <- plt +
+      scale_fill_manual(values = color_list, guide = "none")
+  } else {
+    plt <- plt +
+      scale_fill_brewer(palette = "Set1", guide = "none")
+  }
+  
+  if (fix_yaxis) {
+    plt <- plt + 
+      coord_cartesian(xlim = c(max(c(plot_start,
+                                     min(tib_gather$start))) / 1e6,
+                               min(c(plot_end,
+                                     max(tib_gather$end))) / 1e6),
+                      ylim = ylimits)
+  } else {
+    plt <- plt + 
+      coord_cartesian(xlim = c(max(c(plot_start,
+                                     min(tib_gather$start))) / 1e6,
+                               min(c(plot_end,
+                                     max(tib_gather$end))) / 1e6))
+  }
+  
+  if (! is.null(aspect_ratio)) {
+    plt <- plt +
+      theme(aspect.ratio = aspect_ratio)
+  }
+  
+  plot(plt)
+  
+}
+
+
+PlotDataTracksLight(input_tib = tib_damid, 
+                    exp_names = c("DMSO_0h",
+                                  "DMSO_24h",
+                                  "GSK_0h",
+                                  "GSK_24h",
+                                  "EED_0h",
+                                  "EED_24h",
+                                  "h3k27me3_0h",
+                                  "h3k27me3_24h"),
+                    color_groups = c(DMSO_0h = "0h",
+                                     DMSO_24h = "24h",
+                                     GSK_0h = "0h",
+                                     GSK_24h = "24h",
+                                     EED_0h = "0h",
+                                     EED_24h = "24h",
+                                     h3k27me3_0h = "h3k27me3",
+                                     h3k27me3_24h = "h3k27me3"),
+                    smooth = 9, plot_chr = "chr1", fix_yaxis = F,
+                    plot_start = 148e6, plot_end = 205e6,
+                    color_list = c(brewer.pal(3, "Set1")[c(1, 3)],
+                                   "#7570B3"))
+
+PlotDataTracksLight(input_tib = tib_damid, 
+                    exp_names = c("DMSO_0h",
+                                  "GSK_0h",
+                                  "EED_0h",
+                                  "DMSO_24h",
+                                  "GSK_24h",
+                                  "EED_24h",
+                                  "h3k27me3_0h",
+                                  "h3k27me3_24h"),
+                    color_groups = c(DMSO_0h = "DMSO",
+                                     GSK_0h = "GSK",
+                                     EED_0h = "EED",
+                                     DMSO_24h = "DMSO",
+                                     GSK_24h = "GSK",
+                                     EED_24h = "EED",
+                                     h3k27me3_0h = "h3k27me3",
+                                     h3k27me3_24h = "h3k27me3"),
+                    smooth = 5, plot_chr = "chr1", fix_yaxis = F,
+                    plot_start = 165e6, plot_end = 205e6,
+                    color_list = brewer.pal(4, "Dark2"))
+
+PlotDataTracksLight(input_tib = tib_damid, 
+                    exp_names = c("DMSO_0h",
+                                  "DMSO_24h",
+                                  "GSK_0h",
+                                  "GSK_24h",
+                                  "EED_0h",
+                                  "EED_24h",
+                                  "h3k27me3_0h",
+                                  "h3k27me3_24h"),
+                    color_groups = c(DMSO_0h = "0h",
+                                     DMSO_24h = "24h",
+                                     GSK_0h = "0h",
+                                     GSK_24h = "24h",
+                                     EED_0h = "0h",
+                                     EED_24h = "24h",
+                                     h3k27me3_0h = "h3k27me3",
+                                     h3k27me3_24h = "h3k27me3"),
+                    smooth = 5, plot_chr = "chr1", fix_yaxis = F,
+                    plot_start = 165e6, plot_end = 205e6,
+                    color_list = brewer.pal(3, "Set1")[c(1, 3)])
+
+PlotDataTracksLight(input_tib = tib_damid, 
+                    exp_names = c("DMSO_0h",
+                                  "GSK_0h",
+                                  "EED_0h",
+                                  "DMSO_24h",
+                                  "GSK_24h",
+                                  "EED_24h",
+                                  "h3k27me3_0h",
+                                  "h3k27me3_24h"),
+                    color_groups = c(DMSO_0h = "DMSO",
+                                     GSK_0h = "GSK",
+                                     EED_0h = "EED",
+                                     DMSO_24h = "DMSO",
+                                     GSK_24h = "GSK",
+                                     EED_24h = "EED",
+                                     h3k27me3_0h = "h3k27me3",
+                                     h3k27me3_24h = "h3k27me3"),
+                    smooth = 5, plot_chr = "chr8", fix_yaxis = F,
+                    plot_start = 75e6, plot_end = 100e6,
+                    color_list = brewer.pal(4, "Dark2"))
+
+
+PlotDataTracksLight(input_tib = tib_damid, 
+                    exp_names = c("DMSO_0h",
+                                  "GSK_0h",
+                                  "EED_0h",
+                                  "DMSO_24h",
+                                  "GSK_24h",
+                                  "EED_24h",
+                                  "h3k27me3_0h",
+                                  "h3k27me3_24h"),
+                    color_groups = c(DMSO_0h = "DMSO",
+                                     GSK_0h = "GSK",
+                                     EED_0h = "EED",
+                                     DMSO_24h = "DMSO",
+                                     GSK_24h = "GSK",
+                                     EED_24h = "EED",
+                                     h3k27me3_0h = "h3k27me3",
+                                     h3k27me3_24h = "h3k27me3"),
+                    smooth = 5, plot_chr = "chr11", fix_yaxis = F,
+                    plot_start = 103e6, plot_end = 114e6,
+                    color_list = brewer.pal(4, "Dark2"))
+
+
+```
+
+Looks good.
+
+
+### 4. LAD differences versus h3k27me3 levels
+
+Finally, I tried to determine the effect of H3K27me3 depletion on regions with 
+actual H3K27me3 levels.
+
+```{r lad differences versus h3k27me3, fig.width = 5, fig.height = 3.5}
+
+# Add H3K27me3 to LAD scores
+tmp <- as_tibble(findOverlaps(lad_scores, damid_h3k27me3)) %>%
+  mutate(h3k27me3 = tib_damid$h3k27me3_0h[subjectHits]) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(h3k27me3 = mean(h3k27me3, na.rm = T)) %>%
+  ungroup()
+
+lad_scores$h3k27me3 <- tmp$h3k27me3
+tib <- as_tibble(lad_scores)
+
+# LAD scores versus H3K27me3
+tib %>%
+  gather(key, value, contains("0h"), -contains("control")) %>%
+  ggplot(aes(x = value, y = h3k27me3)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_grid(. ~ key) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+# Difference in LAD versus h3k27me3 score
+tib %>%
+  mutate(DMSO_diff = DMSO_0h - control_0h,
+         GSK_diff = GSK_0h - control_0h,
+         EED_diff = EED_0h - control_0h) %>%
+  gather(key, value, contains("diff")) %>%
+  ggplot(aes(x = value, y = h3k27me3)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_grid(. ~ key) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+tib %>%
+  mutate(GSK_diff = GSK_0h - DMSO_0h,
+         EED_diff = EED_0h - DMSO_0h) %>%
+  gather(key, value, contains("diff")) %>%
+  ggplot(aes(x = value, y = h3k27me3)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_grid(. ~ key) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+
+# Correlate change after H3K27me3 depletion versus initial H3K27me3
+tib %>%
+  mutate(DMSO_diff = DMSO_0h - control_0h,
+         GSK_diff = GSK_0h - control_0h,
+         EED_diff = EED_0h - control_0h) %>%
+  drop_na() %>%
+  gather(key, value, contains("diff")) %>%
+  group_by(key) %>%
+  dplyr::summarise(cor = cor(value, h3k27me3, method = "spearman"),
+                   test = cor.test(value, h3k27me3, method = "spearman")$p.value) %>%
+  mutate(padj = p.adjust(test),
+         sign = padj < 0.05,
+         key = str_remove(key, "_diff"),
+         key = factor(key, c("DMSO", "GSK", "EED"))) %>%
+  ggplot(aes(x = key, y = cor, fill = sign)) +
+  geom_bar(stat = "identity") +
+  xlab("Treatment") +
+  ylab("Spearman correlation") +
+  ggtitle("LAD difference after treatment vs H3K27me3") +
+  scale_fill_manual(values = c("grey80", "grey30")) +
+  theme_bw() +
+  theme(aspect.ratio = 2)
+
+```
+
+Overall, the figures above keep showing that the DMSO and H3K27me3 inhibitor 
+experiments are extremely similar. You could say that there is significance 
+between H3K27me3 levels and changes in NL interactions after H3K27me3 depletion,
+but not in the DMSO control. So, there might be something. Too small to be 
+confident in this, though.
+
+
+### Save data
+
+Save the data.
+
+```{r save data}
+
+# Save .rds files
+saveRDS(metadata_h3k27me3, 
+        file.path(output.dir, "metadata_h3k27me3.rds"))
+saveRDS(damid_h3k27me3,
+        file.path(output.dir, "damid_h3k27me3.rds"))
+
+
+# Also, as tsv file
+tib_damid <- as_tibble(damid_h3k27me3) %>%
+  dplyr::select(-width, -strand) %>%
+  dplyr::select(-contains("control"))
+print(names(tib_damid))
+
+write_tsv(tib_damid,
+          file.path(output.dir, "damid_h3k27me3_depletion_average_replicates.tsv"))
+
+```
+
+
+### Conclusion
+
+LAD patterns are not affected by H3K27me3 inhibition. There is also no effect of
+the combination of CTCF depletion and H3K27me3 inhibition.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+

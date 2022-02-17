@@ -1,0 +1,598 @@
+---
+title: "LAD border changes"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+Look whether LAD border class change after protein depletions, to prove the 
+point that CTCF and cohesin are not involved in LAD border positioning. Or to
+which extent they are.
+
+
+### Method
+
+Use HMM models of the various experiments, and compare LAD border positioning
+with the LAD borders defined in the parental data.
+
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+library(GenomicRanges)
+library(rtracklayer)
+library(tidyverse)
+library(ggbeeswarm)
+library(ggplot2)
+library(broom)
+
+# Prepare output 
+output_dir <- "ts220117_LAD_border_changes"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Load input
+input_dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+LADs <- readRDS(file.path(input_dir, "LADs_pA.rds"))
+LAD_borders <- readRDS(file.path(input_dir, "LAD_borders_pA.rds"))
+
+input_dir <- "ts220113_effect_of_CTCF_depletion_on_LAD_borders"
+bin_size <- readRDS(file.path(input_dir, "bin_size.rds"))
+metadata_damid <- readRDS(file.path(input_dir, "metadata_damid.rds"))
+damid <- readRDS(file.path(input_dir, "damid.rds"))
+
+# Select input
+LADs <- LADs[[1]]
+LAD_borders <- LAD_borders[[1]]
+LAD_borders <- LAD_borders[LAD_borders$ovl_gene == F]
+
+bins <- damid
+mcols(bins) <- NULL
+
+```
+
+Knitr set-up.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 8, fig.height = 3.5, cache = T,
+               dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/")) 
+
+pdf.options(useDingbats = FALSE)
+```
+
+Functions.
+
+```{r functions}
+
+LoadBed <- function(metadata, column, reduce = F, size_filter = F) {
+  # Load LADs as GRangesList from metadata object
+  bed <- GRangesList()
+  for (i in 1:nrow(metadata)) {
+    f.name <- (metadata %>% pull(column))[i]
+    f.import <- import(f.name)
+    if (reduce) {
+      f.import <- GenomicRanges::reduce(f.import, min.gapwidth = 50e3)
+    }
+    if (size_filter) {
+      f.import <- f.import[width(f.import) > 50e3]
+    }
+    f.import$sample <- metadata$sample[i]
+    f.import <- f.import[seqnames(f.import) %in% c(paste0("chr", 1:22), "chrX")]
+    bed <- c(bed, GRangesList(f.import))
+  }
+  names(bed) <- metadata$sample
+  bed
+}
+
+LADBorders <- function(LADs, bins, min.distance = 0) {
+  # Given a (named) GRangesList of LADs, return a GRangesList with borders
+  # Strand information defines left (+) or right (-) border
+  # Also, require complete bin object to determine chromosome start and end
+  
+  cells <- names(LADs)
+  LAD.borders <- GRangesList()
+  
+  for (cell in cells ) {
+    
+    # Get LADs and bins for cell
+    cell.LADs <- LADs[[cell]]
+    cell.bins <- bins
+    
+    # Remove small iLADs and remove small LADs
+    cell.LADs <- GenomicRanges::reduce(cell.LADs, min.gapwidth = min.distance)
+    cell.LADs <- cell.LADs[width(cell.LADs) > min.distance]
+    
+    # Get borders
+    cell.borders <- c(GRanges(seqnames = seqnames(cell.LADs),
+                              ranges = IRanges(start = start(cell.LADs),
+                                               end = start(cell.LADs)),
+                              strand = "+"),
+                      GRanges(seqnames = seqnames(cell.LADs),
+                              ranges = IRanges(start = end(cell.LADs),
+                                               end = end(cell.LADs)),
+                              strand = "-"))
+    cell.borders <- sort(cell.borders, ignore.strand = T)
+    
+    # Get start and end of the chromosome and filter overlapping borders
+    chromosome.ends <- c(cell.bins[! duplicated(as.character(seqnames(cell.bins)))],
+                         rev(cell.bins)[! duplicated(as.character(seqnames(rev(cell.bins))))])
+    chromosome.ends <- flank(chromosome.ends, 5000, both = T)
+    
+    cell.borders <- cell.borders[! overlapsAny(cell.borders, 
+                                               chromosome.ends, 
+                                               ignore.strand = T)]
+    
+    cell.borders$cell <- cell
+    
+    LAD.borders <- c(LAD.borders, GRangesList(cell.borders))
+  }
+  
+  names(LAD.borders) <- cells
+  LAD.borders
+  
+}
+
+grMid = function(gr) {
+  start(gr) <- end(gr) <- rowMeans(cbind(start(gr), end(gr)))
+  gr
+}
+
+```
+
+
+### 1. Distance to closest border
+
+First, load LADs.
+
+```{r load lads}
+
+# Prepare LAD metadata
+metadata_lads <- metadata_damid %>% 
+  filter(! condition %in% c("CTCF", "CTCFNQ")) %>%
+  mutate(lad_file = file.path(paste0("../results_NQ/HMM/bin-", bin_size),
+                              str_replace(file, ".norm.txt.gz", "_AD.bed.gz")))
+
+LAD_list <- LoadBed(metadata_lads, "lad_file", reduce = T, size_filter = T)
+
+
+# Prepare borders
+LAD_border_list <- LADBorders(LAD_list, bins)
+
+```
+
+I will start simple: determine the distance from the selected borders to the 
+closest border.
+
+Then, I will plot the distance to the nearest border. However, I want to
+determine whether the border is displaced. If the entire LAD is lost, the 
+nearest border will be "wrong". To prevent this, I will only look in a 100 kb
+window from the parental border, and disregard nearest borders that are further
+away than that. 
+
+In this way, I can specifically ask whether CTCF depletion (or any other 
+depletion) results in a shift of the LAD border. Perhaps not ideal, but 
+together with previous analyses of average signal at LAD borders, it should
+be a convincing analysis. I hope.
+
+```{r distance to border, fig.width = 8, fig.height = 8}
+
+# For all samples, determine distance to nearest border
+border_distance <- tibble()
+
+for (sample in metadata_lads$sample) {
+  
+  # Get borders for sample
+  LAD_sample <- LAD_list[[sample]]
+  LAD_border_sample <- LAD_border_list[[sample]]
+  
+  # Distance to nearest border
+  dis <- as_tibble(distanceToNearest(LAD_borders, LAD_border_sample, ignore.strand = T)) %>%
+    rename_all(~ c("border_idx", "sample_idx", "distance"))
+  
+  # Filter and add metadata
+  dis <- dis %>%
+    arrange(sample_idx, distance) %>%
+    filter(! duplicated(sample_idx)) %>%
+    mutate(sample = sample) %>%
+    mutate(border_strand = as.character(strand(LAD_borders))[border_idx],
+           sample_strand = as.character(strand(LAD_border_sample))[sample_idx],
+           border_within_lad = overlapsAny(LAD_borders[border_idx], LAD_sample,
+                                           ignore.strand = T),
+           sample_within_lad = overlapsAny(LAD_border_sample[sample_idx], LADs,
+                                           ignore.strand = T)) %>%
+    mutate(distance = case_when(sample_within_lad == T ~ distance,
+                                T ~ - distance))
+  
+  # Add to all border distances
+  border_distance <- bind_rows(border_distance, 
+                               dis)
+  
+}
+
+# Prepare for plotting
+border_distance <- border_distance %>%
+  separate(sample, c("condition", "timepoint"), remove = F) %>%
+  mutate(condition = factor(condition, levels(metadata_lads$condition)),
+         timepoint = factor(timepoint, levels(metadata_lads$timepoint)),
+         distance_kb = distance / 1e3,
+         distance_kb = (distance_kb %/% 10) * 10) %>%
+  filter(timepoint != "96h") %>%
+  mutate(CTCF = LAD_borders$CTCF[border_idx],
+         CTCF_strand = LAD_borders$CTCF_strand[border_idx],
+         CTCF_count = LAD_borders$CTCF.count[border_idx],
+         CTCF_strand = factor(CTCF_strand, c("outwards", "inwards", "ambiguous", "nonCTCF"))) %>%
+  mutate(CTCF_count = case_when(CTCF_count >= 3 ~ ">=3",
+                                CTCF_count == 2 ~ "2",
+                                CTCF_count == 1 ~ "1",
+                                T ~ "nonCTCF"),
+         CTCF_count = factor(CTCF_count,
+                             levels = c("nonCTCF", "1", "2", ">=3")))
+
+# Plot this
+border_distance %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+border_distance %>%
+  filter(condition == "CTCFEL") %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+border_distance %>%
+  filter(condition %in% c("RAD21", "WAPL", "CTCFWAPL")) %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Plot this - assuming shift less than 100kb and removing PT
+border_distance %>%
+  filter(condition != "PT",
+         distance_kb > -101, distance_kb < 101) %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+border_distance %>%
+  filter(condition == "CTCFEL",
+         distance_kb > -101, distance_kb < 101) %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+border_distance %>%
+  filter(condition %in% c("RAD21", "WAPL", "CTCFWAPL"),
+         distance_kb > -101, distance_kb < 101) %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Plot this - assuming shift less than 100kb and removing PT, with CTCF strand information
+border_distance %>%
+  filter(condition != "PT",
+         distance_kb > -101, distance_kb < 101) %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF_strand ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Plot this - assuming shift less than 100kb and removing PT, with CTCF count information
+border_distance %>%
+  filter(condition == "CTCFEL",
+         distance_kb > -101, distance_kb < 101) %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF_count ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+border_distance %>%
+  filter(condition != "PT",
+         distance_kb > -101, distance_kb < 101) %>%
+  ggplot(aes(x = distance_kb, col = timepoint)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(CTCF_count ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Plot this - assuming shift less than 100kb and removing PT, by border type
+border_distance %>%
+  filter(condition != "PT",
+         distance_kb > -101, distance_kb < 101) %>%
+  ggplot(aes(x = distance_kb, col = CTCF)) +
+  stat_ecdf(geom = "line") +
+  annotate("rect", xmin = 0, xmax = Inf, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(timepoint ~ condition) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Cum density") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+This looks sort of as expected. Looks good. I can use these figures in the
+manuscript.
+
+
+### 2. Linear models of border slopes
+
+A different approach - use the border to determine a linear slope and compare 
+slope / intercept.
+
+```{r linear model of border slope}
+
+# Get border bins
+max_distance <- 3e4
+
+bins_mid <- grMid(bins)
+
+dis <- as_tibble(distanceToNearest(bins_mid, LAD_borders, ignore.strand = T)) %>%
+  rename_at(1:2, ~ c("bin_idx", "border_idx")) %>%
+  filter(distance < max_distance) %>%
+  mutate(LAD_ovl = overlapsAny(bins_mid[bin_idx], LADs),
+         distance = case_when(LAD_ovl == T ~ distance,
+                              T ~ -distance),
+         distance = distance / 1e3,
+         distance = (distance %/% 10) * 10)
+
+# Add DamID values
+dis <- bind_cols(dis, 
+                 as_tibble(mcols(damid))[dis$bin_idx, ] %>%
+                   dplyr::select(one_of(metadata_lads$sample))) %>%
+  arrange(border_idx, distance) %>%
+  dplyr::select(-bin_idx, -LAD_ovl) %>%
+  gather(key, value, -border_idx, -distance) %>%
+  drop_na()
+
+# Linear models
+border_models <- dis %>%
+  group_by(key, border_idx) %>%
+  do(border_fit = tidy(lm(value ~ distance, data = .))) %>% 
+  unnest(border_fit)
+
+```
+
+```{r plot models, fig.width = 5.5, fig.height = 7.5}
+
+# Prepare for plotting
+border_models_plot <- border_models %>%
+  mutate(term = str_remove_all(term, "\\(|\\)")) %>%
+  dplyr::select(key, border_idx, term, estimate) %>%
+  spread(term, estimate) %>%
+  separate(key, c("condition", "timepoint"), remove = F) %>%
+  mutate(condition = factor(condition, levels(metadata_lads$condition)),
+         timepoint = factor(timepoint, levels(metadata_lads$timepoint))) %>%
+  mutate(CTCF = LAD_borders$CTCF[border_idx]) %>%
+  filter(timepoint != "96h")
+
+# Plot models
+border_models_plot %>%
+  ggplot(aes(x = timepoint, y = distance, col = CTCF, group = interaction(timepoint, CTCF))) +
+  geom_quasirandom(dodge.width = 0.8) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  geom_boxplot(col = "black", outlier.shape = NA, fill = NA) +
+  facet_grid(. ~ condition, scale = "free_x", space = "free_x") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() + 
+  theme(#aspect.ratio = 3, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+border_models_plot %>%
+  ggplot(aes(x = timepoint, y = Intercept, col = CTCF, group = interaction(timepoint, CTCF))) +
+  geom_quasirandom(dodge.width = 0.8) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  geom_boxplot(col = "black", outlier.shape = NA, fill = NA) +
+  facet_grid(. ~ condition, scale = "free_x", space = "free_x") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() + 
+  theme(#aspect.ratio = 3, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+border_models_plot %>%
+  mutate(timepoint = factor(timepoint, rev(levels(metadata_lads$timepoint)))) %>%
+  gather(parameter, parameter_value, distance, Intercept) %>%
+  ggplot(aes(x = timepoint, y = parameter_value, 
+             col = CTCF, group = interaction(timepoint, CTCF))) +
+  geom_quasirandom(dodge.width = 0.8) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  geom_boxplot(col = "black", outlier.shape = NA, fill = NA) +
+  coord_flip() +
+  facet_grid(condition ~ parameter, scale = "free", space = "free_y") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() + 
+  theme(#aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+border_models_plot %>%
+  mutate(CTCF = factor(CTCF, c("nonCTCF", "CTCF"))) %>%
+  gather(parameter, parameter_value, distance, Intercept) %>%
+  ggplot(aes(x = CTCF, y = parameter_value, 
+             col = timepoint, group = interaction(CTCF, timepoint))) +
+  geom_quasirandom(dodge.width = 0.8) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  geom_boxplot(col = "black", outlier.shape = NA, fill = NA) +
+  coord_flip() +
+  facet_grid(condition ~ parameter, scale = "free", space = "free_y") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() + 
+  theme(#aspect.ratio = 1, 
+    axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Determine significance - between border classes
+border_models_plot %>%
+  group_by(condition, timepoint) %>%
+  do(test_slope = tidy(wilcox.test(distance  ~ CTCF, data = .))) %>%
+  unnest(test_slope) %>%
+  mutate(padj = p.adjust(p.value),
+         sign = padj < 0.05)
+
+border_models_plot %>%
+  group_by(condition, timepoint) %>%
+  do(test_intercept = tidy(wilcox.test(Intercept  ~ CTCF, data = .))) %>%
+  unnest(test_intercept) %>%
+  mutate(padj = p.adjust(p.value),
+         sign = padj < 0.05)
+
+
+```
+
+This attempt was unsuccessful. Linear models at LAD borders are too unreliable. 
+
+
+### Conclusion
+
+Looks good. I can show that LAD border positioning is only mildly affected.
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

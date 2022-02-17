@@ -1,0 +1,2409 @@
+---
+title: "CTCF enrichment at LAD borders"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina. 
+
+
+### Introduction
+
+We have measured NL interactions in mESC during CTCF depletion. This assumes
+that CTCF peaks are enriched at LAD borders and might be involved in the 
+formation of LADs. However, can I confirm that CTCF sites are equally enriched
+in mESC cells compared to other cell lines?
+
+
+### Method
+
+Calculate density of CTCF sites from LAD borders.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggbeeswarm))
+
+# # Prepare output 
+output_dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Prepare bin size and scaling
+bin.size <- bin.size.txt <- "10kb"
+bin.size <- as.numeric(gsub("kb", "", bin.size)) * 1e3
+
+scaling = 1e6 / bin.size
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, 
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+List functions.
+
+```{r functions}
+
+LoadBed <- function(metadata, column, reduce = F, size_filter = F) {
+  # Load LADs as GRangesList from metadata object
+  bed <- GRangesList()
+  for (i in 1:nrow(metadata)) {
+    f.name <- (metadata %>% pull(column))[i]
+    f.import <- import(f.name)
+    if (reduce) {
+      f.import <- GenomicRanges::reduce(f.import, min.gapwidth = 50e3)
+    }
+    if (size_filter) {
+      f.import <- f.import[width(f.import) > 50e3]
+    }
+    f.import$cell <- metadata$cell[i]
+    f.import <- f.import[seqnames(f.import) %in% c(paste0("chr", 1:22), "chrX")]
+    bed <- c(bed, GRangesList(f.import))
+  }
+  names(bed) <- metadata$cell
+  bed
+}
+
+LADBorders <- function(LADs, bins, min.distance = 0) {
+  # Given a (named) GRangesList of LADs, return a GRangesList with borders
+  # Strand information defines left (+) or right (-) border
+  # Also, require complete bin object to determine chromosome start and end
+  
+  cells <- names(LADs)
+  LAD.borders <- GRangesList()
+  
+  for (cell in cells ) {
+    
+    # Get LADs and bins for cell
+    cell.LADs <- LADs[[cell]]
+    cell.bins <- bins[[cell]]
+    
+    # Remove small iLADs and remove small LADs
+    cell.LADs <- GenomicRanges::reduce(cell.LADs, min.gapwidth = min.distance)
+    cell.LADs <- cell.LADs[width(cell.LADs) > min.distance]
+    
+    # Get borders
+    cell.borders <- c(GRanges(seqnames = seqnames(cell.LADs),
+                              ranges = IRanges(start = start(cell.LADs),
+                                               end = start(cell.LADs)),
+                              strand = "+"),
+                      GRanges(seqnames = seqnames(cell.LADs),
+                              ranges = IRanges(start = end(cell.LADs),
+                                               end = end(cell.LADs)),
+                              strand = "-"))
+    cell.borders <- sort(cell.borders, ignore.strand = T)
+    
+    # Get start and end of the chromosome and filter overlapping borders
+    chromosome.ends <- c(cell.bins[! duplicated(as.character(seqnames(cell.bins)))],
+                         rev(cell.bins)[! duplicated(as.character(seqnames(rev(cell.bins))))])
+    chromosome.ends <- flank(chromosome.ends, 5000, both = T)
+    
+    cell.borders <- cell.borders[! overlapsAny(cell.borders, 
+                                               chromosome.ends, 
+                                               ignore.strand = T)]
+    
+    cell.borders$cell <- cell
+    
+    LAD.borders <- c(LAD.borders, GRangesList(cell.borders))
+  }
+  
+  names(LAD.borders) <- cells
+  LAD.borders
+  
+}
+
+grMid = function(gr) {
+    start(gr) <- end(gr) <- rowMeans(cbind(start(gr), end(gr)))
+    gr
+}
+
+CTCFDistance <- function(sites, LAD.borders, nearest = T, border.class = F) {
+  # Given (named) GRangesLists of CTCF sites and LAD borders, calculate the 
+  # distance to the preceding and following LAD. Return a new GRangesList
+  
+  cells <- names(sites)
+  
+  # Prepare holders
+  sites.new <- sites
+
+  # Loop over cells 
+  for (cell in cells) {
+    
+    # Get cell objects
+    cell.CTCF <- grMid(sites[[cell]])
+    cell.borders <- LAD.borders[[cell]]
+    
+    # Make sure the chromosomes are as they should be - especially for the bins
+    cell.CTCF <- cell.CTCF[seqnames(cell.CTCF) %in% c(paste0("chr", 1:22),
+                                                      "chrX")]
+    cell.borders <- cell.borders[seqnames(cell.borders) %in% c(paste0("chr", 1:22),
+                                                               "chrX")]
+    
+    # Make sure that a cell column is present - especially for the bins
+    cell.CTCF$cell <- cell
+    
+    # Preceding distance
+    cell.CTCF$dis.precede <- cell.CTCF$strand.precede <- cell.CTCF$border.class.precede <- NA
+    idx.precede <- precede(cell.CTCF, cell.borders, ignore.strand = T, select = "all")
+    cell.CTCF$dis.precede[queryHits(idx.precede)] <- distance(cell.CTCF[queryHits(idx.precede)], 
+                                                              cell.borders[subjectHits(idx.precede)], 
+                                                              ignore.strand = T)
+    cell.CTCF$strand.precede[queryHits(idx.precede)] <- strand(cell.borders[subjectHits(idx.precede)])
+    
+    if (border.class) {
+      cell.CTCF$border.class.precede[queryHits(idx.precede)] <- cell.borders$class[subjectHits(idx.precede)]
+    }
+    
+    # Following distance
+    cell.CTCF$dis.follow <- cell.CTCF$strand.follow <- cell.CTCF$border.class.follow <- NA
+    idx.follow <- follow(cell.CTCF, cell.borders, ignore.strand = T, select = "all")
+    cell.CTCF$dis.follow[queryHits(idx.follow)] <- distance(cell.CTCF[queryHits(idx.follow)], 
+                                                            cell.borders[subjectHits(idx.follow)], 
+                                                            ignore.strand = T)
+    cell.CTCF$strand.follow[queryHits(idx.follow)] <- strand(cell.borders[subjectHits(idx.follow)])
+    
+    if (border.class) {
+      cell.CTCF$border.class.follow[queryHits(idx.follow)] <- cell.borders$class[subjectHits(idx.follow)]
+    }
+    
+    # Exception: overlapping (follow = distance (0), precede = NA)
+    idx.overlap <- findOverlaps(cell.CTCF, cell.borders, ignore.strand = T)
+    cell.CTCF$dis.follow[queryHits(idx.overlap)] <- distance(cell.CTCF[queryHits(idx.overlap)], 
+                                                             cell.borders[subjectHits(idx.overlap)], 
+                                                             ignore.strand = T)
+    cell.CTCF$dis.precede[queryHits(idx.overlap)] <- NA
+    cell.CTCF$strand.follow[queryHits(idx.overlap)] <- cell.CTCF$strand.precede[queryHits(idx.overlap)] <- 
+      strand(cell.borders[subjectHits(idx.overlap)])
+    
+    if (border.class) {
+      cell.CTCF$border.class.precede[queryHits(idx.overlap)] <- 
+        cell.CTCF$border.class.follow[queryHits(idx.overlap)] <-
+        cell.borders$class[subjectHits(idx.overlap)]
+    }
+    
+    # Alternative: only use information from the nearest hit
+    if (nearest) {
+      # Remove precede information if follow is smaller
+      idx.remove.precede <- which(cell.CTCF$dis.follow < cell.CTCF$dis.precede)
+      cell.CTCF$dis.precede[idx.remove.precede] <- NA
+      # Remove follow information if precede is smaller
+      idx.remove.follow <- which(cell.CTCF$dis.follow > cell.CTCF$dis.precede)
+      cell.CTCF$dis.follow[idx.remove.follow] <- NA
+    }
+    
+    # Update object
+    sites.new[[cell]] <- cell.CTCF
+    
+  }
+  
+  sites.new
+  
+}
+
+CountPerBins <- function(sites, sample_name, bin.size = 5000, border.class = F) {
+  # Determine count of CTCF sites per genomic bins
+  
+  if (border.class == F) {
+    
+    tib <- as_tibble(unlist(sites)) %>%
+      mutate(cell = factor(cell, levels = unique(cell))) %>%
+      add_column(number = 1:nrow(.)) %>%
+      dplyr::select(number, cell, dis.precede, dis.follow, strand.precede, strand.follow) %>%
+      mutate(dis.precede.group = as.numeric(cut(dis.precede, 
+                                                breaks = seq(0, max(dis.precede, na.rm = T) + 1, 
+                                                             by = bin.size))) - 1,
+             dis.follow.group = as.numeric(cut(dis.follow, 
+                                               breaks = seq(0, max(dis.follow, na.rm = T) + 1, 
+                                                            by = bin.size))) - 1) %>%
+      dplyr::select(-dis.precede, -dis.follow) %>%
+      mutate(dis.precede.group = ifelse(strand.precede == "+", 
+                                        -dis.precede.group, dis.precede.group),
+             dis.follow.group = ifelse(strand.follow == "+", 
+                                       dis.follow.group, -dis.follow.group)) %>%
+      dplyr::select(-strand.precede, -strand.follow) %>%
+      gather(key, value, -number, -cell) %>%
+      group_by(cell, value) %>%
+      dplyr::summarise(count = n()) %>%
+      ungroup() %>%
+      rename(count = sample_name)
+    
+  } else {
+    
+    tib <- as_tibble(unlist(sites)) %>%
+      mutate(cell = factor(cell, levels = unique(cell))) %>%
+      add_column(number = 1:nrow(.)) %>%
+      dplyr::select(number, cell, dis.precede, dis.follow, strand.precede, strand.follow, 
+                    border.class.precede, border.class.follow) %>%
+      mutate(dis.precede.group = as.numeric(cut(dis.precede, 
+                                                breaks = seq(0, max(dis.precede, na.rm = T) + 1, 
+                                                             by = bin.size))) - 1,
+             dis.follow.group = as.numeric(cut(dis.follow, 
+                                               breaks = seq(0, max(dis.follow, na.rm = T) + 1, 
+                                                            by = bin.size))) - 1) %>%
+      dplyr::select(-dis.precede, -dis.follow) %>%
+      mutate(dis.precede.group = ifelse(strand.precede == "+", 
+                                        -dis.precede.group, dis.precede.group),
+             dis.follow.group = ifelse(strand.follow == "+", 
+                                       dis.follow.group, -dis.follow.group)) %>%
+      dplyr::select(-strand.precede, -strand.follow) %>%
+      gather(key, value, -number, -cell, -border.class.precede, -border.class.follow) %>%
+      drop_na() %>%
+      rowwise() %>%
+      mutate(border.class = ifelse(key == "dis.precede.group", 
+                                   border.class.precede, border.class.follow)) %>%
+      ungroup() %>%
+      dplyr::select(-border.class.precede, -border.class.follow) %>%
+      group_by(cell, value, border.class) %>%
+      dplyr::summarise(count = n()) %>%
+      ungroup() %>%
+      rename(count = sample_name)
+    
+  }
+  
+  tib
+  
+}
+
+ClassifyLADBorders <- function(borders, sites, LADs, overlapping = F, 
+                               cells = levels(metadata$cell),
+                               ranges = c(0, 20000), col_name = "CTCF") {
+  # Classify LAD borders into with and without CTCF
+  for (cell in cells) {
+    
+    # Get cell objects
+    cell.borders <- borders[[cell]]
+    cell.sites <- sites[[cell]]
+    cell.LADs <- LADs[[cell]]
+    
+    # Remove overlapping sites
+    if (! overlapping) cell.sites <- cell.sites[! overlapsAny(cell.sites, cell.LADs)]
+    
+    # Get LAD borders with CTCF peaks within the given range
+    ovl <- distanceToNearest(cell.borders, cell.sites)
+    
+    # Classify borders
+    mcols(cell.borders)[, paste0(col_name, ".distance")] <- mcols(ovl)$distance
+    mcols(cell.borders)[, col_name] <- ifelse(mcols(ovl)$distance >= ranges[1] & 
+                                                mcols(ovl)$distance <= ranges[2],
+                                              "CTCF", "nonCTCF")
+    
+    # Also, add the number of CTCF sites within the range
+    # For this, determine the distance from CTCF site to LAD border instead
+    ovl <- as_tibble(distanceToNearest(cell.sites, cell.borders)) %>%
+      filter(distance >= ranges[1] & distance <= ranges[2]) %>%
+      group_by(subjectHits) %>%
+      dplyr::summarise(n = n())
+    
+    mcols(cell.borders)[, paste0(col_name, ".count")] <- 0
+    mcols(cell.borders)[ovl$subjectHits, paste0(col_name, ".count")] <- ovl$n
+      
+    
+    
+    # Update
+    borders[[cell]] <- cell.borders
+    
+  }
+  
+  borders 
+  
+}
+
+GetBorderDifferences <- function(borders, min.distance = 1e5) {
+  # Differentiate between "shared" and "unique" borders, reflecting fLADs and cLADs
+  
+  # Get all borders
+  borders.all <- unlist(borders)
+  
+  # For every cell, find "unique" borders
+  cells <- names(borders)
+  
+  for (cell in cells) {
+    
+    # Get cell objects
+    borders.cell <- borders[[cell]]
+    borders.others <- borders.all[borders.all$cell != cell]
+    
+    # Get the distance to nearest
+    dis <- distanceToNearest(borders.cell, borders.others)
+    
+    # Classify borders
+    borders.cell$class <- ifelse(mcols(dis)$distance >= min.distance,
+                                 "unique", "shared")
+    
+    # Update object
+    borders[[cell]] <- borders.cell
+    
+  }
+  
+  borders
+  
+}
+
+```
+
+
+### 1. Prepare data
+
+I will perform this analysis in multiple cell types in which the data (DamID + 
+CTCF ChIP) is available. These are:
+
+  * mESC (mouse) - mouse embryonic stem cells
+  * mNPC (mouse) - mouse neural progenitor cells (derived from mESC)
+  * H1 - human stem cells
+  * Hap1 - haploid human cell line
+  * K562 - lymphoblasts from cancer
+  * HCT116 - epithelial colorectal cancer cell line
+  
+Note that some analyses include serum mESC cells with old DamID data. This is 
+not included in the corresponding story / manuscript. The results in these 
+cells are not different from the other cell type. We reasoned that addition
+of these cells only complicate the story and do not add anything.
+  
+For this analysis, I will use 10kb LAD calls from DamID data. I will also 
+do this for the pA-DamID data, to validate that the different data shows the
+same trends.
+
+```{r prepare data, cache = T}
+
+#######################################
+## Prepare metadata
+
+metadata <- as_tibble(t(data.frame(
+  
+  # mESC
+  c("mESC", 
+    "/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results_mouse/HMM/bin-10kb/mESC_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/2_Wapl-0D-antiCtcf_sampleOnly_peaks.narrowPeak"),
+    # "ts200605_CTCF_enrichment_at_LAD_borders/mESC_CTCF_peaks_200.bed"),
+  
+  # mESC - serum
+  c("mESC_serum",
+    "ts201109_CTCF_borders_versus_histone_modifications_serum/HMM/mESC_norm_AD.bed.gz",
+    "Data_NQ/ChIP_NQ/HistoneModifications/Public_serum_ChIP/mESC_serum_CTCFPeaksOnly_ENCFF347BWU.bed"),
+  
+  # mNPC
+  c("mNPC",
+    "/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results_mouse/HMM/bin-10kb/NPC_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/5_WaplNPC-0h_CtcfChIP_sampleOnly_peaks.narrowPeak"),
+  
+  # H1
+  c("H1",
+    "/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/HMM/bin-10kb/H1_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/ts200207_CTCF_peaks/ENCODE/ENCFF821AQO_H1.bed"),
+  
+  # Hap1
+  c("Hap1",
+    "/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/HMM/bin-10kb/Hap1_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/c.leemans/projects/chip_snake/hg38/peaks/Hap1/Haarhuis2017/CTCF_GSM2493878_r1_SRR5266526_peaks.narrowPeak"),
+  
+  # K562
+  c("K562",
+    "/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/HMM/bin-10kb/K562_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/c.leemans/projects/chip_snake/hg38/peaks/K562/Schmidl2015/CTCF_chipmentation_r2_SRR2085872_peaks.narrowPeak"),
+  
+  # HCT116
+  c("HCT116",
+    "/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/HMM/bin-10kb/HCT116_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/ts200207_CTCF_peaks/ENCODE/ENCFF518MQA_HCT116.bed"))),
+
+  .name_repair = ~ c("cell", "LAD.file", "CTCF.file"))
+
+metadata <- metadata %>%
+  mutate(cell = factor(cell, levels = unique(cell))) 
+
+# Also create one object for pA-DamID data
+metadata.pa <- as_tibble(t(data.frame(
+  
+  # mESC-pA
+  c("mESC_pA_PT",
+    "../results_NQ/HMM/bin-10kb/pADamID_PT-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/2_Wapl-0D-antiCtcf_sampleOnly_peaks.narrowPeak"),
+  
+  # Hap1
+  c("Hap1_pA",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts180813_GCF5083_pADamIDtests/results/HMM/bin-10kb/Hap1_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/c.leemans/projects/chip_snake/hg38/peaks/Hap1/Haarhuis2017/CTCF_GSM2493878_r1_SRR5266526_peaks.narrowPeak"),
+  
+  # K562
+  c("K562_pA",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts180813_GCF5083_pADamIDtests/results/HMM/bin-10kb/K562_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/c.leemans/projects/chip_snake/hg38/peaks/K562/Schmidl2015/CTCF_chipmentation_r2_SRR2085872_peaks.narrowPeak"),
+  
+  # HCT116
+  c("HCT116_pA",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts180813_GCF5083_pADamIDtests/results/HMM/bin-10kb/HCT116_LMNB1-10kb-combined_AD.bed.gz",
+    "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/ts200207_CTCF_peaks/ENCODE/ENCFF518MQA_HCT116.bed"))),
+  
+  .name_repair = ~ c("cell", "LAD.file", "CTCF.file"))
+
+metadata.pa <- metadata.pa %>%
+  mutate(cell = factor(cell, levels = unique(cell))) 
+
+
+
+```
+
+Load LADs and prepare basic figures on LAD characteristics (number and size).
+
+```{r load LADs, fig.width = 5, fig.height = 3.5, cache = T}
+
+#######################################
+## Load LADs
+
+# Load LADs as list of GRanges
+LADs <- LoadBed(metadata, "LAD.file", reduce = T, size_filter = T)
+LADs.pa <- LoadBed(metadata.pa, "LAD.file", reduce = T, size_filter = T)
+
+# Combine LADs into one GRanges with cells as argument
+LADs.unlist <- unlist(LADs)
+
+
+#######################################
+## Basic figures
+
+# Plot number of LADs
+as_tibble(LADs) %>% 
+  ggplot(aes(x = cell, fill = cell)) +
+    geom_bar() +
+    ggtitle("LAD count") +
+    xlab("Cell type") +
+    ylab("Count") +
+    scale_fill_brewer(palette = "Set1", name = "Cell type", guide = F) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+    
+# Plot size distribution of LADs
+as_tibble(LADs) %>%
+  ggplot(aes(x = width / 1e6, col = cell)) +
+    geom_density() +
+    ggtitle("LAD size") +
+    xlab("LAD size (Mb)") +
+    ylab("Density") +
+    scale_color_brewer(palette = "Set1", name = "Cell type") +
+    scale_x_log10() +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+
+```
+
+Load CTCF peaks and prepare basic figures on characteristics (number).
+
+I want to add motif orientation to all comparisons, I will use motif orientation
+from FIMO (as Robin did).
+
+```{r Load CTCF sites, cache = T}
+
+#######################################
+## Load CTCF sites
+
+# Load LADs as list of GRanges
+CTCF.sites <- LoadBed(metadata, "CTCF.file")
+
+CTCF.sites.pa <- LoadBed(metadata.pa, "CTCF.file")
+
+# Combine LADs into one GRanges with cells as argument
+CTCF.sites.unlist <- unlist(CTCF.sites)
+
+
+#######################################
+## Basic figures
+
+# Plot number of CTCF peaks
+as_tibble(CTCF.sites) %>% 
+  ggplot(aes(x = cell, fill = cell)) +
+    geom_bar() +
+    ggtitle("CTCF site count") +
+    xlab("Cell type") +
+    ylab("Count") +
+    scale_fill_brewer(palette = "Set1", name = "Cell type", guide = F) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+
+
+
+
+# #######################################
+# ## Add orientation to mESC CTCF peaks
+# 
+
+# Prepare motif orientation from FIMO output (MEME suite)
+fimo_mm10 <- read_tsv("ts210201_CTCF_enrichment_at_LAD_borders/ctcf_peaks/fimo_mm10.tsv") %>%
+  dplyr::rename(seqnames = "sequence_name",
+                sequence = "matched_sequence") %>%
+  drop_na() %>%
+  as(., "GRanges") %>%
+  sort(.)
+export.bed(fimo_mm10, "ts210201_CTCF_enrichment_at_LAD_borders/ctcf_peaks/fimo_mm10.bed")
+
+fimo_hg38 <- read_tsv("ts210201_CTCF_enrichment_at_LAD_borders/ctcf_peaks/fimo_hg38.tsv") %>%
+  dplyr::rename(seqnames = "sequence_name",
+                sequence = "matched_sequence") %>%
+  drop_na() %>%
+  as(., "GRanges") %>%
+  sort(.)
+export.bed(fimo_hg38, "ts210201_CTCF_enrichment_at_LAD_borders/ctcf_peaks/fimo_hg38.bed")
+
+
+
+MotifOrientation <- function(f_orientation, gr_sites, dis_cutoff = 50) {
+  # Update GRanges (gr_sites) with orientation (from f_orien...)
+  # With a max distance of (dis_cutoff)
+  
+  # Load orientation file 
+  ctcf.orientation <- as_tibble(f_orientation)
+  ctcf.orientation$motif <- 1:nrow(ctcf.orientation)
+  
+  # Save as bed files
+  export.bed(as_tibble(ctcf.orientation) %>% filter(strand == "+"),
+             file.path(output_dir, "ctcf_motif_plus.bed"))
+  export.bed(as_tibble(ctcf.orientation) %>% filter(strand == "-"),
+             file.path(output_dir, "ctcf_motif_minus.bed"))
+  
+  # Add this to the CTCF peaks where possible
+  dis <- as_tibble(distanceToNearest(as(ctcf.orientation, "GRanges"),
+                                     gr_sites))
+  
+  # Filter for reasonable distances
+  dis <- dis %>%
+    filter(distance < 50) %>%
+    arrange(distance) %>%
+    rename_at(1:2, ~ c("motif", "peak"))
+  
+  # Add motif numbers
+  dis_bypeak <- dis %>%
+    left_join(ctcf.orientation %>%
+                dplyr::select(motif, strand, score)) %>%
+    group_by(peak) %>%
+    summarise(n = n(),
+              strand = case_when(all(strand == "+") ~ "+",
+                                 all(strand == "-") ~ "-",
+                                 T ~ "both"))
+  
+  # Add the CTCF sites
+  gr_sites$motif_count <- 0
+  gr_sites$motif_strand <- NA
+  
+  gr_sites$motif_count[dis_bypeak$peak] <- dis_bypeak$n
+  gr_sites$motif_strand[dis_bypeak$peak] <- dis_bypeak$strand
+  
+  gr_sites
+  
+}
+
+# Add orientation based on orientation file
+for (cell in metadata$cell) {
+  if (cell %in% c("mESC", "mESC_serum", "mNPC")) {
+    CTCF.sites[[cell]] <- MotifOrientation(fimo_mm10, 
+                                           CTCF.sites[[cell]])
+  } else {
+    CTCF.sites[[cell]] <- MotifOrientation(fimo_hg38, 
+                                           CTCF.sites[[cell]])
+  }
+}
+
+for (cell in metadata.pa$cell) {
+  if (cell %in% c("mESC_pA_PT")) {
+    CTCF.sites.pa[[cell]] <- MotifOrientation(fimo_mm10, 
+                                              CTCF.sites.pa[[cell]])
+  } else {
+    CTCF.sites.pa[[cell]] <- MotifOrientation(fimo_hg38, 
+                                              CTCF.sites.pa[[cell]])
+  }
+}
+
+```
+
+Finally, I will prepare lists with all the genomic bins to use as a 
+background distribution.
+
+```{r load all bins as control, cache = T} 
+
+#######################################
+## As control, also do this for all 10kb bins
+
+# Read 10kb bins (for human and mouse)
+bins.10kb.human <- read_tsv("/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/counts/bin-10kb/K562_r1_LMNB1-10kb.counts.txt.gz", col_names = c("seqnames", "start", "end", "count"))
+bins.10kb.human <- as(bins.10kb.human, "GRanges")
+bins.10kb.human$species <- "human"
+start(bins.10kb.human) <- start(bins.10kb.human) + 1
+
+bins.10kb.mouse <- read_tsv("../results_NQ/counts/bin-10kb/pADamID_CTCF-EL_0h_Dam_r1-10kb.counts.txt.gz", 
+                            col_names = c("seqnames", "start", "end", "count"))
+bins.10kb.mouse <- as(bins.10kb.mouse, "GRanges")
+bins.10kb.mouse$species <- "mouse"
+start(bins.10kb.mouse) <- start(bins.10kb.mouse) + 1
+
+# Prepare similar GRangesList as the CTCF sites
+bins.10kb <- GRangesList(mESC = bins.10kb.mouse,
+                         mESC_serum = bins.10kb.mouse, 
+                        mNPC = bins.10kb.mouse,
+                        H1 = bins.10kb.human,
+                        Hap1 = bins.10kb.human,
+                        K562 = bins.10kb.human,
+                        HCT116 = bins.10kb.human)
+                        # HFF = bins.10kb.human,
+                        # HEPG2 = bins.10kb.human)
+                        # RPE = bins.10kb.human)
+
+bins.10kb.pa <- GRangesList(mESC_pA_PT = bins.10kb.mouse,
+                           Hap1_pA = bins.10kb.human,
+                           K562_pA = bins.10kb.human,
+                           HCT116_pA = bins.10kb.human)
+
+```
+
+
+### 2. LAD enrichment of CTCF sites
+
+LADs are usually depleted in CTCF sites. Can I confirm this in the data here?
+
+```{r LAD enrichment of CTCF sites, cache = T}
+
+#######################################
+## Add LAD overlap to CTCF sites
+
+# Loop over the cells and add LAD overlap
+for (cell in metadata$cell) {
+  
+  # Get the cell-specific data
+  cell.CTCF <- CTCF.sites[[cell]]
+  cell.LADs <- LADs[[cell]]
+  
+  # Add LAD overlap
+  cell.CTCF$which.LAD <- cell.CTCF$overlap.LAD <- NA
+  
+  dis <- as_tibble(distanceToNearest(cell.CTCF, cell.LADs))
+  cell.CTCF$which.LAD[dis$queryHits] <- dis$subjectHits
+  cell.CTCF$overlap.LAD[dis$queryHits] <- dis$distance == 0
+  
+  # Save data
+  CTCF.sites[[cell]] <- cell.CTCF
+  
+}
+
+for (cell in metadata.pa$cell) {
+  
+  # Get the cell-specific data
+  cell.CTCF <- CTCF.sites.pa[[cell]]
+  cell.LADs <- LADs.pa[[cell]]
+  
+  # Add LAD overlap
+  cell.CTCF$which.LAD <- cell.CTCF$overlap.LAD <- NA
+  
+  dis <- as_tibble(distanceToNearest(cell.CTCF, cell.LADs))
+  cell.CTCF$which.LAD[dis$queryHits] <- dis$subjectHits
+  cell.CTCF$overlap.LAD[dis$queryHits] <- dis$distance == 0
+  
+  # Save data
+  CTCF.sites.pa[[cell]] <- cell.CTCF
+  
+}
+
+
+#######################################
+## Plot fraction in LAD
+
+# Generate summary
+tib <- as_tibble(unlist(CTCF.sites)) %>%
+  group_by(cell) %>%
+  summarise(count = n(),
+            fraction = mean(overlap.LAD, na.rm = T))
+
+# Random distribution of CTCF sites
+tib.random <- as_tibble(do.call(rbind, 
+                                lapply(metadata$cell, 
+                                       function(cell) c(cell, 
+                                                        sum(bins.10kb[[cell]] %over% LADs[[cell]]) / 
+                                                          length(bins.10kb[[cell]])))),
+                        .name_repair = ~ c("cell", "expected"))
+
+# Plot fraction in LADs and expectation
+tib %>%
+  ggplot(aes(x = cell, y = fraction)) +
+    geom_bar(stat = "identity") +
+    geom_point(data = tib.random, aes(x = cell, y = expected), 
+               col = "red", size = 3) +
+    ggtitle("CTCF enrichment in LADs") +
+    ylim(0, 1) +
+    xlab("Cell type") +
+    ylab("Fraction peaks in LADs") +
+    scale_fill_brewer(palette = "Set1", name = "Cell type", guide = F) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+Note that the red dot shows the expected count, based on the total size of all 
+LADs combined. In all cell lines, CTCF peaks are depleted in LADs. 
+
+
+### 3. Get LAD borders
+
+Next, get the LAD borders from the LAD domains. Extract LAD borders with 
+orientation, where "+" is left border and "-" is the left border. 
+
+```{r extract LAD borders, cache = T}
+
+#######################################
+## Get LAD borders 
+
+# Minimum distance that LADs should be apart
+plotting.window <- 0
+
+# Get the borders
+LAD.borders <- LADBorders(LADs, bins.10kb, min.distance = plotting.window)
+LAD.borders.pa <- LADBorders(LADs.pa, bins.10kb.pa, min.distance = plotting.window)
+
+```
+
+Update 20-07-22: it might be good to remove LAD borders with active genes, which
+can further impact results. Let's mark those LAD borders. (Without removing them)
+
+```{r load expression mesc, cache = T}
+
+# Load expression
+genes_mouse <- readRDS("ts200604_GeneExpression/genes.rds")
+fpkm_mesc <- readRDS("ts200604_GeneExpression/genes_fpkm_mean.rds")
+
+# Expand genes - genes
+genes_mouse_expand <- genes_mouse
+start(genes_mouse_expand) <- start(genes_mouse) - (bin.size+1)
+end(genes_mouse_expand) <- end(genes_mouse) + (bin.size+1)
+
+# Mark borders close to genes
+ovl <- as_tibble(findOverlaps(LAD.borders[["mESC"]], 
+                              genes_mouse_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_mouse)[subjectHits]),
+         expression = fpkm_mesc$WT_0h[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders[["mESC"]]$ovl_gene <- (1:length(LAD.borders[["mESC"]])) %in% ovl$queryHits
+LAD.borders[["mESC"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders[["mESC"]]$max_gene_expression <- 0
+LAD.borders[["mESC"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders[["mESC"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+# Mark borders close to genes - pA-DamID data
+ovl <- as_tibble(findOverlaps(LAD.borders.pa[["mESC_pA_PT"]], 
+                              genes_mouse_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_mouse)[subjectHits]),
+         expression = fpkm_mesc$WT_0h[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders.pa[["mESC_pA_PT"]]$ovl_gene <- (1:length(LAD.borders.pa[["mESC_pA_PT"]])) %in% ovl$queryHits
+LAD.borders.pa[["mESC_pA_PT"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders.pa[["mESC_pA_PT"]]$max_gene_expression <- 0
+LAD.borders.pa[["mESC_pA_PT"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders.pa[["mESC_pA_PT"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+
+# Also get TSS and TES
+tss_mouse <- tes_mouse <- genes_mouse
+mcols(tss_mouse) <- mcols(tes_mouse) <- data.frame(motif_count = 1,
+                                                   motif_strand = strand(genes_mouse))
+start(tss_mouse) <- end(tss_mouse) <- ifelse(strand(genes_mouse) == "+", 
+                                             start(genes_mouse), 
+                                             end(genes_mouse))
+start(tes_mouse) <- end(tes_mouse) <- ifelse(strand(genes_mouse) == "-", 
+                                             start(genes_mouse), 
+                                             end(genes_mouse))
+
+
+```
+
+```{r load expression mNPC, cache = T}
+
+# Load expression
+fpkm_mNPC <- full_join(read_tsv(file.path(output_dir, "gene_expression", "GSM2533845_NPC_rep1.txt.gz")) %>%
+                         dplyr::rename(npc_r1 = "fpkm"),
+                       read_tsv(file.path(output_dir, "gene_expression", "GSM2533846_NPC_rep2.txt.gz")) %>%
+                         dplyr::rename(npc_r2 = "fpkm")) %>%
+  mutate(mNPC = (npc_r1 + npc_r2) / 2) %>%
+  dplyr::rename(ensembl_id = "ENSEMBL_ID")
+
+fpkm_mNPC <- left_join(fpkm_mesc %>% dplyr::select(ensembl_id), 
+                       fpkm_mNPC)
+
+
+# Mark borders close to genes
+ovl <- as_tibble(findOverlaps(LAD.borders[["mNPC"]], 
+                              genes_mouse_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_mouse)[subjectHits]),
+         expression = fpkm_mNPC$mNPC[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders[["mNPC"]]$ovl_gene <- (1:length(LAD.borders[["mNPC"]])) %in% ovl$queryHits
+LAD.borders[["mNPC"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders[["mNPC"]]$max_gene_expression <- 0
+LAD.borders[["mNPC"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders[["mNPC"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+
+```
+
+I will also do this for the human data. Simple solution: repeat code several 
+times.
+
+```{r load expression human, cache = T}
+
+# Load expression
+genes_human <- readRDS("~/mydata/proj/3D_nucleus/results/ts191220_laminaVsNucleolus_NewAnalyses/ts200113_GeneExpression/genes.rds")
+fpkm_human <- readRDS("~/mydata/proj/3D_nucleus/results/ts191220_laminaVsNucleolus_NewAnalyses/ts200113_GeneExpression/tib_fpkm.rds")
+
+# Expand genes
+genes_human_expand <- genes_human
+start(genes_human_expand) <- start(genes_human) - (bin.size+1)
+end(genes_human_expand) <- end(genes_human) + (bin.size+1)
+
+
+
+# Mark borders close to genes - H1 cells
+ovl <- as_tibble(findOverlaps(LAD.borders[["H1"]], 
+                              genes_human_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_human)[subjectHits]),
+         expression = fpkm_human$H1_expr[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders[["H1"]]$ovl_gene <- (1:length(LAD.borders[["H1"]])) %in% ovl$queryHits
+LAD.borders[["H1"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders[["H1"]]$max_gene_expression <- 0
+LAD.borders[["H1"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders[["H1"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+# Mark borders close to genes - Hap1 cells
+ovl <- as_tibble(findOverlaps(LAD.borders[["Hap1"]], 
+                              genes_human_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_human)[subjectHits]),
+         expression = fpkm_human$Hap1_expr[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders[["Hap1"]]$ovl_gene <- (1:length(LAD.borders[["Hap1"]])) %in% ovl$queryHits
+LAD.borders[["Hap1"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders[["Hap1"]]$max_gene_expression <- 0
+LAD.borders[["Hap1"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders[["Hap1"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+ovl <- as_tibble(findOverlaps(LAD.borders.pa[["Hap1_pA"]], 
+                              genes_human_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_human)[subjectHits]),
+         expression = fpkm_human$Hap1_expr[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders.pa[["Hap1_pA"]]$ovl_gene <- (1:length(LAD.borders.pa[["Hap1_pA"]])) %in% ovl$queryHits
+LAD.borders.pa[["Hap1_pA"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders.pa[["Hap1_pA"]]$max_gene_expression <- 0
+LAD.borders.pa[["Hap1_pA"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders.pa[["Hap1_pA"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+# Mark borders close to genes - HCT116 cells
+ovl <- as_tibble(findOverlaps(LAD.borders[["HCT116"]], 
+                              genes_human_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_human)[subjectHits]),
+         expression = fpkm_human$HCT116_expr[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders[["HCT116"]]$ovl_gene <- (1:length(LAD.borders[["HCT116"]])) %in% ovl$queryHits
+LAD.borders[["HCT116"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders[["HCT116"]]$max_gene_expression <- 0
+LAD.borders[["HCT116"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders[["HCT116"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+ovl <- as_tibble(findOverlaps(LAD.borders.pa[["HCT116_pA"]], 
+                              genes_human_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_human)[subjectHits]),
+         expression = fpkm_human$HCT116_expr[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders.pa[["HCT116_pA"]]$ovl_gene <- (1:length(LAD.borders.pa[["HCT116_pA"]])) %in% ovl$queryHits
+LAD.borders.pa[["HCT116_pA"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders.pa[["HCT116_pA"]]$max_gene_expression <- 0
+LAD.borders.pa[["HCT116_pA"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders.pa[["HCT116_pA"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+# Mark borders close to genes - K562 cells
+ovl <- as_tibble(findOverlaps(LAD.borders[["K562"]], 
+                              genes_human_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_human)[subjectHits]),
+         expression = fpkm_human$K562_expr[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders[["K562"]]$ovl_gene <- (1:length(LAD.borders[["K562"]])) %in% ovl$queryHits
+LAD.borders[["K562"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders[["K562"]]$max_gene_expression <- 0
+LAD.borders[["K562"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders[["K562"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+ovl <- as_tibble(findOverlaps(LAD.borders.pa[["K562_pA"]], 
+                              genes_human_expand, 
+                              ignore.strand = T)) %>%
+  mutate(strand = as.character(strand(genes_human)[subjectHits]),
+         expression = fpkm_human$K562_expr[subjectHits]) %>%
+  filter(expression > 1) %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(max_expression = max(expression),
+                   min_expression = min(expression),
+                   strand = case_when(all(strand == "+") ~ "+",
+                                      all(strand == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+LAD.borders.pa[["K562_pA"]]$ovl_gene <- (1:length(LAD.borders.pa[["K562_pA"]])) %in% ovl$queryHits
+LAD.borders.pa[["K562_pA"]]$strand_of_gene <- factor(NA, levels = c("+", "-", "ambiguous"))
+LAD.borders.pa[["K562_pA"]]$max_gene_expression <- 0
+LAD.borders.pa[["K562_pA"]]$strand_of_gene[ovl$queryHits] <- ovl$strand
+LAD.borders.pa[["K562_pA"]]$max_gene_expression[ovl$queryHits] <- ovl$max_expression
+
+
+# Also get TSS and TES
+tss_human <- tes_human <- genes_human
+mcols(tss_human) <- mcols(tes_human) <- data.frame(motif_count = 1,
+                                                   motif_strand = strand(genes_human))
+start(tss_human) <- end(tss_human) <- ifelse(strand(genes_human) == "+", 
+                                             start(genes_human), 
+                                             end(genes_human))
+start(tes_human) <- end(tes_human) <- ifelse(strand(genes_human) == "-", 
+                                             start(genes_human), 
+                                             end(genes_human))
+
+
+```
+
+
+
+### 4. LAD border enrichment of CTCF sites
+
+To compare CTCF density to LAD borders, I first need to compute the distance to
+LAD borders.
+
+```{r compute distance to LAD border, cache = T}
+
+#######################################
+## Calculate CTCF positioning near LAD borders
+
+# Also select bins overlapping a CTCF site for a different perspective
+bins.10kb.CTCF <- bins.10kb
+
+for (cell in names(bins.10kb.CTCF)) {
+  cell.bins <- bins.10kb.CTCF[[cell]]
+  cell.CTCF <- grMid(CTCF.sites[[cell]])
+  
+  cell.bins <- cell.bins[overlapsAny(cell.bins, cell.CTCF)]
+  
+  bins.10kb.CTCF[[cell]] <- cell.bins
+  
+}
+
+bins.10kb.CTCF.pa <- bins.10kb.pa
+
+for (cell in names(bins.10kb.CTCF.pa)) {
+  cell.bins <- bins.10kb.CTCF.pa[[cell]]
+  cell.CTCF <- grMid(CTCF.sites.pa[[cell]])
+  
+  cell.bins <- cell.bins[overlapsAny(cell.bins, cell.CTCF)]
+  
+  bins.10kb.CTCF.pa[[cell]] <- cell.bins
+  
+}
+
+# Distance to LAD border
+CTCF.sites <- CTCFDistance(CTCF.sites, LAD.borders)
+bins.10kb <- CTCFDistance(bins.10kb, LAD.borders)
+bins.10kb.CTCF <- CTCFDistance(bins.10kb.CTCF, LAD.borders)
+
+CTCF.sites.pa <- CTCFDistance(CTCF.sites.pa, LAD.borders.pa)
+bins.10kb.pa <- CTCFDistance(bins.10kb.pa, LAD.borders.pa)
+bins.10kb.CTCF.pa <- CTCFDistance(bins.10kb.CTCF.pa, LAD.borders.pa)
+
+
+#######################################
+## Get count per 10kb bins for CTCF and control bins
+
+# Count occurences
+CTCF.distances <- CountPerBins(CTCF.sites, sample_name = "CTCF", bin.size = bin.size)
+bins.distances <- CountPerBins(bins.10kb, sample_name = "bins", bin.size = bin.size)
+bins.CTCF.distances <- CountPerBins(bins.10kb.CTCF, sample_name = "bins.CTCF", bin.size = bin.size)
+
+CTCF.distances.pa <- CountPerBins(CTCF.sites.pa, sample_name = "CTCF", bin.size = bin.size)
+bins.distances.pa <- CountPerBins(bins.10kb.pa, sample_name = "bins", bin.size = bin.size)
+bins.CTCF.distances.pa <- CountPerBins(bins.10kb.CTCF.pa, sample_name = "bins.CTCF", bin.size = bin.size)
+
+# Calculate ratios
+distances <- CTCF.distances %>%
+  full_join(bins.distances) %>%
+  full_join(bins.CTCF.distances) %>%
+  rowwise() %>%
+  mutate(ratio = CTCF / bins,
+         ratio_withCTCF = bins.CTCF / bins) %>%
+  ungroup() %>%
+  filter(bins > 50)
+
+distances.pa <- CTCF.distances.pa %>%
+  full_join(bins.distances.pa) %>%
+  full_join(bins.CTCF.distances.pa) %>%
+  rowwise() %>%
+  mutate(ratio = CTCF / bins,
+         ratio_withCTCF = bins.CTCF / bins) %>%
+  ungroup() %>%
+  filter(bins > 50)
+
+
+```
+
+Having the distances and a summary table, I can do some plotting. I will plot
+the results in two ways:
+
+  * Average amount of CTCF-sites per 10kb bins (similar to Guelen, 2008)
+  * Fraction of 10kb bins overlapping with a CTCF peak - this is what I will use
+  later on.
+
+```{r plot distances to LAD border, fig.width = 1.5, fig.height = 10, cache = T}
+
+#######################################
+## Plot the distances
+
+# Plot the CTCF density for 10kb bins (100x 10kb = 1Mb)
+distances %>%
+  filter(cell != "mESC_serum") %>%
+  ggplot(aes(x = value / scaling, y = ratio)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(col = "red", size = 1) +
+    facet_grid(cell ~ .) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("CTCF-bound sites per 10kb") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.35)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Plot the fraction of bins with CTCF peaks
+distances %>%
+  filter(cell != "mESC_serum") %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(col = "red", size = 1) +
+    facet_grid(cell ~ .) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("Fraction 10kb bins overlapping a CTCF peak") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.37)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Zoom-in
+distances %>%
+  filter(cell != "mESC_serum") %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(col = "red", size = 1) +
+    facet_grid(cell ~ .) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("Fraction 10kb bins overlapping a CTCF peak") +
+    coord_cartesian(xlim = c(-0.1, 0.1), ylim = c(0, 0.37)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# For pA data sets
+distances.pa %>%
+  ggplot(aes(x = value / scaling, y = ratio)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(col = "red", size = 1) +
+    facet_grid(cell ~ .) +
+    ggtitle("CTCF enrichment at pA-DamID LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("CTCF-bound sites per 10kb") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.43)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+distances.pa %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(col = "red", size = 1) +
+    facet_grid(cell ~ .) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("Fraction 10kb bins overlapping a CTCF peak") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.35)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Zoom-in
+distances.pa %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(col = "red", size = 1) +
+    facet_grid(cell ~ .) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("Fraction 10kb bins overlapping a CTCF peak") +
+    coord_cartesian(xlim = c(-0.1, 0.1), ylim = c(0, 0.35)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+It seems that CTCF peaks are indeed enriched surrounding LAD borders for some 
+cells. The enrichment in mESC cells is not very strong, but I would argue still
+present. 
+
+
+### 5. Classify CTCF-LAD borders
+
+From the previous analysis I know that the CTCF peak occurs at distances 
+15000-5000 bases before the LAD border. Here, I will classify LAD borders into
+borders with and without CTCF, using these cutoffs.
+
+```{r classify LAD borders, fig.width = 5, fig.height = 3.5, cache = T}
+
+# Classify LAD borders
+LAD.borders <- ClassifyLADBorders(LAD.borders, CTCF.sites, LADs)
+
+# Plot amount
+as_tibble(LAD.borders) %>%
+  dplyr::select(group_name, CTCF) %>%
+  group_by(group_name) %>%
+  summarise(mean(CTCF == "CTCF")) %>%
+  rename_at(vars(names(.)), ~ c("cell", "fraction")) %>%
+  mutate(cell = factor(cell, levels = levels(metadata$cell))) %>%
+  ggplot(aes(x = cell, y = fraction, fill = cell)) +
+    geom_bar(stat = "identity") +
+    scale_fill_brewer(palette = "Set1", name = "Cell type", guide = F) +
+    ggtitle("LAD border classification with CTCF status") +
+    xlab(NULL) +
+    ylab("Fraction borders defined as CTCF borders") +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Classify LAD borders
+LAD.borders.pa <- ClassifyLADBorders(LAD.borders.pa, CTCF.sites.pa, LADs.pa, 
+                                     cells = levels(metadata.pa$cell))
+
+# Plot amount
+as_tibble(LAD.borders.pa) %>%
+  dplyr::select(group_name, CTCF) %>%
+  group_by(group_name) %>%
+  summarise(mean(CTCF == "CTCF")) %>%
+  rename_at(vars(names(.)), ~ c("cell", "fraction")) %>%
+  mutate(cell = factor(cell, levels = levels(metadata.pa$cell))) %>%
+  ggplot(aes(x = cell, y = fraction, fill = cell)) +
+    geom_bar(stat = "identity") +
+    scale_fill_brewer(palette = "Set1", name = "Cell type", guide = F) +
+    ggtitle("LAD border classification with CTCF status") +
+    xlab(NULL) +
+    ylab("Fraction borders defined as CTCF borders") +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+
+### 6. CTCF motif orientation
+
+The previous figures show the enrichment of CTCF at LAD borders. However, CTCF
+binds the genome in an oriented manner, and we should treat this accordingly.
+Let's show how the CTCF motif is oriented at LAD borders. 
+
+```{r ctcf motif orientation, fig.width = 2.5, fig.height = 8, cache = T}
+
+# Classify LAD borders based on CTCF orientation 
+ClassifyLADBordersOrientation <- function(borders_mESC, ctcf_sites, LADs_mESC, overlapping = F, 
+                                          ranges = c(0, 20000), col_name = "CTCF") {
+  
+  
+  # Remove overlapping sites
+  if (! overlapping) ctcf_sites <- ctcf_sites[! overlapsAny(ctcf_sites, LADs_mESC)]
+  
+  # Get LAD borders with CTCF peaks within the given range
+  dis_borders <- as_tibble(distanceToNearest(borders_mESC, ctcf_sites, ignore.strand = T))
+  dis_sites <- as_tibble(distanceToNearest(ctcf_sites, borders_mESC, ignore.strand = T))
+  
+  # Determine uniqueness of borders - from ctcf peaks
+  dis_sites <- dis_sites %>%
+    filter(distance < ranges[2]) %>%
+    mutate(border = subjectHits,
+           border_strand = as.character(strand(borders_mESC)[subjectHits]),
+           motif_strand = as.character(ctcf_sites$motif_strand[queryHits]),
+           motif_orientation = as.character(ctcf_sites$motif_orientation[queryHits])) %>%
+    group_by(border) %>%
+    summarise(mESC_inwards = all(motif_orientation == "mESC_inwards"),
+              mESC_outwards = all(motif_orientation == "mESC_outwards")) %>%
+    ungroup() %>%
+    mutate(class = case_when(mESC_inwards == T ~ "inwards",
+                             mESC_outwards == T ~ "outwards",
+                             T ~ "ambiguous"))
+  
+  # Determine uniqueness of borders - from borders
+  dis_borders <- dis_borders %>%
+    filter(distance < ranges[2]) %>%
+    mutate(border = queryHits,
+           border_strand_border = as.character(strand(borders_mESC)[queryHits]),
+           motif_strand_border = as.character(ctcf_sites$motif_strand[subjectHits]),
+           motif_orientation_border = as.character(ctcf_sites$motif_orientation[subjectHits])) %>%
+    mutate(class_border = case_when(motif_orientation_border == "mESC_both" ~ "ambiguous",
+                                    motif_orientation_border == "mESC_inwards" ~ "inwards",
+                                    motif_orientation_border == "mESC_outwards" ~ "outwards")) %>%
+    dplyr::select(-queryHits, -subjectHits)
+  
+  # Combine
+  border_class <- full_join(dis_sites, dis_borders) %>%
+    mutate(class = case_when(is.na(class) ~ "ambiguous",
+                             T ~ class))
+  
+  # Classify borders
+  mcols(borders_mESC)[, col_name] <- "nonCTCF"
+  mcols(borders_mESC)[border_class$border, col_name] <- border_class$class
+  
+  borders_mESC 
+  
+}
+
+
+
+
+CTCFOrientationEnrichment <- function(gr_sites, gr_lads, gr_borders, gr_bins, cell) {
+  
+  original_cell <- cell
+  
+  # Get ctcf peaks
+  ctcf <- as_tibble(gr_sites) %>% 
+    rowwise() %>%
+    mutate(distance = ifelse(overlap.LAD == T,
+                             max(dis.precede, dis.follow, na.rm = T),
+                             - max(dis.precede, dis.follow, na.rm = T)),
+           at_border = distance <= 0 & distance > -20e3,
+           border = case_when(overlap.LAD == T & is.na(dis.follow) ~ "right",
+                              overlap.LAD == F & is.na(dis.precede) ~ "right",
+                              T ~ "left")) %>%
+    ungroup()
+  
+  # Update CTCF sites
+  gr_sites$distance <- ctcf$distance
+  gr_sites$border <- ctcf$border
+  gr_sites$at_border <- ctcf$at_border
+  
+  # Which bin size should I use for this?
+  ctcf_bin_size <- bin.size
+  scaling = 1e6 / ctcf_bin_size
+  
+  # Separate CTCF outwards and inwards of the LAD border
+  ctcf_outwards <- ctcf %>%
+    filter(motif_count > 0,
+           ! motif_strand == "both",
+           ! (border == "right" & motif_strand == "-"),
+           ! (border == "left" & motif_strand == "+")) %>%
+    mutate(cell = paste0(cell, "_outwards"))
+  
+  ctcf_inwards <- ctcf %>%
+    filter(motif_count > 0,
+           ! motif_strand == "both",
+           ! (border == "left" & motif_strand == "-"),
+           ! (border == "right" & motif_strand == "+")) %>%
+    mutate(cell = paste0(cell, "_inwards"))
+  
+  ctcf_both <- ctcf %>%
+    filter(motif_count > 0,
+           motif_strand == "both") %>%
+    mutate(cell = paste0(cell, "_both"))
+  
+  ctcf <- ctcf %>%
+    mutate(motif_orientation = case_when((motif_count > 0 &
+                                            ! motif_strand == "both" &
+                                            ! (border == "right" & motif_strand == "-") &
+                                            ! (border == "left" & motif_strand == "+")) ~ "mESC_outwards",
+                                         (motif_count > 0 &
+                                            ! motif_strand == "both" &
+                                            ! (border == "left" & motif_strand == "-") &
+                                            ! (border == "right" & motif_strand == "+")) ~ "mESC_inwards",
+                                         (motif_count > 0 &
+                                            motif_strand == "both") ~ paste0(cell, "_both"),
+                                         T ~ paste0(cell, "_nostrand")))
+  gr_ctcf <- as(ctcf, "GRanges")
+  
+  # Prepare lists for functions made previously
+  ctcf_list <- GRangesList(outwards = as(ctcf_outwards, "GRanges"),
+                           inwards = as(ctcf_inwards, "GRanges"),
+                           both = as(ctcf_both, "GRanges"))
+  border_list <- GRangesList(outwards = gr_borders,
+                             inwards = gr_borders,
+                             both = gr_borders)
+  bins_10kb <- GRangesList(outwards = gr_bins,
+                           inwards = gr_bins,
+                           both = gr_bins)
+  LAD_list <- GRangesList(outwards = gr_lads,
+                          inwards = gr_lads,
+                          both = gr_lads)
+  
+  
+  # Also select bins overlapping a CTCF site for a different perspective
+  bins_10kb_CTCF <- bins_10kb
+  
+  for (cell in names(bins_10kb_CTCF)) {
+    cell_bins <- bins_10kb_CTCF[[cell]]
+    cell_CTCF <- grMid(ctcf_list[[cell]])
+    
+    cell_bins <- cell_bins[overlapsAny(cell_bins, cell_CTCF)]
+    
+    bins_10kb_CTCF[[cell]] <- cell_bins
+    
+  }
+  
+  
+  # Distance to LAD border
+  ctcf_list <- CTCFDistance(ctcf_list, border_list)
+  bins_10kb <- CTCFDistance(bins_10kb, border_list)
+  bins_10kb_CTCF <- CTCFDistance(bins_10kb_CTCF, border_list)
+  
+  # Count occurences
+  cell_distances <- CountPerBins(ctcf_list, sample_name = "CTCF", bin.size = ctcf_bin_size)
+  bins_distances <- CountPerBins(bins_10kb, sample_name = "bins", bin.size = ctcf_bin_size)
+  bins_CTCF_distances <- CountPerBins(bins_10kb_CTCF, sample_name = "bins_CTCF", bin.size = ctcf_bin_size)
+  
+  # Calculate ratios
+  distances <- cell_distances %>%
+    full_join(bins_distances) %>%
+    full_join(bins_CTCF_distances) %>%
+    rowwise() %>%
+    mutate(ratio = CTCF / bins,
+           ratio_withCTCF = bins_CTCF / bins,
+           original_cell = original_cell) %>%
+    ungroup() %>%
+    filter(bins > 50,
+           cell != "both")
+  
+  # Plot the fraction of bins with CTCF peaks
+  plt <- distances %>%
+    ggplot(aes(x = value / scaling, y = ratio_withCTCF, col = cell)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(size = 1) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("Fraction 10kb bins overlapping a CTCF peak") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.16)) +
+    scale_color_brewer(palette = "Set2") +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  #plot(plt)
+  
+  plt <- distances %>%
+    ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(size = 1, col = "red") +
+    facet_grid(. ~ cell) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("Fraction 10kb bins overlapping a CTCF peak") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.16)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  #plot(plt)
+  
+  
+  
+  
+  # Classify LAD borders
+  gr_borders <- ClassifyLADBordersOrientation(gr_borders, gr_ctcf, gr_lads,
+                                                col_name = c("CTCF_strand"))
+  
+  
+  
+  # Plot amount
+  plt <- as_tibble(gr_borders) %>%
+    group_by(CTCF_strand) %>%
+    summarise(n = n()) %>%
+    mutate(fraction = n / sum(n)) %>%
+    mutate(CTCF_strand = factor(CTCF_strand, 
+                                levels = c("outwards", "inwards", "ambiguous", "nonCTCF"))) %>%
+    ggplot(aes(x = CTCF_strand, y = fraction, fill = CTCF_strand)) +
+    geom_bar(stat = "identity") +
+    scale_fill_brewer(palette = "Set1", name = "Cell type", guide = F) +
+    ggtitle("LAD border classification with CTCF status") +
+    xlab(NULL) +
+    ylab("Fraction borders defined as CTCF borders") +
+    scale_fill_brewer(palette = "Set2", name = "Border class") +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  #plot(plt)
+  
+  
+  # Also, update CTCF peaks
+  tib <- as_tibble(gr_sites) %>%
+    dplyr::select(seqnames, start, end, which.LAD, border, at_border) %>%
+    mutate(border_idx = 2 * which.LAD - ifelse(border == "left", 1, 0),
+           border_class = gr_borders$CTCF_strand[border_idx])
+  
+  gr_sites$border_idx <- tib$border_idx
+  gr_sites$border_class <- tib$border_class
+  
+  # Return objects
+  list(gr_sites, gr_borders, distances)
+  
+}
+
+# 1) DamID data
+all_distances <- tibble()
+
+for (cell in metadata$cell) {
+  if (cell %in% c("mESC", "mESC_serum", "mNPC")) {
+    tmp <- CTCFOrientationEnrichment(gr_sites = CTCF.sites[[cell]],
+                                     gr_lads = LADs[[cell]],
+                                     gr_borders = LAD.borders[[cell]],
+                                     gr_bins = bins.10kb.mouse,
+                                     cell = cell)
+    
+  } else {
+    tmp <- CTCFOrientationEnrichment(gr_sites = CTCF.sites[[cell]],
+                                     gr_lads = LADs[[cell]],
+                                     gr_borders = LAD.borders[[cell]],
+                                     gr_bins = bins.10kb.human,
+                                     cell = cell)
+  }
+  CTCF.sites[[cell]] <- tmp[[1]]
+  LAD.borders[[cell]] <- tmp[[2]]
+  all_distances <- bind_rows(all_distances, tmp[[3]])
+}
+
+plt <- all_distances %>%
+  filter(original_cell != "mESC_serum") %>%
+  mutate(original_cell = factor(original_cell, levels(metadata$cell))) %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+  annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_line(size = 1, col = "red") +
+  facet_grid(original_cell ~ cell) +
+  ggtitle("CTCF enrichment at LAD borders") +
+  xlab("Distance from LAD border (Mb)") +
+  ylab("Fraction 10kb bins overlapping a CTCF peak") +
+  coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.13)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+plt <- all_distances %>%
+  filter(original_cell != "mESC_serum") %>%
+  mutate(original_cell = factor(original_cell, levels(metadata$cell))) %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+  annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_line(size = 1, col = "red") +
+  facet_grid(original_cell ~ cell) +
+  ggtitle("CTCF enrichment at LAD borders") +
+  xlab("Distance from LAD border (Mb)") +
+  ylab("Fraction 10kb bins overlapping a CTCF peak") +
+  coord_cartesian(xlim = c(-0.15, 0.15), ylim = c(0, 0.13)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+
+# 2) pA_DamID data
+all_distances <- tibble()
+
+for (cell in metadata.pa$cell) {
+  if (cell %in% c("mESC_pA_pT")) {
+    tmp <- CTCFOrientationEnrichment(gr_sites = CTCF.sites.pa[[cell]],
+                                     gr_lads = LADs.pa[[cell]],
+                                     gr_borders = LAD.borders.pa[[cell]],
+                                     gr_bins = bins.10kb.mouse,
+                                     cell = cell)
+  } else {
+    tmp <- CTCFOrientationEnrichment(gr_sites = CTCF.sites.pa[[cell]],
+                                     gr_lads = LADs.pa[[cell]],
+                                     gr_borders = LAD.borders.pa[[cell]],
+                                     gr_bins = bins.10kb.human,
+                                     cell = cell)
+  }
+  CTCF.sites.pa[[cell]] <- tmp[[1]]
+  LAD.borders.pa[[cell]] <- tmp[[2]]
+  all_distances <- bind_rows(all_distances, tmp[[3]])
+}
+
+
+plt <- all_distances %>%
+  mutate(original_cell = factor(original_cell, levels(metadata.pa$cell))) %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+  annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_line(size = 1, col = "red") +
+  facet_grid(original_cell ~ cell) +
+  ggtitle("CTCF enrichment at LAD borders") +
+  xlab("Distance from LAD border (Mb)") +
+  ylab("Fraction 10kb bins overlapping a CTCF peak") +
+  coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.13)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+
+plt <- all_distances %>%
+  mutate(original_cell = factor(original_cell, levels(metadata.pa$cell))) %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+  annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_line(size = 1, col = "red") +
+  facet_grid(original_cell ~ cell) +
+  ggtitle("CTCF enrichment at LAD borders") +
+  xlab("Distance from LAD border (Mb)") +
+  ylab("Fraction 10kb bins overlapping a CTCF peak") +
+  coord_cartesian(xlim = c(-0.15, 0.15), ylim = c(0, 0.13)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+
+
+
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+### 7. Stable LAD borders vs CTCF binding
+
+Finally, I want to address whether the LAD borders that do not change over time
+are more or less enriched for CTCF sites. This is basically the same thing as
+cLADs and fLADs.
+
+I will perform this analysis in two parts: for mouse and human.
+
+However, I first need to define what I mean with "dynamic LAD borders". These 
+are LAD border that are different between the cell types. These can be LAD 
+borders within and outside LADs (in the other cell type). To prevent small 
+changes in the HMM calling from having a big effect, I will filter out borders
+that do not overlap but are close.
+
+```{r mouse changes, fig.width = 5, fig.height = 3.5, cache = T}
+
+# Remove serum data
+metadata.serum <- metadata[2, ]
+LADs.serum <- LADs[2]
+LAD.borders.serum <- LAD.borders[2]
+CTCF.sites.serum <- CTCF.sites[2]
+bins.10kb.serum <- bins.10kb[2]
+bins.10kb.CTCF.serum <- bins.10kb.CTCF[2]
+
+metadata <- metadata[-2, ]
+LADs <- LADs[-2]
+LAD.borders <- LAD.borders[-2]
+CTCF.sites <- CTCF.sites[-2]
+bins.10kb <- bins.10kb[-2]
+bins.10kb.CTCF <- bins.10kb.CTCF[-2]
+
+# Get unique borders
+LAD.borders.mouse <- GetBorderDifferences(LAD.borders[c("mESC", "mNPC")])
+LAD.borders.human <- GetBorderDifferences(LAD.borders[c("H1", "Hap1", "K562", "HCT116")])
+LAD.borders <- c(LAD.borders.mouse, LAD.borders.human)
+
+# Plot numbers
+tib <- full_join(as_tibble(LAD.borders.mouse),
+                 as_tibble(LAD.borders.human)) %>%
+  dplyr::select(group_name, CTCF, class) %>%
+  rename(group_name = "cell") %>%
+  mutate(cell = factor(cell, levels = levels(metadata$cell)))
+
+tib %>%
+  ggplot(aes(x = cell, fill = class)) +
+    geom_bar(position = "dodge", col = "black") +
+    ggtitle("Shared and unique LAD borders") +
+    xlab(NULL) + 
+    ylab("Count") +
+    scale_fill_grey() +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+```
+
+Having classified borders as shared or unique between cell types, I can address
+the question whether there is an enrichment in CTCF binding at stable or 
+dynamic borders.
+
+```{r plot fraction CTCF borders, fig.width = 5, fig.height = 3.5, cache = T}
+
+# Plot with fraction CTCF
+tib.summary <- tib %>%
+  group_by(cell, class) %>%
+  summarise(count = n(),
+            mean = mean(CTCF == "CTCF"))
+  
+tib.summary %>%
+  ggplot(aes(x = cell, y = mean, fill = class)) +
+    geom_bar(stat = "identity", position = "dodge", col = "black") +
+    ggtitle("Shared and unique LAD borders") +
+    xlab(NULL) + 
+    ylab("Fraction CTCF borders") +
+    scale_fill_grey() +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+For all cell types tested, shared borders have a stronger enrichment of CTCF 
+peaks than unique borders. The difference is small, but the overall enrichment
+of CTCF at borders was already small to begin with. Let's repeat the enrichment
+plot, separating shared and unique borders.
+
+```{r CTCF enrichment at shared and unique borders, fig.width = 2.5, fig.height = 10, cache = T}
+ 
+# Update CTCF distances
+CTCF.sites <- CTCFDistance(CTCF.sites, LAD.borders, border.class = T)
+bins.10kb <- CTCFDistance(bins.10kb, LAD.borders, border.class = T)
+bins.10kb.CTCF <- CTCFDistance(bins.10kb.CTCF, LAD.borders, border.class = T)
+
+# Update CTCF counts
+CTCF.distances <- CountPerBins(CTCF.sites, sample_name = "CTCF", border.class = T, 
+                               bin.size = bin.size)
+bins.distances <- CountPerBins(bins.10kb, sample_name = "bins", border.class = T, 
+                               bin.size = bin.size)
+bins.CTCF.distances <- CountPerBins(bins.10kb.CTCF, sample_name = "bins.CTCF",
+                                    border.class = T, bin.size = bin.size)
+
+
+# Calculate ratios
+distances <- CTCF.distances %>%
+  full_join(bins.distances) %>%
+  full_join(bins.CTCF.distances) %>%
+  rowwise() %>%
+  mutate(ratio = CTCF / bins,
+         ratio_withCTCF = bins.CTCF / bins) %>%
+  ungroup() %>%
+  filter(bins > 50)
+
+# Plot the CTCF density for 10kb bins (100x 10kb = 1Mb)
+distances %>%
+  ggplot(aes(x = value / scaling, y = ratio)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(col = "red", size = 1) +
+    facet_grid(cell ~ border.class) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("CTCF-bound sites per 10kb") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.58)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Plot the fraction of bins with CTCF peaks
+distances %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(col = "red", size = 1) +
+    facet_grid(cell ~ border.class) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("Fraction 10kb bins overlapping a CTCF peak") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.38)) +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+Plot this in a single plot.
+
+```{r CTCF enrichment at shared and unique borders combined, fig.width = 2.5, fig.height = 8, cache = T}
+
+distances %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF, col = border.class)) +
+    annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(size = 1) +
+    facet_grid(cell ~ .) +
+    ggtitle("CTCF enrichment at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("Fraction 10kb bins overlapping a CTCF peak") +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.37)) +
+    scale_color_brewer(palette = "Set2", name = "Border class") +
+    theme_bw() +
+    theme(aspect.ratio = 1, 
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+Also in this plot, you can consistently observe the (small) increase in CTCF 
+sites at shared borders. Pretty intriguing.
+
+
+### 8. LAD borders and active genes
+
+Based on Max's suggestion, let's look at LAD borders +/- CTCF and active genes.
+
+This is based on reprocessed RNAseq data for the 4DN project (see that project),
+RNAseq data generated for this project in mESC cells (PT clone) and RNAseq data 
+from mNPC cells (Bonev, 2017). Alternatively, I can also use the Bonev data in 
+mESC cells.
+
+```{r lad borders and transcription start and end, cache = T, message = F, warning = F, fig.width = 6, fig.height = 10}
+
+# Transcription data - list
+tss_list <- list(mESC = tss_mouse[which(fpkm_mesc$WT_0h > 1)],
+                 mNPC = tss_mouse[which(fpkm_mNPC$mNPC > 1)],
+                 H1 = tss_human[which(fpkm_human$H1_expr > 1)],
+                 Hap1 = tss_human[which(fpkm_human$Hap1_expr > 1)],
+                 K562 = tss_human[which(fpkm_human$K562_expr > 1)],
+                 HCT116 = tss_human[which(fpkm_human$HCT116_expr > 1)])
+tes_list <- list(mESC = tes_mouse[which(fpkm_mesc$WT_0h > 1)],
+                 mNPC = tes_mouse[which(fpkm_mNPC$mNPC > 1)],
+                 H1 = tes_human[which(fpkm_human$H1_expr > 1)],
+                 Hap1 = tes_human[which(fpkm_human$Hap1_expr > 1)],
+                 K562 = tes_human[which(fpkm_human$K562_expr > 1)],
+                 HCT116 = tes_human[which(fpkm_human$HCT116_expr > 1)])
+
+# 1) Overlap with LAD border
+for (cell in names(tss_list)) {
+  
+  # Get the cell-specific data
+  cell.tss <- tss_list[[cell]]
+  cell.tes <- tes_list[[cell]]
+  cell.LADs <- LADs[[cell]]
+  
+  # Add LAD overlap
+  cell.tss$which.LAD <- cell.tss$overlap.LAD <- NA
+  cell.tes$which.LAD <- cell.tes$overlap.LAD <- NA
+  
+  dis <- as_tibble(distanceToNearest(cell.tss, cell.LADs))
+  cell.tss$which.LAD[dis$queryHits] <- dis$subjectHits
+  cell.tss$overlap.LAD[dis$queryHits] <- dis$distance == 0
+  
+  dis <- as_tibble(distanceToNearest(cell.tes, cell.LADs))
+  cell.tes$which.LAD[dis$queryHits] <- dis$subjectHits
+  cell.tes$overlap.LAD[dis$queryHits] <- dis$distance == 0
+  
+  # Save data
+  tss_list[[cell]] <- cell.tss
+  tes_list[[cell]] <- cell.tes
+  
+}
+
+# 2) Distance to LAD borders
+tss_list <- CTCFDistance(tss_list, LAD.borders)
+tes_list <- CTCFDistance(tes_list, LAD.borders)
+
+
+
+
+TranscriptionOrientationEnrichment <- function(gr_sites, gr_lads, gr_borders, gr_bins, cell) {
+  
+  # Modified function of the CTCF motif strand enrichment: 
+  #  - removed "both" group
+  
+  original_cell <- cell
+  
+  # Get ctcf peaks
+  ctcf <- as_tibble(gr_sites) %>% 
+    rowwise() %>%
+    mutate(distance = ifelse(overlap.LAD == T,
+                             max(dis.precede, dis.follow, na.rm = T),
+                             - max(dis.precede, dis.follow, na.rm = T)),
+           at_border = distance <= 0 & distance > -20e3,
+           border = case_when(overlap.LAD == T & is.na(dis.follow) ~ "right",
+                              overlap.LAD == F & is.na(dis.precede) ~ "right",
+                              T ~ "left")) %>%
+    ungroup()
+  
+  # Update CTCF sites
+  gr_sites$distance <- ctcf$distance
+  gr_sites$border <- ctcf$border
+  gr_sites$at_border <- ctcf$at_border
+  
+  # Which bin size should I use for this?
+  ctcf_bin_size <- bin.size
+  scaling = 1e6 / ctcf_bin_size
+  
+  # Separate CTCF outwards and inwards of the LAD border
+  ctcf_outwards <- ctcf %>%
+    filter(motif_count > 0,
+           ! motif_strand == "both",
+           ! (border == "right" & motif_strand == "-"),
+           ! (border == "left" & motif_strand == "+")) %>%
+    mutate(cell = paste0(cell, "_outwards"))
+  
+  ctcf_inwards <- ctcf %>%
+    filter(motif_count > 0,
+           ! motif_strand == "both",
+           ! (border == "left" & motif_strand == "-"),
+           ! (border == "right" & motif_strand == "+")) %>%
+    mutate(cell = paste0(cell, "_inwards"))
+  
+  ctcf <- ctcf %>%
+    mutate(motif_orientation = case_when((motif_count > 0 &
+                                            ! (border == "right" & motif_strand == "-") &
+                                            ! (border == "left" & motif_strand == "+")) ~ "mESC_outwards",
+                                         (motif_count > 0 &
+                                            ! (border == "left" & motif_strand == "-") &
+                                            ! (border == "right" & motif_strand == "+")) ~ "mESC_inwards",
+                                         T ~ paste0(cell, "_nostrand")))
+  gr_ctcf <- as(ctcf, "GRanges")
+  
+  # Prepare lists for functions made previously
+  ctcf_list <- GRangesList(outwards = as(ctcf_outwards, "GRanges"),
+                           inwards = as(ctcf_inwards, "GRanges"))
+  border_list <- GRangesList(outwards = gr_borders,
+                             inwards = gr_borders)
+  bins_10kb <- GRangesList(outwards = gr_bins,
+                           inwards = gr_bins)
+  LAD_list <- GRangesList(outwards = gr_lads,
+                          inwards = gr_lads)
+  
+  
+  # Also select bins overlapping a CTCF site for a different perspective
+  bins_10kb_CTCF <- bins_10kb
+  
+  for (cell in names(bins_10kb_CTCF)) {
+    cell_bins <- bins_10kb_CTCF[[cell]]
+    cell_CTCF <- grMid(ctcf_list[[cell]])
+    
+    cell_bins <- cell_bins[overlapsAny(cell_bins, cell_CTCF)]
+    
+    bins_10kb_CTCF[[cell]] <- cell_bins
+    
+  }
+  
+  
+  # Distance to LAD border
+  ctcf_list <- CTCFDistance(ctcf_list, border_list)
+  bins_10kb <- CTCFDistance(bins_10kb, border_list)
+  bins_10kb_CTCF <- CTCFDistance(bins_10kb_CTCF, border_list)
+  
+  # Count occurences
+  cell_distances <- CountPerBins(ctcf_list, sample_name = "CTCF", bin.size = ctcf_bin_size)
+  bins_distances <- CountPerBins(bins_10kb, sample_name = "bins", bin.size = ctcf_bin_size)
+  bins_CTCF_distances <- CountPerBins(bins_10kb_CTCF, sample_name = "bins_CTCF", bin.size = ctcf_bin_size)
+  
+  # Calculate ratios
+  distances <- cell_distances %>%
+    full_join(bins_distances) %>%
+    full_join(bins_CTCF_distances) %>%
+    rowwise() %>%
+    mutate(ratio = CTCF / bins,
+           ratio_withCTCF = bins_CTCF / bins,
+           original_cell = original_cell) %>%
+    ungroup() %>%
+    filter(bins > 50,
+           cell != "both")
+  
+  # Return objects
+  distances
+  
+}
+
+# 1) DamID data
+all_distances <- tibble()
+
+for (cell in metadata$cell) {
+  if (cell %in% c("mESC", "mESC_serum", "mNPC")) {
+    tmp_tss <- TranscriptionOrientationEnrichment(gr_sites = tss_list[[cell]],
+                                     gr_lads = LADs[[cell]],
+                                     gr_borders = LAD.borders[[cell]],
+                                     gr_bins = bins.10kb.mouse,
+                                     cell = cell) %>%
+      mutate(class = "tss")
+    tmp_tes <- TranscriptionOrientationEnrichment(gr_sites = tes_list[[cell]],
+                                     gr_lads = LADs[[cell]],
+                                     gr_borders = LAD.borders[[cell]],
+                                     gr_bins = bins.10kb.mouse,
+                                     cell = cell) %>%
+      mutate(class = "tes")
+    
+  } else {
+    tmp_tss <- TranscriptionOrientationEnrichment(gr_sites = tss_list[[cell]],
+                                     gr_lads = LADs[[cell]],
+                                     gr_borders = LAD.borders[[cell]],
+                                     gr_bins = bins.10kb.human,
+                                     cell = cell) %>%
+      mutate(class = "tss")
+    tmp_tes <- TranscriptionOrientationEnrichment(gr_sites = tes_list[[cell]],
+                                     gr_lads = LADs[[cell]],
+                                     gr_borders = LAD.borders[[cell]],
+                                     gr_bins = bins.10kb.human,
+                                     cell = cell) %>%
+      mutate(class = "tes")
+  }
+  all_distances <- bind_rows(all_distances, tmp_tss, tmp_tes)
+}
+
+plt <- all_distances %>%
+  mutate(original_cell = factor(original_cell, levels(metadata$cell)),
+         class = factor(class, c("tss", "tes"))) %>%
+  ggplot(aes(x = value / scaling, y = ratio_withCTCF, col = cell)) +
+  annotate("rect", xmin = 0, xmax = 1, ymin = -1, ymax = 5, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_line(size = 1) +
+  facet_grid(original_cell ~ class) +
+  scale_color_manual(values = c("green3", "brown")) +
+                       #palette = "Dark2") +
+  ggtitle("Active gene enrichment at LAD borders") +
+  xlab("Distance from LAD border (Mb)") +
+  ylab("Fraction 10kb bins overlapping a TSS/TES") +
+  coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 0.09)) +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+```
+
+Next, I will determine the numbers of the segmented LAD borders based on CTCF 
+binding, CTCF strand and positioning of active genes.
+
+```{r lad borders and active genes, cache = T, fig.width = 4, fig.height = 12}
+
+# Convert LAD borders to tibble
+tib <- as_tibble(unlist(LAD.borders)) %>%
+  mutate(strand = as.character(strand),
+         strand_of_gene = as.character(strand_of_gene),
+         gene_orientation = case_when(strand_of_gene == "ambiguous" ~ "ambiguous",
+                                      strand_of_gene == strand ~ "inwards",
+                                      strand_of_gene != strand ~ "outwards",
+                                      T ~ "-"))
+
+# Plot fraction of borders overlapping with active genes
+tib %>%
+  group_by(cell, CTCF) %>%
+  dplyr::summarise(n = n(),
+                   all = mean(ovl_gene),
+                   inwards = mean(gene_orientation == "inwards"),
+                   outwards = mean(gene_orientation == "outwards")) %>%
+  gather(key, value, all, inwards, outwards) %>%
+  mutate(cell = factor(cell, levels(metadata$cell)),
+         key = factor(key, rev(c("all", "inwards", "outwards")))) %>%
+  ggplot(aes(x = key, y = value, fill = CTCF)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_grey() +
+  coord_flip() +
+  ylab("Fraction borders overlapping gene") +
+  xlab("Gene orientation") +
+  facet_wrap(. ~ cell, ncol = 1) +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+# Conclusion: there is no enrichment of (active) gene orientation at LAD borders
+
+# Plot expression of (active) genes overlapping borders
+tib %>%
+  filter(gene_orientation %in% c("inwards", "outwards")) %>%
+  mutate(cell = factor(cell, levels(metadata$cell))) %>%
+  ggplot(aes(x = interaction(gene_orientation, CTCF), y = log2(max_gene_expression+1))) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, col = "red", fill = NA) +
+  coord_flip() +
+  ylab("Expression (log2)") +
+  xlab("Border class") +
+  facet_wrap(. ~ cell, ncol = 1, scales = "free") +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+# Conclusion: there is no difference in gene expression based on gene strand
+
+
+# Plot border classification - with filtered borders with overlapping genes
+tib %>%
+  group_by(cell, CTCF, ovl_gene) %>%
+  dplyr::summarise(n = n()) %>%
+  mutate(cell = factor(cell, levels(metadata$cell))) %>%
+  ggplot(aes(x = CTCF, fill = ovl_gene, y = n)) +
+  geom_bar(stat = "identity") +
+  xlab("Border class") +
+  ylab("Count") +
+  scale_fill_grey() +
+  coord_flip() +
+  facet_wrap(cell ~ ., ncol = 1) +
+  theme_classic() +
+  theme(aspect.ratio = 1/2)
+
+# I want the numbers for the manuscript text
+tib %>%
+  group_by(cell, CTCF, ovl_gene) %>%
+  dplyr::summarise(n = n()) %>%
+  spread(ovl_gene, n) %>%
+  mutate(total = `TRUE` + `FALSE`,
+         fraction = `FALSE` / (`TRUE` + `FALSE`)) %>%
+  print(n = 40)
+
+
+# Repeat, by strand
+tib %>%
+  group_by(cell, CTCF_strand, ovl_gene) %>%
+  dplyr::summarise(n = n()) %>%
+  mutate(cell = factor(cell, levels(metadata$cell)),
+         CTCF_strand = factor(CTCF_strand, c("outwards", "inwards", "ambiguous", "nonCTCF"))) %>%
+  ggplot(aes(x = CTCF_strand, fill = ovl_gene, y = n)) +
+  geom_bar(stat = "identity") +
+  xlab("Border class") +
+  ylab("Count") +
+  scale_fill_grey() +
+  coord_flip() +
+  facet_wrap(cell ~ ., ncol = 1) +
+  theme_classic() +
+  theme(aspect.ratio = 3/4)
+
+# I want the numbers for the manuscript text
+tib %>%
+  group_by(cell, CTCF_strand, ovl_gene) %>%
+  dplyr::summarise(n = n()) %>%
+  spread(ovl_gene, n) %>%
+  mutate(total = `TRUE` + `FALSE`,
+         fraction = `FALSE` / (`TRUE` + `FALSE`)) %>%
+  print(n = 40)
+
+
+```
+
+Repeat this for the pA-DamID data.
+
+```{r lad borders and active genes for pADamID, cache = T, fig.width = 4, fig.height = 12}
+
+# Convert LAD borders to tibble
+tib <- as_tibble(unlist(LAD.borders.pa)) %>%
+  mutate(strand = as.character(strand),
+         strand_of_gene = as.character(strand_of_gene),
+         gene_orientation = case_when(strand_of_gene == "ambiguous" ~ "ambiguous",
+                                      strand_of_gene == strand ~ "inwards",
+                                      strand_of_gene != strand ~ "outwards",
+                                      T ~ "-"))
+
+# Plot fraction of borders overlapping with active genes
+tib %>%
+  group_by(cell, CTCF) %>%
+  dplyr::summarise(n = n(),
+                   all = mean(ovl_gene),
+                   inwards = mean(gene_orientation == "inwards"),
+                   outwards = mean(gene_orientation == "outwards")) %>%
+  gather(key, value, all, inwards, outwards) %>%
+  mutate(cell = factor(cell, levels(metadata$cell)),
+         key = factor(key, rev(c("all", "inwards", "outwards")))) %>%
+  ggplot(aes(x = key, y = value, fill = CTCF)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_grey() +
+  coord_flip() +
+  ylab("Fraction borders overlapping gene") +
+  xlab("Gene orientation") +
+  facet_wrap(. ~ cell, ncol = 1) +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+
+# Plot expression of (active) genes overlapping borders
+tib %>%
+  filter(gene_orientation %in% c("inwards", "outwards")) %>%
+  mutate(cell = factor(cell, levels(metadata.pa$cell))) %>%
+  ggplot(aes(x = interaction(gene_orientation, CTCF), y = log2(max_gene_expression+1))) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, col = "red", fill = NA) +
+  coord_flip() +
+  ylab("Expression (log2)") +
+  xlab("Border class") +
+  facet_wrap(. ~ cell, ncol = 1, scales = "free") +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+
+
+# Plot border classification - with filtered borders with overlapping genes
+tib %>%
+  group_by(cell, CTCF, ovl_gene) %>%
+  dplyr::summarise(n = n()) %>%
+  mutate(cell = factor(cell, levels(metadata.pa$cell))) %>%
+  ggplot(aes(x = CTCF, fill = ovl_gene, y = n)) +
+  geom_bar(stat = "identity") +
+  xlab("Border class") +
+  ylab("Count") +
+  scale_fill_grey() +
+  coord_flip() +
+  facet_wrap(cell ~ ., ncol = 1) +
+  theme_classic() +
+  theme(aspect.ratio = 1/2)
+
+# I want the numbers for the manuscript text
+tib %>%
+  group_by(cell, CTCF, ovl_gene) %>%
+  dplyr::summarise(n = n()) %>%
+  spread(ovl_gene, n) %>%
+  mutate(total = `TRUE` + `FALSE`,
+         fraction = `FALSE` / (`TRUE` + `FALSE`)) %>%
+  print(n = 40)
+
+
+tib %>%
+  group_by(cell, CTCF_strand, ovl_gene) %>%
+  dplyr::summarise(n = n()) %>%
+  mutate(cell = factor(cell, levels(metadata.pa$cell)),
+         CTCF_strand = factor(CTCF_strand, c("outwards", "inwards", "ambiguous", "nonCTCF"))) %>%
+  ggplot(aes(x = CTCF_strand, fill = ovl_gene, y = n)) +
+  geom_bar(stat = "identity") +
+  xlab("Border class") +
+  ylab("Count") +
+  scale_fill_grey() +
+  coord_flip() +
+  facet_wrap(cell ~ ., ncol = 1) +
+  theme_classic() +
+  theme(aspect.ratio = 3/4)
+
+# I want the numbers for the manuscript text
+tib %>%
+  group_by(cell, CTCF_strand, ovl_gene) %>%
+  dplyr::summarise(n = n()) %>%
+  spread(ovl_gene, n) %>%
+  mutate(total = `TRUE` + `FALSE`,
+         fraction = `FALSE` / (`TRUE` + `FALSE`)) %>%
+  print(n = 40)
+
+
+```
+
+Conclusions: 
+
+  * LAD borders with CTCF are marginally depleted of active genes.
+  * LAD borders are relatively enriched for outward-facing genes.
+  
+How does this compare with Guelen, 2008? 
+
+2688 LAD borders, of which 363 with oriented promoters and 365 with CTCF. 
+Expected by change = 49 borders with both. Result = 65 borders with both. 
+In other words, there is no depletion of these two marks combined.
+
+
+
+### X. Save data
+
+Finally, save the relevant R objects for later use.
+
+```{r save data}
+
+# Add serum again
+metadata <- bind_rows(metadata, metadata.serum)
+LADs <- c(LADs, LADs.serum)
+LAD.borders <- c(LAD.borders, LAD.borders.serum)
+CTCF.sites <- c(CTCF.sites, CTCF.sites.serum)
+bins.10kb <- c(bins.10kb, bins.10kb.serum)
+bins.10kb.CTCF <- c(bins.10kb.CTCF, bins.10kb.CTCF.serum)
+
+# Save objects
+saveRDS(metadata, 
+        file.path(output_dir, "metadata.rds"))
+saveRDS(LADs, 
+        file.path(output_dir, "LADs.rds"))
+saveRDS(LAD.borders, 
+        file.path(output_dir, "LAD_borders.rds"))
+saveRDS(CTCF.sites, 
+        file.path(output_dir, "CTCF_sites.rds"))
+
+saveRDS(LADs.pa, 
+        file.path(output_dir, "LADs_pA.rds"))
+saveRDS(LAD.borders.pa, 
+        file.path(output_dir, "LAD_borders_pA.rds"))
+saveRDS(CTCF.sites.pa, 
+        file.path(output_dir, "CTCF_sites_pA.rds"))
+
+# Save LADs and LAD borders for NQ
+write_tsv(as_tibble(LADs[["mESC"]]),
+          file.path(output_dir, "LADs_mESC_2i.txt"))
+write_tsv(as_tibble(LAD.borders[["mESC"]]),
+          file.path(output_dir, "LAD_borders_mESC_2i.txt"))
+
+write_tsv(as_tibble(LADs[["mESC_serum"]]),
+          file.path(output_dir, "LADs_mESC_serum.txt"))
+write_tsv(as_tibble(LAD.borders[["mESC_serum"]]),
+          file.path(output_dir, "LAD_borders_mESC_serum.txt"))
+
+
+export.bed(as_tibble(LADs[["mESC"]]),
+           file.path(output_dir, "LADs_mESC_2i.bed"))
+export.bed(as_tibble(LAD.borders[["mESC"]][LAD.borders[["mESC"]]$CTCF_strand == "nonCTCF"]),
+          file.path(output_dir, "LAD_borders_mESC_2i_nonCTCF.bed"))
+export.bed(as_tibble(LAD.borders[["mESC"]][LAD.borders[["mESC"]]$CTCF_strand == "inwards"]),
+          file.path(output_dir, "LAD_borders_mESC_2i_inwards.bed"))
+export.bed(as_tibble(LAD.borders[["mESC"]][LAD.borders[["mESC"]]$CTCF_strand == "outwards"]),
+          file.path(output_dir, "LAD_borders_mESC_2i_outwards.bed"))
+export.bed(as_tibble(LAD.borders[["mESC"]][LAD.borders[["mESC"]]$CTCF_strand == "ambiguous"]),
+          file.path(output_dir, "LAD_borders_mESC_2i_ambiguous.bed"))
+
+
+export.bed(as_tibble(LADs.pa[["mESC_pA_PT"]]),
+           file.path(output_dir, "LADs_mESC_2i_pA.bed"))
+export.bed(as_tibble(LAD.borders.pa[["mESC_pA_PT"]][LAD.borders.pa[["mESC_pA_PT"]]$CTCF_strand == "nonCTCF"]),
+          file.path(output_dir, "LAD_borders_mESC_2i_pA_nonCTCF.bed"))
+export.bed(as_tibble(LAD.borders.pa[["mESC_pA_PT"]][LAD.borders.pa[["mESC_pA_PT"]]$CTCF_strand == "inwards"]),
+          file.path(output_dir, "LAD_borders_mESC_2i_pA_inwards.bed"))
+export.bed(as_tibble(LAD.borders.pa[["mESC_pA_PT"]][LAD.borders.pa[["mESC_pA_PT"]]$CTCF_strand == "outwards"]),
+          file.path(output_dir, "LAD_borders_mESC_2i_pA_outwards.bed"))
+export.bed(as_tibble(LAD.borders.pa[["mESC_pA_PT"]][LAD.borders.pa[["mESC_pA_PT"]]$CTCF_strand == "ambiguous"]),
+          file.path(output_dir, "LAD_borders_mESC_2i_pA_ambiguous.bed"))
+
+```
+
+
+### Conclusion
+
+CTCF sites are enriched at LAD borders. In some cell lines, this enrichment is
+more obvious than in others. mESC is one of the cell lines were the effect seems
+less obvious.
+
+I hope that this enrichment is still strong enough to design any follow up
+experiment on. 
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```

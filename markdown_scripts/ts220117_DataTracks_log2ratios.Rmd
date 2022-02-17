@@ -1,0 +1,732 @@
+---
+title: "Example data tracks"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Project
+
+Lamina mapping of various mESC-AID cell lines. 
+
+
+### Introduction
+
+In this document, I will create simple data tracks that illustrates the general
+data patterns. This is better than IGV snapshots.
+
+
+### Method
+
+Simple R plotting. 
+
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up, warning = F, message = F}
+
+# Load dependencies - without warnings / messages
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(ggplot2)
+library(reshape2)
+library(RColorBrewer)
+library(caTools)
+library(wesanderson)
+library(Gviz)
+library(ggrastr)
+library(colorspace)
+
+# Prepare output 
+output_dir <- "ts220117_DataTracks_log2ratios"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Load previous input
+input_dir <- "ts220113_effect_of_CTCF_depletion_on_LAD_borders/"
+bin_size <- readRDS(file.path(input_dir, "bin_size.rds"))
+damid <- readRDS(file.path(input_dir, "damid.rds"))
+metadata <- readRDS(file.path(input_dir, "metadata_damid.rds"))
+
+# Load previous input
+input_dir <- "ts220113_GeneExpression"
+genes <- readRDS(file.path(input_dir, "genes.rds"))
+genes_fpkm <- readRDS(file.path(input_dir, "genes_fpkm_mean.rds"))
+
+# Load chrom sizes
+chrom.sizes <- read_tsv("~/mydata/data/genomes/mm10/mm10.chrom.sizes",
+                        col_names = c("seqnames", "length"))
+
+```
+
+Set-up knitr output.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, cache = T,
+               dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+List functions.
+
+```{r functions}
+
+PlotDataTracks <- function(gr_norm_mean, name, samples,
+                           centromeres = NULL,
+                           plot_chr = "chr1", 
+                           plot_start = 1, plot_end = 100e6,
+                           smooth = 1, 
+                           filter_samples = NULL,
+                           lighten_negative = T,
+                           color_list = NULL,
+                           free_y = T) {
+  
+  # Get the scores for the samples
+  tib <- as_tibble(gr_norm_mean) %>%
+    dplyr::select(seqnames, start, end, 
+                  contains("PT_0h"),
+                  matches(name))
+  
+  if (! is.null(filter_samples)) {
+    tib <- tib %>%
+      dplyr::select(-matches(filter_samples))
+  }
+  
+  if (smooth > 1) {
+    tib <- tib %>%
+      mutate_at(vars(contains("_")), 
+                runmean, k = smooth)
+  }
+  
+  # Filter for plotting window
+  tib <- tib %>%
+    filter(seqnames == plot_chr,
+           start >= plot_start,
+           end <= plot_end)
+  
+  # Gather
+  tib_gather <- tib %>%
+    gather(key, value, -seqnames, -start, -end) %>%
+    separate(key, c("condition", "timepoint"), remove = F) %>%
+    mutate(condition = factor(condition, levels = levels(samples$condition)),
+           timepoint = factor(timepoint, levels = levels(samples$timepoint)),
+           interaction = interaction(condition, timepoint)) %>%
+    arrange(condition, timepoint) %>%
+    mutate(interaction = factor(interaction, levels = unique(interaction)))
+  tib_gather$fill_column <- tib_gather %>% pull(interaction)
+  
+  # Should negative values be a lighter shade of the color?
+  if (lighten_negative) {
+    tib_gather <- tib_gather %>%
+      mutate(fill_column = interaction(fill_column,
+                                       value < 0))
+  }
+  
+  # Limits
+  ylimits <- quantile(tib_gather$value, c(0.001, 0.999), na.rm = T)
+  
+  plt <- tib_gather %>%
+    ggplot(aes(fill = fill_column)) +
+    rasterize(geom_rect(aes(xmin = start / 1e6, xmax = end / 1e6, 
+                            ymin = 0, ymax = value)),
+              dpi = 300) +
+    geom_hline(yintercept = 0, size = 0.5) +
+    coord_cartesian(xlim = c(max(c(plot_start,
+                                   min(tib_gather$start))) / 1e6,
+                             min(c(plot_end,
+                                   max(tib_gather$end))) / 1e6)) +
+    xlab(paste0(plot_chr, " (Mb)")) +
+    ylab("pA-DamID (z-score)") +
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0.025, 0.025)) +
+    #scale_fill_gradient(low = "deepskyblue2", high = "deepskyblue4", 
+    #                    guide = F) +
+    theme_classic() +
+    theme(aspect.ratio = 0.15)
+  
+  # Y-axis
+  if (free_y) {
+    plt <- plt + 
+      facet_grid(interaction ~ ., scales = "free_y")
+  } else {
+    plt <- plt + 
+      facet_grid(interaction ~ .)
+  }
+  
+  # Colors
+  if (! is.null(color_list)) {
+    
+    if (lighten_negative) {
+      color_list <- c(color_list,
+                      lighten(color_list, amount = 0.5))
+    }
+    
+    colors <- levels(tib_gather$fill_column)
+    
+    color_list <- color_list[1:length(colors)]
+    names(color_list) <- colors
+    
+    plt <- plt +
+      scale_fill_manual(values = color_list, guide = "none")
+    
+  } else {
+    
+    color_list <- wes_palette("Zissou1", length(unique(tib_gather$fill_column)),
+                              type = "continuous")
+    
+    plt <- plt + 
+      scale_fill_manual(values = color_list, guide = "none")
+    
+  }
+  
+  
+  plot(plt)
+  
+}
+
+# Plot with Gviz
+GetDataTracks <- function(damid, sample_names, fill = NULL, smooth = 3) {
+  # Function to get DataTracks for every sample given
+  
+  damid_tmp <- damid
+  mcols(damid_tmp) <- as_tibble(mcols(damid_tmp)) %>%
+    dplyr::select(sample_names)
+  
+  # Smooth
+  if (smooth > 1) {
+    mcols(damid_tmp) <- as_tibble(mcols(damid_tmp)) %>%
+      mutate_at(vars(contains("_")), 
+                runmean, k = smooth)
+  }
+  
+  ylimits <- quantile(as_tibble(mcols(damid_tmp)) %>%
+                       gather(key, value) %>%
+                        pull("value"), 
+                      c(0.001, 0.999), na.rm = T)
+  
+  # Get DataTracks
+  l <- list()
+  for (i in 1:length(sample_names)) {
+    s <- sample_names[i]
+    f <- ifelse(is.null(fill), "darkblue", fill[i])
+    # name shortcut
+    n <- str_remove_all(s, "TCF|APL|AD21")
+    tmp <- damid_tmp
+    mcols(tmp) <- data.frame(score = mcols(damid_tmp)[, s])
+    tmp <- DataTrack(tmp, name = n, type = "histogram", ylim = ylimits,
+                     fill.histogram = f, col.histogram	= NA)
+    l <- c(l, list(tmp))
+  }
+  l
+}
+
+CreatePlot <- function(chr, from, to, 
+                       sample_names = c("PT_0h", 
+                                        "WAPL_0h", "WAPL_6h", "WAPL_24h",
+                                        "CTCFWAPL_0h", "CTCFWAPL_6h", "CTCFWAPL_24h"),
+                       fill = c("black", 
+                                "darkred", "darkred", "darkred",
+                                "darkgreen", "darkgreen", "darkgreen"),
+                       features = T, smooth = 3,
+                       damid = damid) {
+  
+  if (features) {
+    track_list <- list(ctcf_track,
+                       genes_track,
+                       gtrack)
+  } else {
+    track_list <- list(gtrack)
+  }
+  
+  # plot tracks
+  plotTracks(c(GetDataTracks(damid, 
+                             sample_names,
+                             fill = fill,
+                             smooth = smooth),
+               track_list),
+             chromosome = chr,
+             from = from,
+             to = to,
+             stacking = "dense",
+             background.title = "transparent",
+             fontcolor.title = "black",
+             col.title = "black",
+             col.axis = "black")
+}
+
+
+# gtrack & itrack
+gtrack <- GenomeAxisTrack(labelPos = "below", 
+                          col = "black", fontcolor = "black")
+itrack <- IdeogramTrack(genome = "mm10")
+
+# ctcf
+ctcf_track <- DataTrack("Data_NQ/ChIP_NQ/CohesinFactors/2_Wapl-0D-antiCtcf_SF.3517_MQ15_sample.bw", 
+                        name = "CTCF", type = "histogram", 
+                        fill.histogram = "black", col.histogram	= NA)
+
+# genes
+genes_track <- GeneRegionTrack(genes, shape = "arrow",
+                               name = "Gene Model",
+                               symbol = genes$gene_name)
+
+```
+
+
+### 0) Comparison with DamID
+
+I want to include a figure where I compare pA-DamID with DamID, for the sake of
+completeness. Plot this here.
+
+```{r comparison with damid, cache = T, fig.width = 5, fig.height = 3.5}
+
+# Load the data
+damid_old <- read_tsv("~/mydata/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results_mouse/normalized/bin-10kb/mESC_LMNB1-10kb-combined.norm.txt.gz", 
+                      col_names = c("seqnames", "start", "end", "DamID_0h")) %>%
+  mutate(start = start + 1)
+
+damid_comparison <- as_tibble(damid) %>%
+  dplyr::select(1:6) %>%
+  full_join(damid_old) %>%
+  drop_na() 
+damid_comparison <- as(damid_comparison, "GRanges")
+
+# Fake metadata
+metadata_comparison <- tibble(file = "",
+                              sample = c("PT", "DamID"),
+                              condition = factor(c("PT", "DamID")),
+                              timepoint = factor("0h"), 
+                              cell = "mESC")
+
+# Plot tracks
+PlotDataTracks(damid_comparison, name = "DamID", samples = metadata_comparison,
+               plot_chr = "chr1", plot_start = 0, plot_end = 800e6,
+               smooth = 25, color_list = c("grey30", "steelblue"))
+
+
+# Gviz plot
+CreatePlot(chr = "chr6",
+           from = 1,
+           to = 149736546, 
+           sample_names = c("DamID_0h", "PT_0h"),
+           fill = c("grey50", 
+                    "steelblue"),
+           features = F,
+           smooth = 25, damid = damid_comparison)
+
+
+# Also, create scatterplot
+as_tibble(mcols(damid_comparison)) %>%
+  ggplot(aes(x = DamID_0h, y = PT_0h)) +
+  geom_bin2d(bins = 100) +
+  geom_abline(slope = 1, intercept = 0, col = "red") +
+  ggtitle(paste0("R = ",
+                 round(cor(damid_comparison$DamID_0h, 
+                           damid_comparison$PT_0h,
+                           method = "pearson"), 2))) +
+  xlab("DamID (log2)") +
+  ylab("pA-DamID (log2)") +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  coord_cartesian(xlim = c(-5.5, 5), ylim = c(-3, 3)) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+  
+
+```
+
+I also tried other plots, but I don't like these.
+
+```{r plot damid with ctcf, cache = T, fig.width = 5, fig.height = 2}
+
+CreatePlot(chr = "chr2",
+           from = 3e6,
+           to = 25e6, 
+           sample_names = c("DamID_0h"),
+           fill = c("grey30"),
+           features = T,
+           smooth = 5, damid = damid_comparison)
+
+```
+
+
+### 1) Plot tracks
+
+Here, plot data tracks in R for the various depletions. These are useful for 
+manuscript figures and presentations.
+
+Plot several example regions.
+
+```{r plot chromosome tracks, cache = T, fig.width = 5, fig.height = 8}
+
+PlotDataTracks(damid, 
+               name = "0h", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 7),
+               plot_start = 0, plot_end = 800e6,
+               smooth = 25)
+
+PlotDataTracks(damid,
+               name = "0h|24h", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 10),
+               plot_start = 0, plot_end = 800e6,
+               smooth = 25, filter_samples = "CTCFNQ|CTCF_")
+
+PlotDataTracks(damid,
+               name = "PT|CTCFEL", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 6),
+               plot_start = 0, plot_end = 800e6,
+               smooth = 25)
+
+PlotDataTracks(damid,
+               name = "PT|CTCFNQ", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 6),
+               plot_start = 0, plot_end = 800e6,
+               smooth = 25)
+
+PlotDataTracks(damid,
+               name = "PT|^WAPL", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 6),
+               plot_start = 0, plot_end = 800e6,
+               smooth = 25)
+
+PlotDataTracks(damid,
+               name = "PT|CTCFWAPL", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 6),
+               plot_start = 0, plot_end = 800e6,
+               smooth = 25)
+
+PlotDataTracks(damid,
+               name = "PT|RAD21", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 5),
+               plot_start = 0, plot_end = 800e6,
+               smooth = 25)
+
+```
+
+And more.
+
+```{r plot specific tracks, cache = T, fig.width = 5, fig.height = 8}
+
+PlotDataTracks(damid,
+               name = "PT|CTCFEL", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 6),
+               plot_start = 130e6, plot_end = 800e6,
+               smooth = 15)
+
+PlotDataTracks(damid,
+               name = "PT|CTCFEL", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 6),
+               plot_start = 152e6, plot_end = 158.5e6,
+               smooth = 7)
+
+PlotDataTracks(damid,
+               name = "PT|CTCFNQ", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 6),
+               plot_start = 130e6, plot_end = 800e6,
+               smooth = 15)
+
+PlotDataTracks(damid,
+               name = "PT|CTCFEL", samples = metadata,
+               plot_chr = "chr3", color_list = rep("steelblue", 6),
+               plot_start = 8e6, plot_end = 16e6,
+               smooth = 3)
+
+PlotDataTracks(damid,
+               name = "PT|^WAPL", samples = metadata,
+               plot_chr = "chr3", color_list = rep("steelblue", 6),
+               plot_start = 8e6, plot_end = 16e6,
+               smooth = 3)
+
+PlotDataTracks(damid,
+               name = "PT|CTCFWAPL", samples = metadata,
+               plot_chr = "chr3", color_list = rep("steelblue", 6),
+               plot_start = 8e6, plot_end = 16e6,
+               smooth = 3)
+
+PlotDataTracks(damid,
+               name = "PT|CTCFEL", samples = metadata,
+               plot_chr = "chr11", color_list = rep("steelblue", 6),
+               plot_start = 30e6, plot_end = 800e6,
+               smooth = 15)
+
+PlotDataTracks(damid,
+               name = "PT|^WAPL", samples = metadata,
+               plot_chr = "chr11", color_list = rep("steelblue", 6),
+               plot_start = 30e6, plot_end = 800e6,
+               smooth = 15)
+
+PlotDataTracks(damid,
+               name = "PT|CTCFWAPL", samples = metadata, 
+               plot_chr = "chr11", color_list = rep("steelblue", 6),
+               plot_start = 30e6, plot_end = 800e6,
+               smooth = 15)
+
+PlotDataTracks(damid,
+               name = "PT|RAD21", samples = metadata,
+               plot_chr = "chr13", color_list = rep("steelblue", 5),
+               plot_start = 70e6, plot_end = 80e6,
+               smooth = 3)
+
+PlotDataTracks(damid,
+               name = "PT|RAD21", samples = metadata,
+               plot_chr = "chr9", color_list = rep("steelblue", 5),
+               plot_start = 80e6, plot_end = 95e6,
+               smooth = 3)
+
+PlotDataTracks(damid,
+               name = "PT|RAD21", samples = metadata,
+               plot_chr = "chr3", color_list = rep("steelblue", 5),
+               plot_start = 140e6, plot_end = 146e6,
+               smooth = 3)
+
+
+
+PlotDataTracks(damid,
+               name = "0h|24h", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 10),
+               plot_start = 0e6, plot_end = 50e6,
+               smooth = 15, filter_samples = "CTCFNQ|CTCF_",
+               free_y = F)
+
+PlotDataTracks(damid,
+               name = "0h|24h", samples = metadata,
+               plot_chr = "chr1", color_list = rep("steelblue", 10),
+               plot_start = 0e6, plot_end = 35e6,
+               smooth = 9, filter_samples = "CTCFNQ|CTCF_",
+               free_y = F)
+
+```
+
+```{r plot all samples, cache = T, fig.width = 5, fig.height = 8}
+
+PlotDataTracks(damid,
+               name = "0h|24h", samples = metadata,
+               plot_chr = "chr3", color_list = rep("steelblue", 10),
+               plot_start = 0e6, plot_end = 36e6,
+               smooth = 9, filter_samples = "CTCFNQ|CTCF_",
+               free_y = F)
+
+PlotDataTracks(damid,
+               name = "0h|24h", samples = metadata,
+               plot_chr = "chr3", color_list = rep("steelblue", 10),
+               plot_start = 4.5e6, plot_end = 45e6,
+               smooth = 9, filter_samples = "CTCFNQ|CTCF_",
+               free_y = F)
+
+PlotDataTracks(damid,
+               name = "0h|24h", samples = metadata,
+               plot_chr = "chr3", color_list = rep("steelblue", 10),
+               plot_start = 4.5e6, plot_end = 36e6,
+               smooth = 9, filter_samples = "CTCFNQ|CTCF_",
+               free_y = F)
+
+```
+
+
+### 2. Plot with Gviz
+
+Again, try GViz for plotting. 
+
+```{r gviz with ctcf, cache = T, fig.width = 8, fig.height = 6}
+
+# plot tracks
+CreatePlot(chr = "chr3", 
+           from = 8e6,
+           to = 16e6, 
+           damid = damid)
+
+CreatePlot(chr = "chr2",
+           from = 43e6,
+           to = 60e6, 
+           damid = damid)
+
+# Chromosome-plots
+CreatePlot(chr = "chr3",
+           from = 0,
+           to = 160039680, 
+           sample_names = c("PT_0h",
+                            "CTCFEL_0h", "CTCFEL_24h",
+                            "WAPL_0h", "WAPL_24h",
+                            "CTCFWAPL_0h", "CTCFWAPL_24h",
+                            "RAD21_0h", "RAD21_24h"),
+           fill = c("grey30", 
+                    "red", "red",
+                    "blue", "blue",
+                    "darkgreen", "darkgreen",
+                    "purple", "purple"),
+           features = F,
+           smooth = 31, 
+           damid = damid)
+
+
+CreatePlot(chr = "chr6",
+           from = 0,
+           to = 149736546, 
+           sample_names = c("PT_0h",
+                            "CTCFEL_0h", "CTCFEL_24h",
+                            "WAPL_0h", "WAPL_24h",
+                            "CTCFWAPL_0h", "CTCFWAPL_24h",
+                            "RAD21_0h", "RAD21_24h"),
+           fill = c("grey30", 
+                    "red", "red2",
+                    "blue", "blue2",
+                    "green1", "green3",
+                    "purple", "purple2"),
+           features = F,
+           smooth = 31, 
+           damid = damid)
+
+
+# Custom size plots
+CreatePlot(chr = "chr6",
+           from = 136e6,
+           to = 149736546, 
+           sample_names = c("PT_0h",
+                            "CTCFEL_0h", "CTCFEL_24h",
+                            "WAPL_0h", "WAPL_24h",
+                            "CTCFWAPL_0h", "CTCFWAPL_24h",
+                            "RAD21_0h", "RAD21_24h"),
+           fill = c("grey30", 
+                    "red", "red2",
+                    "blue", "blue2",
+                    "green1", "green3",
+                    "purple", "purple2"),
+           features = T,
+           smooth = 3, 
+           damid = damid)
+
+CreatePlot(chr = "chr6",
+           from = 136e6,
+           to = 149736546, 
+           sample_names = c("PT_0h",
+                            "CTCFEL_0h", "CTCFEL_6h", 
+                            "CTCFEL_24h", "CTCFEL_96h"),
+           fill = c("grey30", 
+                    "red", "red1",
+                    "red2", "red3"),
+           features = T,
+           smooth = 3, 
+           damid = damid)
+
+CreatePlot(chr = "chr6",
+           from = 136e6,
+           to = 149736546, 
+           sample_names = c("PT_0h",
+                            "WAPL_0h", "WAPL_6h", 
+                            "WAPL_24h", "WAPL_96h"),
+           fill = c("grey30", 
+                    "blue", "blue1",
+                    "blue2", "blue3"),
+           features = T,
+           smooth = 3, 
+           damid = damid)
+
+
+```
+
+Don't like it.
+
+Maybe with gene expression.
+
+```{r gviz with expression, cache = T, fig.width = 4.5, fig.height = 6}
+
+GetGeneDataTracks <- function(genes_fpkm, sample_names, ylimits,
+                              fill = NULL, extend = 5000) {
+  # Function to get DataTracks for every sample given
+  
+  genes_tmp <- genes
+  mcols(genes_tmp) <- genes_fpkm %>%
+    dplyr::select(sample_names)
+  
+  # Change GRanges object
+  # start(genes_tmp) <- ifelse(strand(genes) == "+",
+  #                            start(genes), end(genes) - extend)
+  # end(genes_tmp) <- ifelse(strand(genes) == "+",
+  #                          start(genes) + extend, end(genes))
+  
+  strand(genes_tmp) <- "*"
+  
+  # Get DataTracks
+  l <- list()
+  for (i in 1:length(sample_names)) {
+    s <- sample_names[i]
+    f <- ifelse(is.null(fill), "darkblue", fill[i])
+    # name shortcut
+    n <- str_remove_all(s, "TCF|APL|AD21")
+    tmp <- genes_tmp
+    mcols(tmp) <- data.frame(score = mcols(genes_tmp)[, s])
+    tmp <- DataTrack(tmp, name = n, type = "histogram", ylim = ylimits,
+                     fill.histogram = f, col.histogram	= NA)
+    l <- c(l, list(tmp))
+  }
+  l
+}
+
+CreatePlotWithExpr <- function(chr, from, to, 
+                               sample_names = c("CTCFWAPL_0h", "CTCFWAPL_24h",
+                                                "RAD21_0h", "RAD21_24h"),
+                               fill = c("darkgreen", "darkgreen",
+                                        "purple2", "purple2"),
+                               ylimits = c(0, 30)) {
+  # plot tracks
+  plotTracks(c(GetDataTracks(damid, 
+                             sample_names,
+                             fill = fill),
+               GetGeneDataTracks(genes_fpkm, 
+                             sample_names,
+                             fill = fill,
+                             ylimits = ylimits),
+               list(genes_track,
+                    gtrack)),
+             chromosome = chr,
+             from = from,
+             to = to,
+             #stacking = "dense",
+             transcriptAnnotation = "symbol",
+             background.title = "transparent",
+             fontcolor.title = "black",
+             col.title = "black",
+             col.axis = "black")
+}
+
+# For differential genes
+CreatePlotWithExpr(chr = "chr1",
+                   from = 96e6,
+                   to = 100e6, 
+                   ylimits = c(0, 20))
+
+CreatePlotWithExpr(chr = "chr9",
+                   from = 89.5e6,
+                   to = 92e6,
+                   ylimits = c(0, 10))
+
+CreatePlotWithExpr(chr = "chr18",
+                   from = 45e6,
+                   to = 50e6,
+                   ylimits = c(0, 1))
+
+```
+
+No.
+
+
+### Conclusions
+
+Good tracks for presentations. Just use custom R plotting, not GViz.
+
+
+### Session info
+
+```{r session info}
+sessionInfo()
+```

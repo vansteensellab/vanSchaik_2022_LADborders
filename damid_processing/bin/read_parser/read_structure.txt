@@ -1,0 +1,91 @@
+# Read structure file accompanying the parsing module
+
+# For version 1.5
+
+# This works by specifying all adapters / other sequences to be removed from the
+# read. They can be used to filter the output, or extract more information from 
+# the read.
+
+# IMPORTANT:
+# Use "-" as default / blank instead of whitespaces.
+
+# The structure is as follows:
+# - ID:              The name / identifier of the element (required!)
+# - 5':              5' sequence (default: none) (Note: this can also be a .txt file with
+#                    line separated entries)
+# - 3':              3' sequence (default: none) (Note: this can also be a .txt file with
+#                    line separated entries)
+# - type:            Type of the element, described in more detail below (required!)
+# - req:             Set requirement of this element: present, absent or not important
+#                    (default: don't filter), see below for a complete list of options
+# - second-read:     If paired end, is this in the first of second read? (default: 
+#                    first read)
+# - pos:             Is the position fixed (first/last base of the read), or can 
+#                    the position vary (default: fixed)
+# - keep-bases:      (Feature for DamID) Keep "n" bases from the filter. In case of
+#                    DamID, you can then both cut and save the GATC sequence (and a 
+#                    possible mismatch if present here). (Note: this cannot be used with
+#                    5' and 3' sequences together, which also wouldn't make sense.)
+#                    (default: no)
+
+# "Type" described in more detail. Options are:
+# - const:           Constant region (can include Ns). Only for filtering, to be removed
+# - barcode:         Barcode. Will be removed, and readID - barcode association will be
+#                    saved. 
+#                    Format: "NNNNNNN" or "NNNGTGNNNN" (including actual bases) or
+#                    "10" (an integer of the barcode length).
+# - index:           Index region, basically the same as barcodes, but the reads will 
+#                    be separated on index sequence. (Should this include unknown 
+#                    indices, which can make things very messy, or should you then
+#                    just use barcodes and figure it out yourself?) 
+#                    Important!: This is not a really robust indexing method, and could
+#                    use some improvement!
+# - const_bar:       A constant region including a barcode, for when the barcode ends
+#                    with just a few constant bases too short for a new element, or to
+#                    detect a barcode insertion / deletion. The format for this is:
+#                    "CGACAG{NNNNN}CATGA", where the Ns can also replaced with an 
+#                    integer of the barcode length.
+# - DNA:             A sequence to be returned in fastq format. Can be an integer of the
+#                    DNA length. 
+#                    (Note: because elements are parsed one at the time, this is always "single"
+#                    end. However, only "good" reads are written, so two of these DNA elements
+#                    where both are "required" can be seen as paired end data files)
+# - const_DNA:       A mix between const_bar and DNA. Returned in fastq format
+# - const_bar_comp:  This type is for the reverse complement of a barcode. Say, you have 
+#                    readthrough, past the constant region of a barcode into the barcode
+#                    itself, this allows you to replace the read-specific barcode
+#                    with the previously found barcode. 
+#                    Format: GATC[BC]TGAAG, where "[BC]" is the previously given barcode.
+
+# # "Req" described in more detail. Options are:
+# - "-" (default):   Do not filter reads based on this feature.
+# - present:         Filter reads on the presence of this feature.
+# - absent:          Filter reads on the absence of this feature.
+# - group:[xxx]:     Filter reads on the presence of one the features with this
+#                    specific group. You can add this "group:" + identifier to 
+#                    multiple features, and reads will only be kept when one of
+#                    these features have been found. Two considerations. 
+#                    First, the only way to find out which element has been found 
+#                    is to make the all_file, and parse this yourself. Two, using 
+#                    this options, reads will not be filtered until all features 
+#                    have been scanned, making it a bit less efficient (in case the 
+#                    group-features are all at the beginning of the structure 
+#                    file). (Note: I could of course do something with the feature
+#                    that was found, just say what you'd like!)
+
+# WARNING for const_xxx:
+# Cutadapt uses an algorithm which maximizes the number of matches, while it's still
+# within the max_error_rate. Usually this is not a problem, but for the const_xxx 
+# class I use a very lenient max_error_rate to prevent the situation where the 
+# whole pattern is matched, but a (small, 5bps?) edge not. However, the downside of 
+# this is that a long edge can have a lot of insertions to get the highest number
+# of matches, resulting in very short barcodes/DNAs found. This can be prevented 
+# by having relatively small edges (5-10 bps?). A long constant part followed by
+# a barcode is then best split in a first constant part and second a const_bar part
+# Sorry for the inconvenience, but I can't (easily) change Cutadapt's alignment
+# algorithm.
+
+# Example (Note: please keep the header-line in your own file if you want to 
+# this working):
+ID          5'                         3'                type        req      second-read    pos      keep-bases
+adapter     NNNNGTGGTCGCGGCCGAGGATC    -                 const       present  -              -        4       

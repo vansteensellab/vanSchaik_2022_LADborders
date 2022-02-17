@@ -1,0 +1,24 @@
+name: 4DN_mapper
+channels:
+- bioconda
+- conda-forge
+- defaults
+- r
+dependencies:
+- bamutil=1.0.14=1
+- bwa=0.7.17=pl5.22.0_0
+- samtools=1.6=0
+- bzip2=1.0.6=1
+- ca-certificates=2017.11.5=0
+- curl=7.54.1=0
+- krb5=1.14.2=0
+#- libssh2=1.8.0=1
+- openssl=1.0.2n=0
+- perl=5.22.0.1=0
+- xz=5.2.3=0
+- zlib=1.2.8=3
+- libgcc=7.2.0=h69d50b8_2
+- libgcc-ng=7.2.0=h7cc24e2_2
+- libstdcxx-ng=7.2.0=h7a57d05_2
+prefix: /home/t.v.schaik/mydata/miniconda3/envs/4DN_mapper
+

@@ -1,0 +1,489 @@
+###############################################################################
+## snakemake damid pipeline ###################################################
+###############################################################################
+## Tom van Schaik
+## 171030
+## version 1.2
+
+# Introduction snakemake:
+# Snakemake is a bioinformatics pipeline tool written in python. It follows the 
+# 'make'-logic: you determine rules with which files can be generated, and 
+# which input files these require. Snakemake will try to execute the first rule
+# given, and execute other rules based on the input the final rule requires. 
+# In this way, you have a pipeline. 
+# Some cool features of snakemake:
+# - You give input and output file names, and snakemake will do the rest.
+# - If a rule gives an error, the output file is automatically removed, to 
+#   prevent "partial" data files.
+# - Given a number of cores to snakemake, it will automatically parallelize 
+#   things when possible. 
+# - You can create a fancy workflow overview picture.
+
+# This is "standard" DamID-seq pipeline, which means including a dam-only control
+# Briefly, parameters are located in the attached config.yaml-file, which are used
+# to:
+# 1) Parse reads to remove adapters, given in the read_structure file and
+#    using the read_parser module
+# 2) Map gDNA sequences with bwa mem, and sort / index the bam files.
+# 3) Count reads in GATC-fragments and various bin sizes, given that they 
+#    overlap the GATC fragment.
+# 4) Normalize the count-data using the dam-only control.
+# 5) Create BigWigs tracks of counts and normalized values.
+# 6) Create simple quality reports
+# 7) Define enriched domains with a HMM.
+
+# Important note: 
+# This is a work in progress! Some bugs might still be present. 
+
+# Versions
+# 1.0 - Initial version
+# 1.1 - Removed loops
+# 1.2 - Updated pipeline
+
+# Execute as (from analysis folder):
+# snakemake -s bin/snakemake/damid.snake --cores 8 --printshellcmds --use-conda
+# (Tested with Snakemake 3.13.3)
+
+
+###############################################################################
+### General set-up ############################################################
+###############################################################################
+
+import os
+import datetime
+
+configfile: "bin/snakemake/config.yaml"
+#configfile: "bin/snakemake/config_mm9.yaml"
+#configfile: "bin/snakemake/config_NPC_differentiation.yaml"
+
+date = datetime.datetime.now()
+date = '%i%0.2i%0.2i' % (date.year, date.month, date.day)
+
+
+###############################################################################
+### Object conversions ########################################################
+###############################################################################
+
+# Set-up basenames dictionary
+basenames = config["basenames"]
+
+# Note, the only difference is that the name entries are not OrderedDicts.
+for base in basenames.keys():
+   entry = basenames[base]
+   for i, e in enumerate(basenames[base]):
+      if type(e) is str:
+         e_base = e.split("/")[-1]
+         e_base = e_base.split(".")[0]
+         basenames[base][i] = {e_base: e}
+
+# From the config["basenames"], create a fastq_names dictionary
+basename2bam = {}
+for k in basenames.keys():
+   n = []
+   for j in basenames[k]:
+      for i in j.keys():
+         n.append(i)
+   basename2bam[k] = n
+
+# From the config["basenames"], create a basename - mapped basename file
+fastq_names = {}
+for k in basenames.keys():
+   for j in basenames[k]:
+      for i in j.keys():
+         fastq_names[i] = j[i]
+
+# Convert "bins" into an integer
+bins = config["bins"].split(",")
+sizes = [s + "kb" for s in bins]
+sizes_all = ["gatc"] + [s + "kb" for s in bins]
+
+# Append output directories
+out_parse = os.path.join(config["output_dir"], config["out_parse"])
+out_map = os.path.join(config["output_dir"], config["out_map"])
+out_count = os.path.join(config["output_dir"], config["out_count"])
+out_norm = os.path.join(config["output_dir"], config["out_norm"])
+out_tracks_norm = os.path.join(config["output_dir"], config["out_tracks_norm"])
+out_tracks_counts = os.path.join(config["output_dir"], config["out_tracks_counts"])
+out_hmm = os.path.join(config["output_dir"], config["out_hmm"])
+out_report_experiment = os.path.join(config["output_dir"], config["out_report_experiment"])
+out_report_replicate = os.path.join(config["output_dir"], config["out_report_replicate"])
+out_statistics = os.path.join(config["output_dir"], config["out_statistics"])
+
+
+###############################################################################
+### Rules #####################################################################
+###############################################################################
+
+
+##################################
+### xxx) All rule ################
+##################################
+
+# "First and final" rule: list required input
+rule all:
+   input:
+      "all_tracks.txt",
+      "all_hmm.txt",
+      "all_report.txt",
+      "all_statistics.txt",
+      "all_normalized.txt",
+      "all_counted.txt",
+      "all_mapped.txt"
+#      "all_parsed.txt"
+
+
+##################################
+### 8) Pipeline statistics #######
+##################################
+
+# Gather basic statistics of the pipeline:
+# total reads, parsed reads, mapped reads, counted reads, used reads
+
+rule merge_statistics:
+   input:
+      expand("%s/{basename}.statistics.txt" % out_statistics,
+             basename = basenames.keys())
+   params:
+      basenames = basenames,
+      output_dir = out_statistics,
+      merge_statistics = config["merge_statistics"]
+   output:
+      expand("%s/pipeline.statistics.{extension}" % out_statistics,
+             extension = ["txt", "pdf"]),
+      temp(touch("all_statistics.txt"))
+   run:
+      basenames = ",".join(params.basenames)
+      shell("{params.merge_statistics} -b {basenames} -o {params.output_dir} -d {params.output_dir}")
+
+rule gather_statistics:
+   input:
+      parsed = lambda wildcards: expand("%s/{basename}.statistics.txt" % out_parse, 
+                                        basename = basename2bam[wildcards.basename]),
+      mapped = lambda wildcards: expand("%s/{basename}.mapping.statistics.txt" % out_map, 
+                                        basename = basename2bam[wildcards.basename]),
+      counts = lambda wildcards: expand("%s/{basename}.counts.statistics.txt" % out_count, 
+                                        basename = wildcards.basename)
+   params:
+      basename = "{basename}",
+      output_dir = out_statistics,
+      gather_statistics = config["gather_statistics"]
+   output:
+      temp("%s/{basename}.statistics.txt" % out_statistics)
+   run:
+      parsed = ",".join(input.parsed)
+      parsed = ",".join(input.parsed)
+      mapped = ",".join(input.mapped)
+      shell("{params.gather_statistics} -b {params.basename} -o {params.output_dir} -p {parsed} -m {mapped} -c {input.counts}")
+      
+
+##################################
+### 7) Sample statistics #########
+##################################
+
+# Create an R-markdown document summarizing various statistics of the sample
+# and containing quality plots.
+
+rule all_report:
+   input:
+      expand("%s/{basename}_report.html" % out_report_experiment,
+             basename = config['dam_controls'].keys()),
+      expand("%s/{replicate}_replicate.html" % out_report_replicate,
+             replicate = config['replicates'].keys())
+   output:
+      temp(touch("all_report.txt"))
+
+rule experiment_report:
+   input:
+      expand("%s/bin-{size}/{{basename}}-{size}.norm.txt.gz" % out_norm,
+             size = sizes_all),
+      expand("%s/bin-{size}/{{basename}}-{size}_HMM.txt.gz" % out_hmm,
+             size = sizes)
+   params:
+      file_report = config["file_report"],
+      #centromeres_bed = config["centromeres_bed"],
+      basename = "{basename}"
+   output:
+      "%s/{basename}_report.html" % out_report_experiment
+   script:
+      #"{params.file_report}"
+      config["file_report"]
+
+rule replicate_report:
+   input:
+      lambda wildcards: expand("%s/bin-{size}/{replicate}-{size}.norm.txt.gz" % out_norm,
+                               size = sizes_all,
+                               replicate = config["replicates"][wildcards.replicate]),
+      lambda wildcards: expand("%s/bin-{size}/{replicate}-{size}_HMM.txt.gz" % out_hmm,
+                               size = sizes,
+                               replicate = config["replicates"][wildcards.replicate])
+   params:
+      replicate_report = config["replicate_report"],
+      basename = "{replicate}"
+   output:
+      "%s/{replicate}_replicate.html" % out_report_replicate
+   script:
+      #"{params.replicate_report}"
+      config["replicate_report"]
+
+
+##################################
+### 6) HMM caling ################
+##################################
+
+# Run a HMM to define enriched domains
+
+# HMM modeling of the normalized data
+rule all_hmm:
+   input:
+      expand("%s/bin-{size}/{basename}-{size}_{type}.gz" % out_hmm, 
+             basename = config['dam_controls'].keys(),
+             size = sizes,
+             type = ["HMM.txt", "AD.bed"]),
+      expand("%s/bin-{size}/{basename}-{size}-combined_{type}.gz" % out_hmm, 
+             basename = config['replicates'].keys(),
+             size = sizes,
+             type = ["HMM.txt", "AD.bed"])
+   output:
+      temp(touch("all_hmm.txt"))
+
+rule hmm_calling_combined:
+   input:
+      "%s/bin-{size}/{basename}-{size}-combined.norm.txt.gz" % out_norm
+   params:
+      hmm_calling = config["hmm_calling"],
+      output_dir = os.path.join(out_hmm, "bin-{size}")
+   output:
+      "%s/bin-{size}/{basename}-{size}-combined_HMM.txt.gz" % out_hmm,
+      "%s/bin-{size}/{basename}-{size}-combined_AD.bed.gz" % out_hmm
+   shell:
+      "{params.hmm_calling} -n {input} -o {params.output_dir}"
+
+rule hmm_calling:
+   input:
+      "%s/bin-{size}/{basename}-{size}.norm.txt.gz" % out_norm
+   params:
+      hmm_calling = config["hmm_calling"],
+      output_dir = os.path.join(out_hmm, "bin-{size}")
+   output:
+      "%s/bin-{size}/{basename}-{size}_HMM.txt.gz" % out_hmm,
+      "%s/bin-{size}/{basename}-{size}_AD.bed.gz" % out_hmm
+   shell:
+      "{params.hmm_calling} -n {input} -o {params.output_dir}"
+
+##################################
+### 5) BigWig tracks #############
+##################################
+
+# Here, I will create BigWig tracks for all desired samples
+
+# Create all desired tracks
+rule all_tracks:
+   input:
+      expand("%s/bin-{size}/{basename}-{size}.bw" % out_tracks_norm, 
+             basename = config['dam_controls'].keys(),
+             size = sizes_all),
+      expand("%s/bin-{size}/{basename}-{size}-combined.bw" % out_tracks_norm, 
+             basename = config['replicates'].keys(),
+             size = sizes_all),
+      expand("%s/bin-{size}/{basename}-{size}.bw" % out_tracks_counts, 
+             basename = basenames.keys(),
+             size = sizes_all)
+   output:
+      temp(touch("all_tracks.txt"))
+
+# Create data tracks for each normalized dataset and raw counts dataset
+rule tracks_norm_combined:
+   input:
+      "%s/bin-{size}/{basename}-{size}-combined.norm.txt.gz" % out_norm
+   params:
+      bed2bigwig = config["bed2bigwig"],
+      chrom_sizes = config["chrom_sizes"],
+      output_dir = os.path.join(out_tracks_norm, "bin-{size}")
+   output:
+      "%s/bin-{size}/{basename}-{size}-combined.bw" % out_tracks_norm
+   shell:
+      "{params.bed2bigwig} -n {input} -o {params.output_dir} -s {params.chrom_sizes}"
+
+rule tracks_norm:
+   input:
+      "%s/bin-{size}/{basename}-{size}.norm.txt.gz" % out_norm
+   params:
+      bed2bigwig = config["bed2bigwig"],
+      chrom_sizes = config["chrom_sizes"],
+      output_dir = os.path.join(out_tracks_norm, "bin-{size}")
+   output:
+      "%s/bin-{size}/{basename}-{size}.bw" % out_tracks_norm
+   shell:
+      "{params.bed2bigwig} -n {input} -o {params.output_dir} -s {params.chrom_sizes}"
+
+rule tracks_count:
+   input:
+      "%s/bin-{size}/{basename}-{size}.counts.txt.gz" % out_count
+   params:
+      bed2bigwig = config["bed2bigwig"],
+      chrom_sizes = config["chrom_sizes"],
+      output_dir = os.path.join(out_tracks_counts, "bin-{size}")
+   output:
+      "%s/bin-{size}/{basename}-{size}.bw" % out_tracks_counts
+   shell:
+      "{params.bed2bigwig} -n {input} -o {params.output_dir} -s {params.chrom_sizes} -c"
+
+
+##################################
+### 4) Normalization #############
+##################################
+
+# Normalize target fusion over its corresponding Dam-only
+
+# Normalization is on all the files given
+rule all_normalized:
+   input:
+      expand("%s/bin-{size}/{basename}-{size}.norm.txt.gz" % out_norm, 
+             basename = config["dam_controls"].keys(),
+             size = sizes_all),
+      expand("%s/bin-{size}/{replicate}-{size}-combined.norm.txt.gz" % out_norm,
+             replicate = config["replicates"].keys(),
+             size = sizes_all)
+   output:
+      temp(touch("all_normalized.txt"))
+
+# Replicate normalized file - simply the mean log2 signal
+rule normalized_replicate:
+   input:
+      replicates = lambda wildcards: expand("%s/bin-{size}/{basename}-{size}.norm.txt.gz" % out_norm,
+                                            basename = config["replicates"][wildcards.replicate],
+                                            size = wildcards.size)
+   params:
+      combine_replicates = config["combine_replicates"],
+      replicate = "{replicate}",
+      size = lambda wildcards: wildcards.size,
+      output_norm = lambda wildcards: os.path.join(out_norm, "bin-" + wildcards.size)
+   output:
+      "%s/bin-{size}/{replicate}-{size}-combined.norm.txt.gz" % out_norm
+   run:
+      replicates = ",".join(input.replicates)
+      replicate = params.replicate + "-" + params.size
+      shell("{params.combine_replicates} -r {replicates} -o {params.output_norm} -n {replicate}")
+
+# Normalize each target file using the appropriate dam-only file
+rule normalized:
+   input:
+      target = "%s/bin-{size}/{basename}-{size}.counts.txt.gz" % out_count,
+      dam_only = lambda wildcards: "%s/bin-%s/%s-%s.counts.txt.gz" % (out_count,
+                                                                      wildcards.size,
+                                                                      config["dam_controls"][wildcards.basename],
+                                                                      wildcards.size)
+   params:
+      normalize_damid = config["normalize_damid"],
+      method = config["normalize_method"],
+      output_norm = lambda wildcards: os.path.join(out_norm, "bin-" + wildcards.size),
+      pseudo = config["pseudo"]
+   log: "%s/bin-{size}/{basename}-{size}.log" % out_norm
+   output:
+      "%s/bin-{size}/{basename}-{size}.norm.txt.gz" % out_norm
+   shell:
+      "{params.normalize_damid} -c {input.target} -m {params.method} -o {params.output_norm} -d {input.dam_only} -L {log} -p {params.pseudo} -Z"
+
+
+##################################
+### 3) GATC-counting #############
+##################################
+
+# Count reads in GATC fragments and various bin sizes, given that the reads
+# overlap GATC borders
+
+rule all_counted:
+   input:
+      expand("%s/bin-gatc/{basename}-gatc.counts.txt.gz" % out_count,
+             basename = basenames.keys())
+   output:
+      temp(touch("all_counted.txt"))
+
+# Count GATC fragments in each bam file
+rule counting:
+   input:
+      lambda wildcards: expand("%s/{basename}.bam" % out_map, 
+                               basename = basename2bam[wildcards.basename])
+   params:
+      gatc_counting = config["gatc_counting"],
+      gatc_gff = config["gatc_gff"],
+      output_counts = out_count,
+      chrom_sizes = config["chrom_sizes"],
+      basename = "{basename}",
+      bins = bins
+   log: "%s/{basename}.log" % out_count
+   output:
+      expand("%s/bin-{size}/{{basename}}-{size}.counts.txt.gz" % out_count, 
+             size = sizes_all),
+      "%s/{basename}.counts.statistics.txt" % out_count
+   run:
+      # First, combine all the files into one string for the GATC counting script
+      files = ",".join(input)      
+      bins = ",".join(params.bins)
+      shell("{params.gatc_counting} -b {files} -f {params.gatc_gff} -o {params.output_counts} -L {log} -B {bins} -G {params.chrom_sizes} -Z -n {params.basename} -q 10 -F")
+
+
+##################################
+### 2) Read mapping ##############
+##################################
+
+# Read mapping with bwa mem
+
+rule all_mapped:
+   input:
+      expand("%s/{basename}.bam" % out_map,
+             basename = fastq_names.keys())
+   output:
+      temp(touch("all_mapped.txt"))
+
+rule mapping:
+   input:
+      reads = "%s/{sample}.fastq.gz" % out_parse
+   params:
+      mapper = config["mapper"],
+      output_mapped = out_map,
+      genome_index = config["genome_index"],
+   log: "%s/{sample}.log" % out_map
+   conda:
+       config["conda_mapping"]
+   output:
+      "%s/{sample}.bam" % out_map,
+      "%s/{sample}.mapping.statistics.txt" % out_map
+   priority: 50
+   threads: 6
+   shell:
+      "{params.mapper} -r {input.reads} -i {params.genome_index} -o {params.output_mapped} -d -c {threads} -f {log}"
+
+
+##################################
+### 1) Read parsing ##############
+##################################
+
+# Parse reads - do not keep these reads afterwards(!)
+# Note: this can also be combined using piping to the mapping script, which saves 
+#       time but does make things less organized
+
+rule all_parsed:
+   input:
+      expand("%s/{basename}.fastq.gz" % out_parse,
+             basename = fastq_names.keys())
+   output:
+      temp(touch("all_parsed.txt"))
+
+rule parsing:
+   input:
+      reads = lambda wildcards: fastq_names[wildcards.sample]
+   params:
+      read_parser = config["read_parser"],
+      basename = "{sample}",
+      read_structure = config["read_structure"],
+      output_parsed = out_parse,
+   log: "%s/{sample}.log" % out_parse
+   conda:
+       config["conda_parser"]
+   output:
+      temp("%s/{sample}.fastq.gz" % out_parse),
+      "%s/{sample}.statistics.txt" % out_parse
+   threads: 2
+   shell:
+      "python {params.read_parser} {input.reads} {params.read_structure} {params.output_parsed} -b {params.basename} -a -l {log}"

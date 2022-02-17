@@ -1,0 +1,579 @@
+---
+title: "Replicate statistics"
+author: "Tom"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+```{r setup}
+
+```
+
+### Overview
+
+This document provides quality control figures for DamID replicates.
+
+### Set-up 
+
+```{r temporary test set-up, include = FALSE} 
+
+# # # Libraries used
+# library(GenomicRanges)
+# library(GenomicAlignments)
+# library(rtracklayer)
+# library(ggplot2)
+# library(reshape2)
+# library(GGally)
+# library(RColorBrewer)
+# 
+# # Basename
+# basename <- "H1_LMNB1"
+# samples <- c("H1_r1_LMNB1", "H1_r2_LMNB1", "H1_r3_LMNB1")
+# 
+# # Bin sizes
+# bins <- c("5", "20", "80")
+# bins.kb <- paste0(bins, "kb")
+# bins.with_gatc <- c("gatc", paste0(bins, "kb"))
+# 
+# bins.count <- length(bins.with_gatc)
+# 
+# # Input directories
+# map_dir <- "/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/mapped"
+# counts_dir <- "/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/counts"
+# norm_dir <- "/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/normalized"
+# hmm_dir <- "/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/HMM"
+
+```
+
+```{r damid set-up}
+
+# Libraries used
+library(GenomicRanges)
+library(GenomicAlignments)
+library(rtracklayer)
+library(ggplot2)
+library(reshape2)
+library(GGally)
+library(RColorBrewer)
+
+# Basenames
+basename <- snakemake@params[["basename"]]
+samples <- snakemake@config[["replicates"]][[basename]]
+
+if (length(samples) < 2) {
+  stop("Not enough samples!")
+} 
+
+# Bin sizes
+bins <- snakemake@config[["bins"]]
+bins <- strsplit(bins, ",")[[1]]
+bins.kb <- paste0(bins, "kb")
+bins.with_gatc <- c("gatc", paste0(bins, "kb"))
+
+bins.count <- length(bins.with_gatc)
+
+# Input directories - note that the .Rmd file is the working directory!
+map_dir <- file.path(snakemake@config[["report_relative_location"]],
+                     snakemake@config[["output_dir"]],
+                     snakemake@config["out_map"])
+counts_dir <- file.path(snakemake@config[["report_relative_location"]],
+                        snakemake@config[["output_dir"]],
+                        snakemake@config[["out_count"]])
+norm_dir <- file.path(snakemake@config[["report_relative_location"]],
+                      snakemake@config[["output_dir"]],
+                      snakemake@config[["out_norm"]])
+hmm_dir <- file.path(snakemake@config[["report_relative_location"]],
+                     snakemake@config[["output_dir"]],
+                     snakemake@config[["out_hmm"]])
+
+```
+
+Samples to be analyzed:
+
+```{r damid set-up printed}
+print(basename)
+
+print(samples)
+
+```
+
+### Read-in data
+
+I will read in the data
+
+  * Normalized scores
+  * HMM model
+
+```{r read-in data}
+
+FixGATCsequences <- function(df) {
+  # The GATC fragments have the downside that they overlap, as they end with
+  # GATC and also start with GATC. This function quickly fixes this issue.
+
+  df.gr <- as(df, "GRanges")
+
+  # Fix the start / end
+  start(df.gr) <- start(df.gr) + 2
+  end(df.gr) <- end(df.gr) - 2
+
+  # Also trim the object to be within range
+  df.gr <- trim(df.gr)
+
+  as(df.gr, "data.frame")[, c("seqnames", "start", "end", "score")]
+}
+
+# 1) Normalized values
+replicate.norm <- list()
+
+for (s in samples) {
+  
+  target.norm <- list()
+
+  for (bin in bins.with_gatc) {
+    df.name <- file.path(norm_dir,
+                         paste0("bin-", bin),
+                         paste0(s,
+                                "-",
+                                bin,
+                                ".norm.txt.gz"))
+  
+    df <- read.table(df.name,
+                     sep = "\t", stringsAsFactors = FALSE,
+                     col.names = c("seqnames", "start", "end", "score"))
+  
+    if (bin == "gatc") {
+      df <- FixGATCsequences(df)
+    }
+    target.norm <- c(target.norm, list(df))
+  }
+  names(target.norm) <- bins.with_gatc
+  
+  replicate.norm <- c(replicate.norm, list(target.norm))
+}
+names(replicate.norm) <- samples
+
+
+# 1b) Normalized combined values
+replicate.norm.combined <- list()
+
+for (bin in bins.with_gatc) {
+  df.name <- file.path(norm_dir,
+                       paste0("bin-", bin),
+                       paste0(basename,
+                              "-",
+                              bin,
+                              "-combined.norm.txt.gz"))
+
+  df <- read.table(df.name,
+                   sep = "\t", stringsAsFactors = FALSE,
+                   col.names = c("seqnames", "start", "end", "score"))
+
+  if (bin == "gatc") {
+    df <- FixGATCsequences(df)
+  }
+  replicate.norm.combined <- c(replicate.norm.combined, list(df))
+}
+names(replicate.norm.combined) <- bins.with_gatc
+
+
+# 2) HMM 
+replicate.hmm <- list()
+
+for (s in samples) {
+  
+  target.hmm <- list()
+
+  for (bin in bins.kb) {
+    df.name <- file.path(hmm_dir,
+                         paste0("bin-", bin),
+                         paste0(s,
+                                "-",
+                                bin,
+                                "_HMM.txt.gz"))
+  
+    df <- read.table(df.name,
+                     sep = "\t", stringsAsFactors = FALSE,
+                     col.names = c("seqnames", "start", "end", "score"))
+  
+    if (bin == "gatc") {
+      df <- FixGATCsequences(df)
+    }
+    target.hmm <- c(target.hmm, list(df))
+  }
+  names(target.hmm) <- bins.kb
+  
+  replicate.hmm <- c(replicate.hmm, list(target.hmm))
+}
+names(replicate.hmm) <- samples
+
+
+```
+
+Top of the normalized counts and HMM model for sample #1:
+
+```{r read-in data printed}
+
+head(replicate.norm[[samples[1]]][[1]])
+head(replicate.hmm[[samples[1]]][[1]])
+
+```
+
+### Quality controls
+
+Various quality plots will be shown below. This list is still under construction.
+
+
+#### 1) Bins called
+
+First, how many bins have reads in replicate #1 and replicate #2? 
+
+```{r bin overlap, fig.height = 5, fig.width = 5}
+
+for (i in 1:length(samples)) {
+  print(samples[i])
+  print(paste(sum(! is.na(replicate.norm[[samples[i]]][[1]][, 4])),  # NA bins
+              "/",
+              nrow(replicate.norm[[samples[i]]][[1]]),
+              "GATC bins have reads.",
+              sep = " "))
+  print("")
+}
+
+```
+
+Or the same thing in a plot
+
+```{r bin plot, fig.height = 5, fig.width = 5}
+
+library(Vennerable)
+
+plotGATCOverlap <- function(replicate.norm, samples, n_bin = 1) {
+  
+  x <- ! is.na(replicate.norm[[samples[1]]][[n_bin]][, 4])
+  y <- ! is.na(replicate.norm[[samples[2]]][[n_bin]][, 4])
+    
+  ab <- sum(x & y)
+  a <- sum(x & !y)
+  b <- sum(!x & y)
+  
+  if (length(samples) == 2) {
+    
+    w <- Venn(SetNames = samples)
+    Weights(w) <- c(0, a, b, ab)
+    plot(w, show = list(Faces = F))
+    
+  } else if (length(samples >= 3)) {
+    
+    z <- ! is.na(replicate.norm[[samples[3]]][[n_bin]][, 4])
+
+    abc <- sum(x & y & z)
+    ac <- sum(x & !y & z)
+    bc <- sum(!x & y & z)
+    c <- sum(!x & !y & z)
+    
+    if (length(samples) == 3) {
+      
+      w <- Venn(SetNames = samples)
+      Weights(w) <- c(0, a, b, ab, c, ac, bc, abc)
+      plot(w, show = list(Faces = F))
+      
+    } else if (length(samples) == 4) {
+      
+      q <- ! is.na(replicate.norm[[samples[4]]][[n_bin]][, 4])
+
+      abcd <- sum(x & y & z & q)
+  
+      abd <- sum(x & y & !z & q)
+      acd <- sum(x & !y & z & q)
+      bcd <- sum(!x & y & z & q)
+  
+      ad <- sum(x & !y & !z & q)
+      bd <- sum(!x & y & !z & q)
+      cd <- sum(!x & !y & z & q)
+  
+      d <- sum(!x & !y & !z & q)
+  
+      w <- Venn(SetNames = samples)
+      Weights(w) <- c(0, a, b, ab, c, ac, bc, abc, d, ad, bd, abd, cd, acd, bcd, abcd)
+      plot(w, show = list(Faces = F))
+      
+    } else {
+      stop("Sorry, this number of names is not supported yet")
+    }
+  }
+}
+
+for (i in 1:length(bins.with_gatc)) {
+  print(paste0("Current bin size: ", bins.with_gatc[i]))
+  
+  tryCatch(plotGATCOverlap(replicate.norm, samples, n_bin = i),
+           error = function(e) print(e))
+}
+
+```
+
+
+#### 2) HMM overlap
+
+How well does the HMM calling overlap between the replicates for different bin
+sizes?
+
+```{r HMM overlap, fig.height = 5, fig.width = 5}
+
+library(Vennerable)
+
+plotVennFromList <- function(df.list) {
+
+  names.plot <- paste0("bin_", names(df.list))
+
+  # Convert HMM list into one GRanges object
+  # For now, this assumes that:
+  # 1) Model go from small to large
+
+  hmm.gr <- as(df.list[[1]],
+                    "GRanges")
+  names(mcols(hmm.gr)) <- names.plot[1]
+
+  for (i in 2:length(df.list)) {
+
+    # Determine overlap
+    ovl <- findOverlaps(hmm.gr,
+                        as(df.list[[i]],
+                           "GRanges"),
+                        type = "within")
+
+    mcols(hmm.gr)[, names.plot[i]] <- df.list[[i]][subjectHits(ovl), "score"]
+
+  }
+
+  # Convert into data frame
+  hmm.df <- as(hmm.gr,
+               "data.frame")
+
+  # Only select the interesting data, and only the complete cases
+  df.tmp <- hmm.df[, c("seqnames", "start", "end", names.plot)]
+  df.tmp <- df.tmp[complete.cases(df.tmp), ]
+
+  # Next, create a vector of overlap
+  if (length(names.plot) == 2) {
+
+    x <- (df.tmp[, names.plot[1]] == "AD")
+    y <- (df.tmp[, names.plot[2]] == "AD")
+
+    ab <- sum(x & y)
+    a <- sum(x & !y)
+    b <- sum(!x & y)
+
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab)
+    plot(w, show = list(Faces = F))
+
+  } else if (length(names.plot) == 3) {
+
+    x <- (df.tmp[, names.plot[1]] == "AD")
+    y <- (df.tmp[, names.plot[2]] == "AD")
+    z <- (df.tmp[, names.plot[3]] == "AD")
+
+    abc <- sum(x & y & z)
+    ab <- sum(x & y & !z)
+    ac <- sum(x & !y & z)
+    bc <- sum(!x & y & z)
+    a <- sum(x & !y & !z)
+    b <- sum(!x & y & !z)
+    c <- sum(!x & !y & z)
+
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab, c, ac, bc, abc)
+    plot(w, show = list(Faces = F))
+
+  } else if (length(names.plot) == 4) {
+
+    x <- (df.tmp[, names.plot[1]] == "AD")
+    y <- (df.tmp[, names.plot[2]] == "AD")
+    z <- (df.tmp[, names.plot[3]] == "AD")
+    q <- (df.tmp[, names.plot[4]] == "AD")
+
+    abcd <- sum(x & y & z & q)
+
+    abc <- sum(x & y & z & !q)
+    abd <- sum(x & y & !z & q)
+    acd <- sum(x & !y & z & q)
+    bcd <- sum(!x & y & z & q)
+
+    ab <- sum(x & y & !z & !q)
+    ac <- sum(x & !y & z & !q)
+    ad <- sum(x & !y & !z & q)
+    bc <- sum(!x & y & z & !q)
+    bd <- sum(!x & y & !z & q)
+    cd <- sum(!x & !y & z & q)
+
+    a <- sum(x & !y & !z & !q)
+    b <- sum(!x & y & !z & !q)
+    c <- sum(!x & !y & z & !q)
+    d <- sum(!x & !y & !z & q)
+
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab, c, ac, bc, abc, d, ad, bd, abd, cd, acd, bcd, abcd)
+    plot(w, show = list(Faces = F))
+
+  } else {
+    stop("Sorry, this number of names is not supported yet")
+  }
+
+}
+
+# Unfortunately, there is a bug in Vennerable. Try it, but don't bother if
+# it doesn't work.
+
+for (b in bins.kb) {
+  print(paste0("Current bin size: ", b))
+  
+  hmm.list <- lapply(samples, function(x) replicate.hmm[[x]][[b]])
+  
+  names(hmm.list) <- samples
+  
+  tryCatch(plotVennFromList(hmm.list),
+           error = function(e) print(e))
+}
+
+
+```
+
+
+
+#### 3) Correlation between samples
+
+First, the correlation + spearman number.
+
+```{r correlation, fig.height = 5, fig.width = 5}
+
+op <- par(pty="s")
+
+n <- 10000
+
+for (i in 1:length(bins.with_gatc)) {
+  
+  # Get a data frame with the observations
+  df <- do.call(cbind, lapply(samples, function(x) replicate.norm[[x]][[i]][, 4]))
+  df <- df[complete.cases(df), ]
+  df <- data.frame(df)
+  names(df) <- samples
+  
+  # Take a samples of this data frame
+  s <- sample(1:nrow(df), min(n, nrow(df)), replace = F)
+  df.reduced <- df[s, ]
+  
+  # Get the limits 
+  limits <- c(min(df), max(df))
+  
+  # Plot
+  my_dens <- function(data, mapping, ...) {
+    ggplot(data = data, mapping=mapping) +
+      geom_point(..., alpha = 0.2) +
+      geom_abline(slope = 1, lty = "dashed", col = "red")
+  }
+  
+  print(ggpairs(df.reduced,
+          lower = list(continuous = my_dens)) +
+    ggtitle(paste(bins.with_gatc[i],
+                  "|", nrow(df.reduced), "points plotted")) +
+    xlab("Normalized score (log2)") +
+    ylab("Normalized score (log2)") +
+    theme_bw())
+  
+  # plot(df, 
+  #      pch = 19, col = alpha("black", 0.2),
+  #      xlab = paste(samples[1], "(log 2)"),
+  #      ylab = paste(samples[2], "(log 2)"),
+  #      xlim = limits, ylim = limits,
+  #      main = paste(bins.with_gatc[i],
+  #                   "|", nrow(df), "points plotted"))
+  # abline(a = 0, b = 1, lty = 2, col = "red")
+  
+}
+par(op)
+
+
+```
+
+Also, let's plot the cross correlation. Note, this is only for replicate #1 and #2.
+
+```{r cross correlation, fig.height = 5, fig.width = 5}
+
+# op <- par(pty="s")
+# 
+# for (i in 1:length(bins.with_gatc)) {
+#   x <- replicate.norm[[samples[1]]][[i]][, 4]
+#   y <- replicate.norm[[samples[2]]][[i]][, 4]
+#   
+#   ccf(x, y, na.action = na.pass,
+#       lag.max = 20,
+#       main = paste(basename, 
+#                    bins.with_gatc[i],
+#                    sep = " - "))
+# }
+# 
+# par(op)
+
+```
+
+#### 4) Autocorrelation
+
+Multiple replicates should filter out the (technical) noise present in samples. 
+If we use the autocorrelation as quality measure, can we see this?
+
+```{r autocorrelation}
+
+# Set-up for the ACF
+acf.df <- c()
+
+for (b in bins.with_gatc) {
+  acf.vec <- c()
+
+  for (s in samples) {
+    # Where -b is the bin size and -s is the sample
+
+    # Calculate the ACF - with the notion that NAs are simply skipped
+    a <- acf(replicate.norm[[s]][[b]][, 4], lag.max = 2, na.action = na.pass, plot = F)
+    acf.vec <- c(acf.vec, a$acf[2])
+  }
+  
+  # And for the combined replicate
+  a <- acf(replicate.norm.combined[[b]][, 4], lag.max = 2, na.action = na.pass, plot = F)
+  acf.vec <- c(acf.vec, a$acf[2])
+  
+  acf.df <- cbind(acf.df, acf.vec)
+}
+acf.df <- data.frame(acf.df)
+names(acf.df) <- bins.with_gatc
+acf.df$sample <- c(samples, paste0(basename, "-combined"))
+
+
+# Plot all of this
+acf.df.melt <- melt(acf.df, id.vars = "sample")
+
+ggplot(acf.df.melt, aes(x = variable, y = value, col = sample)) +
+  geom_point() +
+  ggtitle("Combined replicate ACF") +
+  xlab("Bin size") +
+  ylab("ACF") +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw()
+
+```
+
+### SessionInfo
+
+```{r}
+
+sessionInfo()
+
+```

@@ -1,0 +1,941 @@
+---
+title: "Correlating expression and NL interactions"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+In a previous documents, I prepared DamID objects for all bins and FPKM values
+for all genes. I will correlate these here.
+
+Note that I tried many things in this document. It comes down to a very simple 
+message: there is no enrichment for LAD genes upon CTCF / RAD21 perturbations.
+
+
+### Method
+
+Load (z-scale) DamID tracks and FPKM values. Correlate these in various ways.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(caTools))
+suppressPackageStartupMessages(library(yaml))
+suppressPackageStartupMessages(library(GGally))
+
+# Prepare output 
+output.dir <- "ts220117_Correlating_Expression_and_NLinteractions"
+dir.create(output.dir, showWarnings = FALSE)
+
+# Load data
+input.dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+lads <- readRDS(file.path(input.dir, "LADs_pA.rds"))[[1]]
+lads.border <- readRDS(file.path(input.dir, "LAD_borders_pA.rds"))[[1]]
+
+input.dir <- "ts220113_effect_of_CTCF_depletion_on_LAD_borders"
+bin.size <- readRDS(file.path(input.dir, "bin_size.rds"))
+gr_damid <- readRDS(file.path(input.dir, "damid.rds"))
+metadata <- readRDS(file.path(input.dir, "metadata_damid.rds"))
+
+input.dir <- "ts220113_GeneExpression"
+genes <- readRDS(file.path(input.dir, "genes.rds"))
+genes.fpkm <- readRDS(file.path(input.dir, "genes_fpkm_mean.rds"))
+genes.res <- readRDS(file.path(input.dir, "genes_results.rds"))
+
+input.dir <- "ts220113_CTCF_sites_within_LADs"
+genes_LAD_active <- readRDS(file.path(input.dir, 
+                                      "genes_LAD_active.rds"))
+genes_LAD_active_CTCFidx <- readRDS(file.path(input.dir, 
+                                              "genes_LAD_active_CTCFidx.rds"))
+genes_LAD_inactive <- readRDS(file.path(input.dir, 
+                                        "genes_LAD_inactive.rds"))
+genes_LAD_inactive_CTCFidx <- readRDS(file.path(input.dir,
+                                                "genes_LAD_inactive_CTCFidx.rds"))
+
+input.dir <- "ts220117_Positioning_DifferentialGenes"
+significant_tests <- readRDS(file.path(input.dir, 
+                                       "significant_tests.rds"))
+genes_expression_idx <- readRDS(file.path(input.dir, 
+                                          "genes_expression_idx.rds"))
+
+
+# Also process the nascent expression data
+input.dir <- "ts220117_NascentExpression"
+#genes <- readRDS(file.path(input.dir, "genes.rds"))
+genes.fpkm.nascent <- readRDS(file.path(input.dir, "genes_fpkm_mean.rds"))
+genes.res.nascent <- readRDS(file.path(input.dir, "genes_results.rds"))
+
+
+# Also get the LAD differences
+input.dir <- "ts220113_DamID_changes_versus_LAD_size_and_score"
+gr_LAD_consensus <- readRDS(file.path(input.dir, "LADs_consensus.rds"))
+
+
+```
+
+Prepare knitr.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, 
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output.dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+Functions.
+
+```{r functions}
+
+GenesDamIDScores <- function(genes, gr, extend = 1e4) {
+  
+  # Extend genes
+  genes.ovl <- genes
+  start(genes.ovl) <- start(genes.ovl) - extend
+  end(genes.ovl) <- end(genes.ovl) + extend
+  
+  # Overlay genes with bins
+  ovl <- findOverlaps(genes.ovl, gr)
+  
+  # Determine mean score per gene
+  tib <- as_tibble(mcols(gr))[subjectHits(ovl), ] %>% 
+    add_column(idx = queryHits(ovl)) %>%
+    gather(key, value, -idx) %>%
+    group_by(idx, key) %>%
+    summarise(mean = mean(value, na.rm = T)) %>%
+    ungroup() %>%
+    mutate(key = factor(key, levels = names(mcols(gr)))) %>%
+    spread(key, mean)
+    
+  # Prepare genes with scores
+  genes.damid <- genes
+  mcols(genes.damid) <- tib %>% 
+    dplyr::select(-idx)
+  
+  genes.damid
+  
+}
+
+```
+
+
+### 1. DamID score for genes
+
+First, calculate DamID score for every gene.
+
+```{r damid score per gene, cache = T}
+
+# Overlay genes with LADs and add distance to border
+genes$LAD <- overlapsAny(genes, lads, ignore.strand = T)
+dis <- distanceToNearest(genes, lads.border, ignore.strand = T)
+genes$LAD_distance <- mcols(dis)$distance
+
+# Score per gene
+genes.damid <- GenesDamIDScores(genes, gr_damid)
+
+```
+
+
+### 2. Correlate change in expression with change in DamID score
+
+Compare changes in LaminB1 scores with changes in gene expression.
+
+```{r expression vs damid difference, cache = T, fig.width = 8, fig.height = 4, warning = F, message = F}
+
+# Create various plots between a base sample and other samples
+PlotExpressionVsDamID <- function(genes, res, expr, damid, base, samples,
+                                  min_expr = -1) {
+  
+  # Combine into one tibble
+  tib <- tibble(gene_id = genes$gene_id,
+                LAD = genes$LAD,
+                LAD_distance = genes$LAD_distance,
+                expr_base = expr %>% pull(base),
+                damid_base = as_tibble(mcols(damid)) %>% pull(base)) %>%
+    mutate(LAD = LAD & (LAD_distance > 0)) %>%
+    bind_cols(expr %>% 
+                select(samples) %>% 
+                rename_all(function(x) paste0("expr_", samples))) %>%
+    bind_cols(as_tibble(mcols(damid)) %>% 
+                select(samples) %>% 
+                rename_all(function(x) paste0("damid_", samples))) %>%
+    mutate_at(vars(paste0("expr_", samples)), 
+              function(x) log2(x+1) - log2(.$expr_base+1)) %>%
+    mutate_at(vars(paste0("damid_", samples)), 
+              function(x) x - .$damid_base)
+  
+  # Get differential results
+  sign <- lapply(samples, 
+                 function(x) { mcols(res)[, paste(x, "vs", base, "sign", 
+                                                  sep = "_")]})
+  
+  # Gather
+  idx <- rowSums(expr > min_expr) > 0
+  sign <- factor(unlist(sign), levels = c("down", "stable", "up"))[idx]
+  
+  tib_gather <- tib[idx, ] %>%
+    dplyr::select(-contains("base")) %>%
+    gather(key_expr, expr, contains("expr")) %>%
+    gather(key_damid, damid, contains("damid")) %>%
+    mutate(key_expr = str_remove(key_expr, "expr_"),
+           key_damid = str_remove(key_damid, "damid_")) %>%
+    filter(key_damid == key_expr) %>%
+    mutate(key_damid = factor(key_damid, levels = samples),
+           sign = sign)
+    
+  # Plot
+  plt <- tib_gather %>%
+    ggplot(aes(x = damid, y = expr)) +
+    geom_point(aes(col = sign, alpha = sign)) +
+    geom_vline(xintercept = 0, linetype = "dashed", col = "blue") +
+    geom_hline(yintercept = 0, linetype = "dashed", col = "blue") +
+    geom_smooth(method = "lm", col = "red") +
+    facet_grid(LAD ~ key_damid) +
+    scale_color_manual(values = c("blue", "black", "red")) +
+    scale_alpha_manual(values = c(0.5, 0.05, 0.5)) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  plot(plt)
+  
+  # Plot LAD & latest time point
+  tib_filter <- tib_gather %>%
+    filter(LAD == T, key_damid == tail(tib_gather$key_damid)[1]) %>%
+    drop_na()
+  
+  plt <- tib_filter %>%
+    ggplot(aes(x = damid, y = expr)) +
+    geom_point(aes(col = sign, size = sign)) +
+    geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+    geom_hline(yintercept = 0, linetype = "dashed", col = "black") +
+    scale_color_manual(values = c("blue", "black", "red"), 
+                       labels = c(paste0("Down (n=", sum(tib_filter$sign == "down"), ")"),
+                                  paste0("Stable (n=", sum(tib_filter$sign == "stable"), ")"),
+                                  paste0("Up (n=", sum(tib_filter$sign == "up"), ")"))) +
+    scale_size_manual(values = c(1, 0.25, 1), guide = F) +
+    facet_grid(. ~ key_damid) +
+    ggtitle(paste0("Pearson=",
+                   round(cor(tib_filter$expr, tib_filter$damid), 3),
+                   "; p-value=",
+                   signif(cor.test(tib_filter$expr, tib_filter$damid)$p.value, 2))) +
+    xlab("Delta DamID") +
+    ylab("Delta Expr") +
+    coord_cartesian(xlim = c(-2, 2), ylim = c(-3, 6)) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  plot(plt)
+  
+  # Plot density
+  plt <- tib_gather %>%
+    ggplot(aes(x = damid)) +
+    geom_density(aes(col = sign)) +
+    geom_vline(xintercept = 0, linetype = "dashed", col = "blue") +
+    geom_hline(yintercept = 0, linetype = "dashed", col = "blue") +
+    facet_grid(LAD ~ key_damid) +
+    scale_color_manual(values = c("blue", "black", "red")) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  plot(plt)
+  
+  plt <- tib_gather %>%
+    ggplot(aes(x = damid)) +
+    stat_ecdf(aes(col = sign)) +
+    geom_vline(xintercept = 0, linetype = "dashed", col = "blue") +
+    geom_hline(yintercept = 0, linetype = "dashed", col = "blue") +
+    facet_grid(LAD ~ key_damid) +
+    scale_color_manual(values = c("blue", "black", "red")) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  plot(plt)
+  
+  # Plot without stable group
+  plt <- tib_gather %>%
+    filter(sign != "stable") %>%
+    ggplot(aes(x = damid, y = expr)) +
+    geom_point(aes(col = sign, alpha = sign)) +
+    geom_vline(xintercept = 0, linetype = "dashed", col = "blue") +
+    geom_hline(yintercept = 0, linetype = "dashed", col = "blue") +
+    #geom_smooth(method = "lm", col = "red") +
+    facet_grid(LAD ~ key_damid) +
+    scale_color_manual(values = c("blue", "red")) +
+    scale_alpha_manual(values = c(0.5, 0.5)) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  plot(plt)
+  
+  # Plot only changing NL genes
+  plt <- tib_gather %>%
+    filter(damid < -0.5 | damid > 0.5) %>%
+    ggplot(aes(x = damid, y = expr)) +
+    geom_point(size = 0.5) +
+    geom_vline(xintercept = 0, linetype = "dashed", col = "blue") +
+    geom_hline(yintercept = 0, linetype = "dashed", col = "blue") +
+    #geom_smooth(method = "lm", col = "red") +
+    facet_grid(. ~ key_damid) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  plot(plt)
+  
+  # Plot density
+  plt <- tib_gather %>%
+    mutate(damid_group = case_when(damid < -0.5 ~ "NL_lower",
+                                   damid > 0.5 ~ "NL_higher",
+                                   T ~ "NL_stable"),
+           damid_group = factor(damid_group,
+                                levels = c("NL_lower", "NL_stable", "NL_higher"))) %>%
+    ggplot(aes(x = expr)) +
+    geom_density(alpha = 0.2, aes(fill = damid_group)) +
+    geom_vline(xintercept = 0, linetype = "dashed", col = "blue") +
+    geom_hline(yintercept = 0, linetype = "dashed", col = "blue") +
+    facet_grid(. ~ key_damid) +
+    scale_fill_manual(values = c("blue", "black", "red")) +
+    coord_cartesian(xlim = c(-0.5, 0.5), ylim = c(0, 30)) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  plot(plt)
+  
+  # Print correlation between NL interactions and expression
+  tib_corr <- tib_gather %>%
+    drop_na() %>%
+    filter(LAD == T) %>%
+    group_by(key_damid) %>%
+    summarise(cor = cor(expr, damid, method = "pearson"),
+              pvalue = cor.test(expr, damid, method = "pearson")$p.value,
+              n = n()) %>%
+    ungroup() %>%
+    mutate(sign = pvalue < 0.01)
+  
+  plt <- tib_corr %>%
+    ggplot(aes(x = key_damid, y = cor, fill = sign)) +
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_bar(stat = "identity") +
+    xlab("") +
+    ylab("Pearson correlation") +
+    scale_fill_grey() +
+    theme_bw() +
+    theme(aspect.ratio = 2,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  tib_corr
+    
+  
+  # # Also, determine ratio up/down in iLADs and in LADs
+  # tib_ratio <- tib_gather %>%
+  #   group_by(key_damid, LAD) %>%
+  #   summarise(down = mean(sign == "down"),
+  #             up = mean(sign == "up")) %>%
+  #   ungroup() %>%
+  #   gather(key_sign, fraction, down, up)
+  # 
+  # plt <- tib_ratio %>%
+  #   ggplot(aes(x = LAD, y = fraction, fill = key_sign)) +
+  #   geom_bar(stat = "identity", position = "dodge") +
+  #   #facet_wrap( ~ key_damid, scales = "free_y") +
+  #   facet_grid(. ~ key_damid) +
+  #   scale_fill_grey() +
+  #   theme_classic() +
+  #   theme(aspect.ratio = 3)
+  # plot(plt)
+  # 
+  # # Repeat, the other way around
+  # tib_ratio <- tib_gather %>%
+  #   group_by(key_damid, sign) %>%
+  #   summarise(mean = mean(LAD)) %>%
+  #   ungroup()
+  # 
+  # plt <- tib_ratio %>%
+  #   ggplot(aes(x = key_damid, y = mean, fill = sign)) +
+  #   geom_bar(stat = "identity", position = "dodge") +
+  #   xlab("") +
+  #   ylab("Fraction in LAD") +
+  #   scale_fill_manual(values = c("blue", "darkgrey", "red")) +
+  #   theme_classic() +
+  #   theme(aspect.ratio = 1)
+  # plot(plt)
+  
+}
+
+PlotExpressionVsDamID(genes, genes.res, genes.fpkm, genes.damid, 
+                      base = "CTCFEL_0h", 
+                      samples = c("CTCFEL_6h", "CTCFEL_24h", "CTCFEL_96h"))
+
+PlotExpressionVsDamID(genes, genes.res, genes.fpkm, genes.damid, 
+                      base = "WAPL_0h", 
+                      samples = c("WAPL_6h", "WAPL_24h", "WAPL_96h"))
+
+PlotExpressionVsDamID(genes, genes.res, genes.fpkm, genes.damid, 
+                      base = "CTCFWAPL_0h", 
+                      samples = c("CTCFWAPL_6h", "CTCFWAPL_24h", "CTCFWAPL_96h"))
+
+PlotExpressionVsDamID(genes, genes.res, genes.fpkm, genes.damid, 
+                      base = "RAD21_0h", 
+                      samples = c("RAD21_6h", "RAD21_24h"))
+
+# Filtered for expr > 2.5 (as previous document)
+tib_corr_ctcf <- PlotExpressionVsDamID(genes, genes.res, genes.fpkm, genes.damid, 
+                      base = "CTCFEL_0h", 
+                      samples = c("CTCFEL_6h", "CTCFEL_24h", "CTCFEL_96h"),
+                      min_expr = 2.5)
+
+tib_corr_wapl <- PlotExpressionVsDamID(genes, genes.res, genes.fpkm, genes.damid, 
+                      base = "WAPL_0h", 
+                      samples = c("WAPL_6h", "WAPL_24h", "WAPL_96h"),
+                      min_expr = 2.5)
+
+tib_corr_ctcfwapl <- PlotExpressionVsDamID(genes, genes.res, genes.fpkm, genes.damid, 
+                      base = "CTCFWAPL_0h", 
+                      samples = c("CTCFWAPL_6h", "CTCFWAPL_24h", "CTCFWAPL_96h"),
+                      min_expr = 2.5)
+
+tib_corr_rad21 <- PlotExpressionVsDamID(genes, genes.res, genes.fpkm, genes.damid, 
+                      base = "RAD21_0h", 
+                      samples = c("RAD21_6h", "RAD21_24h"),
+                      min_expr = 2.5)
+
+
+# Combine correlations in one final plot
+tib_corr <- bind_rows(tib_corr_ctcf,
+                      tib_corr_wapl,
+                      tib_corr_ctcfwapl,
+                      tib_corr_rad21) %>%
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05) %>%
+  # filter for "significant" tests only
+  filter(key_damid %in% str_remove(significant_tests, "_vs.*")) %>%
+  separate(key_damid, c("target", "timepoint"), remove = F) %>%
+  mutate(target = str_remove(target, "EL"),
+         target = factor(target, c("CTCF", "RAD21", "WAPL", "CTCFWAPL")),
+         timepoint = factor(timepoint, c("24h", "48h", "96h"))) %>%
+  arrange(target, timepoint) %>%
+  mutate(key_damid = factor(key_damid, unique(key_damid)))
+  
+
+# Plot
+tib_corr %>%
+  ggplot(aes(x = key_damid, y = cor, fill = sign)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("grey80", "grey30")) +
+  xlab("") +
+  ylab("Pearson correlation") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+Many plots. As expected, there is correlation between changes in expression and
+changes in nuclear positioning. This is normal.
+
+Plot the DamID changes for differentially expressed genes. This is another way to
+show the same thing: differentially expressed genes also changes their lamina
+positioning.
+
+```{r plot damid changes of changed genes, cache = T, fig.width = 8, fig.height = 3.5}
+
+# 1) Determine DamID changes with t=0h
+tib_damid_changes <- as_tibble(mcols(genes.damid)) %>%
+  mutate(CTCFEL_96h = CTCFEL_96h - CTCFEL_0h,
+         RAD21_24h = RAD21_24h - RAD21_0h,
+         WAPL_96h = WAPL_96h - WAPL_0h,
+         CTCFWAPL_24h = CTCFWAPL_24h - CTCFWAPL_0h,
+         CTCFWAPL_96h = CTCFWAPL_96h - CTCFWAPL_0h,
+         gene = 1:nrow(.)) %>%
+  dplyr::select(CTCFEL_96h, RAD21_24h, WAPL_96h,
+                CTCFWAPL_24h, CTCFWAPL_96h, gene) %>%
+  gather(key, damid, -gene)
+
+
+# 2) Get significant changes
+tib_genes_sign <- as_tibble(genes.res) %>%
+  dplyr::select(matches(paste(significant_tests, collapse = "|"))) %>%
+  dplyr::select(contains("sign")) %>%
+  dplyr::select(-contains("48h")) %>%
+  mutate(gene = 1:nrow(.)) %>%
+  gather(key, gene_sign, -gene) %>%
+  mutate(key = str_remove(key, "_vs.*"))
+
+
+# 3) Join the two and filter for selected genes (expression > cutoff)
+tib_combined <- full_join(tib_genes_sign, tib_damid_changes) %>%
+  #filter(gene %in% which(genes_expression_idx)) %>%
+  separate(key, c("target", "timepoint"), remove = F) %>%
+  mutate(target = str_remove(target, "EL"),
+         target = factor(target, c("CTCF", "RAD21", "WAPL", "CTCFWAPL")),
+         timepoint = factor(timepoint, c("24h", "48h", "96h"))) %>%
+  arrange(gene, target, timepoint) %>%
+  mutate(key = factor(key, unique(key))) 
+
+
+# LAD genes only?
+lad_idx <- which(overlapsAny(genes.damid, gr_LAD_consensus,
+                             ignore.strand = T))
+#lad_idx <- which(rowSums(as_tibble(mcols(genes.damid)) > 0) > 0)
+
+tib_combined <- tib_combined %>% 
+  filter(gene %in% lad_idx)
+
+
+# 4) Plot
+tib_combined %>%
+  ggplot(aes(x = target, y = damid, fill = gene_sign)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  geom_hline(yintercept = 0, col = "grey30", linetype = "dashed") +
+  facet_grid(. ~ timepoint, scales = "free_x", space = "free") +
+  xlab("") +
+  ylab("pA-DamID difference with t=0h") +
+  scale_fill_manual(values = c("blue", "grey50", "red"),
+                    name = "Class") +
+  coord_cartesian(ylim = c(-1.3, 1.3)) +
+  theme_bw() +
+  theme(#aspect.ratio = 2/3,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+  
+
+# 5) Calculate statistics for illustrator (lazy approach)
+tib_pvalues <- tibble()
+
+for (tmp_key in unique(tib_combined$key)) {
+  
+  tmp <- tib_combined %>%
+    filter(key == tmp_key)
+  
+  for (tmp_sign in c("up", "down")) {
+    
+    test <- wilcox.test(tmp$damid[tmp$gene_sign == "stable"], 
+                        tmp$damid[tmp$gene_sign == tmp_sign],
+                        conf.int = TRUE)
+    
+    tib_pvalues <- bind_rows(tib_pvalues,
+                             tibble(key = tmp_key, 
+                                    gene_sign = tmp_sign,
+                                    n_sign = sum(tmp$gene_sign == tmp_sign),
+                                    pvalue = test$p.value,
+                                    direction = ifelse(test$estimate > 0, 
+                                                       "up", "down")))
+    
+  }
+}
+
+# Multiple testing
+tib_pvalues %>%
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05) %>%
+  print(n = 40)
+
+  
+
+```
+
+Yes. As I said. Do the same thing for nascent expression changes.
+
+```{r plot damid changes of changed nascent genes, cache = T, fig.width = 5, fig.height = 3.5}
+
+# 1) Determine DamID changes with t=0h
+tib_damid_changes <- as_tibble(mcols(genes.damid)) %>%
+  mutate(WAPL_6h = WAPL_6h - WAPL_0h,
+         WAPL_24h = WAPL_24h - WAPL_0h,
+         gene = 1:nrow(.)) %>%
+  dplyr::select(WAPL_6h, WAPL_24h, gene) %>%
+  gather(key, damid, -gene)
+
+# 2) Get significant changes
+tib_genes_sign <- as_tibble(genes.res.nascent) %>%
+  dplyr::select(contains("sign")) %>%
+  mutate(gene = 1:nrow(.)) %>%
+  gather(key, gene_sign, -gene) %>%
+  mutate(key = str_remove(key, "_vs.*")) 
+
+# 3) Join the two and filter for selected genes (expression > cutoff)
+tib_combined <- full_join(tib_genes_sign, tib_damid_changes) %>%
+  #filter(gene %in% which(genes_expression_idx)) %>%
+  separate(key, c("target", "timepoint"), remove = F) %>%
+  mutate(target = factor(target, "WAPL"),
+         timepoint = factor(timepoint, c("6h" ,"24h"))) %>%
+  arrange(gene, target, timepoint) %>%
+  mutate(key = factor(key, unique(key))) 
+
+# LAD genes only?
+tib_combined <- tib_combined %>%
+  filter(gene %in% lad_idx)
+
+# 4) Plot
+tib_combined %>%
+  ggplot(aes(x = key, y = damid, fill = gene_sign)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  geom_hline(yintercept = 0, col = "grey30", linetype = "dashed") +
+  xlab("") +
+  ylab("pA-DamID difference with t=0h") + 
+  scale_fill_manual(values = c("blue", "grey50", "red"),
+                    name = "Class") +
+  coord_cartesian(ylim = c(-1, 1)) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+  
+
+# 5) Calculate statistics for illustrator (lazy approach)
+tib_pvalues <- tibble()
+
+for (tmp_key in unique(tib_combined$key)) {
+  
+  tmp <- tib_combined %>%
+    filter(key == tmp_key)
+  
+  for (tmp_sign in c("up", "down")) {
+    
+    test <- wilcox.test(tmp$damid[tmp$gene_sign == "stable"], 
+                        tmp$damid[tmp$gene_sign == tmp_sign],
+                        conf.int = TRUE)
+    
+    tib_pvalues <- bind_rows(tib_pvalues,
+                             tibble(key = tmp_key, 
+                                    gene_sign = tmp_sign,
+                                    n_sign = sum(tmp$gene_sign == tmp_sign),
+                                    pvalue = test$p.value,
+                                    direction = ifelse(test$estimate > 0, 
+                                                       "up", "down")))
+    
+  }
+}
+
+# Multiple testing 
+tib_pvalues %>%
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05) %>%
+  print(n = 40)
+
+  
+
+```
+
+Here, the picture is less clear. It seems that other effects (i.e. CTCF 
+detachment) are stronger than the transcription effect on lamina interactions.
+
+
+### 3. LAD genes near CTCF in RAD21
+
+Skipped.
+
+
+### 4. Correlating LAD changes versus differential genes
+
+I want to show that differential genes are not causing the LAD changes I 
+observed previously. This is the main thing that I want to convey.
+But how to show this?
+
+To do this, I will determine the change in LAD score for LADs with up
+and downregulated genes. If the LAD score is not correlated with the 
+presence of transcriptional differences, I can conclude that transcription
+is not causing the change in nuclear positioning.
+
+```{r lad changes versus differential genes, fig.width = 7, fig.height = 3.5}
+
+# Get the results
+significant_tests_filtered <- grep("48h", significant_tests, 
+                                   invert = T, value = T)
+
+tib_results <- as_tibble(mcols(genes.res)) %>% 
+  dplyr::select(contains("sign")) %>% 
+  dplyr::select(matches(paste(significant_tests_filtered, collapse = "|"))) %>%
+  dplyr::rename_all(function(x) str_remove(x, "_vs.*"))
+
+
+# Count number of genes per differential LAD
+tib <- as_tibble(mcols(gr_LAD_consensus)) %>%
+  mutate(gene_total = countOverlaps(gr_LAD_consensus, genes.res,
+                                    ignore.strand = T))
+
+tib_combined <- tibble()
+
+for (t in names(tib_results)) {
+  
+  # Determine the number of up and downregulated genes - and a "LAD summary"
+  tib <- tib %>%
+    bind_cols(tibble(up = countOverlaps(gr_LAD_consensus, 
+                                        genes.res[tib_results %>% pull(t) == "up"],
+                                        ignore.strand = T),
+                     down = countOverlaps(gr_LAD_consensus, 
+                                          genes.res[tib_results %>% pull(t) == "down"],
+                                          ignore.strand = T)) %>%
+                mutate(class = case_when((up > 0) & (down > 0) ~ "both",
+                                         up > down ~ "up",
+                                         down > up ~ "down",
+                                         #(up > 0) & (down > 0) ~ "both",
+                                         T ~ "stable"),
+                       class = factor(class, c("down", "stable", "up", "both")),
+                       diff = tib %>% pull(t) -
+                         tib %>% pull(str_replace(t, "_.*", "_0h"))) %>%
+                dplyr::rename_all(function(x) paste(t, x, sep = "_")))
+  
+  # Plot immediately
+  plt <- tib %>%
+    dplyr::rename_all(function(x) str_remove(x, paste0(t, "_"))) %>%
+    ggplot(aes(x = class, y = diff, fill = class)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggtitle(t) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+  # Add to tib combined with all the details
+  tib_combined <- bind_rows(tib_combined,
+                            tib %>%
+                              dplyr::rename_all(function(x) str_remove(x, paste0(t, "_"))) %>%
+                              dplyr::select(class, diff, up, down) %>%
+                              mutate(test = t))
+                            
+}
+
+# Remove LADs with up and downregulated genes
+tib_combined <- tib_combined %>%
+  filter(class != "both")
+  
+    
+# Plot combined
+tib_combined %>%
+  separate(test, c("condition", "timepoint"), remove = F) %>%
+  mutate(condition = factor(condition, levels(metadata$condition)),
+         timepoint = factor(timepoint, levels(metadata$timepoint))) %>%
+  arrange(condition, timepoint) %>%
+  ggplot(aes(x = condition, y = diff, fill = class)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  facet_grid(. ~ timepoint, scales = "free_x", space = "free") +
+  coord_cartesian(ylim = c(-1.4, 1.4)) +
+  xlab("") +
+  ylab("LAD difference") +
+  scale_fill_manual(values = c("blue", "grey50", "red"),
+                    name = "Class") +
+  theme_bw() +
+  theme(# aspect.ratio = 2/3,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+
+# Calculate statistics for illustrator (lazy approach)
+tib_pvalues <- tibble()
+
+for (tmp_key in unique(tib_combined$test)) {
+  
+  tmp <- tib_combined %>%
+    filter(test == tmp_key)
+  
+  for (tmp_sign in c("up", "down")) {
+    
+    test <- wilcox.test(tmp$diff[tmp$class == "stable"], 
+                        tmp$diff[tmp$class == tmp_sign],
+                        conf.int = TRUE)
+    
+    tib_pvalues <- bind_rows(tib_pvalues,
+                             tibble(key = tmp_key, 
+                                    class = tmp_sign,
+                                    n_sign = sum(tmp$class == tmp_sign),
+                                    pvalue = test$p.value,
+                                    direction = ifelse(test$estimate > 0, 
+                                                       "up", "down")))
+    
+  }
+}
+
+# Multiple testing 
+tib_pvalues %>%
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05) %>%
+  print(n = 40)
+
+```
+
+Good. As hoped, most LAD changes are not correlated with the presence of 
+differentially expressed genes.
+
+Repeat for nascent transcription.
+
+```{r lad changes versus differential nascent genes, fig.width = 5, fig.height = 3.5}
+
+# Get the results
+tib_results <- as_tibble(mcols(genes.res.nascent)) %>% 
+  dplyr::select(contains("sign")) %>% 
+  dplyr::rename_all(function(x) str_remove(x, "_vs.*"))
+
+
+# Count number of genes per differential LAD
+tib <- as_tibble(mcols(gr_LAD_consensus)) %>%
+  mutate(gene_total = countOverlaps(gr_LAD_consensus, genes.res.nascent,
+                                    ignore.strand = T))
+
+tib_combined <- tibble()
+
+for (t in names(tib_results)) {
+  
+  # Determine the number of up and downregulated genes - and a "LAD summary"
+  tib <- tib %>%
+    bind_cols(tibble(up = countOverlaps(gr_LAD_consensus, 
+                                        genes.res.nascent[tib_results %>% pull(t) == "up"],
+                                        ignore.strand = T),
+                     down = countOverlaps(gr_LAD_consensus, 
+                                          genes.res.nascent[tib_results %>% pull(t) == "down"],
+                                          ignore.strand = T)) %>%
+                mutate(class = case_when((up > 0) & (down > 0) ~ "both",
+                                         up > down ~ "up",
+                                         down > up ~ "down",
+                                         #(up > 0) & (down > 0) ~ "both",
+                                         T ~ "stable"),
+                       class = factor(class, c("down", "stable", "up", "both")),
+                       diff = tib %>% pull(t) -
+                         tib %>% pull(str_replace(t, "_.*", "_0h"))) %>%
+                dplyr::rename_all(function(x) paste(t, x, sep = "_")))
+  
+  # Plot immediately
+  plt <- tib %>%
+    dplyr::rename_all(function(x) str_remove(x, paste0(t, "_"))) %>%
+    ggplot(aes(x = class, y = diff, fill = class)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggtitle(t) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+  # Add to tib combined with all the details
+  tib_combined <- bind_rows(tib_combined,
+                            tib %>%
+                              dplyr::rename_all(function(x) str_remove(x, paste0(t, "_"))) %>%
+                              dplyr::select(class, diff, up, down) %>%
+                              mutate(test = t))
+                            
+}
+
+# Remove LADs with up and downregulated genes
+tib_combined <- tib_combined %>%
+  filter(class != "both")
+
+
+
+# Plot combined
+tib_combined %>%
+  filter(class != "both") %>%
+  separate(test, c("condition", "timepoint"), remove = F) %>%
+  mutate(condition = factor(condition, levels(metadata$condition)),
+         timepoint = factor(timepoint, levels(metadata$timepoint))) %>%
+  arrange(condition, timepoint) %>%
+  ggplot(aes(x = timepoint, y = diff, fill = class)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  #facet_grid(. ~ timepoint, scales = "free_x", space = "free") +
+  coord_cartesian(ylim = c(-0.8, 0.8)) +
+  xlab("") +
+  ylab("LAD difference") +
+  scale_fill_manual(values = c("blue", "grey50", "red"),
+                    name = "Class") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+
+# Calculate statistics for illustrator (lazy approach)
+tib_pvalues <- tibble()
+
+for (tmp_key in unique(tib_combined$test)) {
+  
+  tmp <- tib_combined %>%
+    filter(test == tmp_key)
+  
+  for (tmp_sign in c("up", "down")) {
+    
+    test <- wilcox.test(tmp$diff[tmp$class == "stable"], 
+                        tmp$diff[tmp$class == tmp_sign],
+                        conf.int = TRUE)
+    
+    tib_pvalues <- bind_rows(tib_pvalues,
+                             tibble(key = tmp_key, 
+                                    class = tmp_sign,
+                                    n_sign = sum(tmp$class == tmp_sign),
+                                    pvalue = test$p.value,
+                                    direction = ifelse(test$estimate > 0, 
+                                                       "up", "down")))
+    
+  }
+}
+
+# Multiple testing 
+tib_pvalues %>%
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05) %>%
+  print(n = 40)
+
+```
+
+These results show that differential genes are mostly not correlated with LAD
+changes. This is roughly the same message as written in the manuscript right 
+now, but is slightly more accurate (and easy to interpret) in my opinion. Also,
+it's easier to include this result in the story.
+
+
+### x. Save data
+
+
+```{r save data}
+
+saveRDS(genes.damid, 
+        file.path(output.dir, "genes_damid.rds"))
+
+```
+
+
+### Conclusion
+
+Good. Conclusions:
+
+  * Overall, there is a negative correlation between changes in gene expression
+    and changes in lamina positioning. This is normal. The effect size is very 
+    small. It seems that other things result in stronger disruptions of the
+    LAD pattern.
+  * The presence of differentially expressed genes does not explain the LAD
+    behaviour in going up / down. This is good, as it suggests a direct effect
+    of CTCF / cohesin on the LAD pattern.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+

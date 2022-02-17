@@ -1,0 +1,45 @@
+name: 4DN_parser
+channels:
+- bioconda
+- conda-forge
+- defaults
+- r
+dependencies:
+- biopython=1.68=py27_0
+- cutadapt=1.11=py27_0
+- editdistance=0.4=py27_0
+- mmtf-python=1.0.2=py27_0
+- xopen=0.3.2=py27_0
+- certifi=2017.11.5=py27_0
+- freetype=2.7=1
+#- jpeg=9b=2
+- libedit=3.1.20170329=0
+- libpng=1.6.34=0
+#- libtiff=4.0.9=0
+- msgpack-python=0.4.8=py27_0
+- ncurses=5.9=10
+- olefile=0.44=py27_0
+- pillow=4.2.1=py27_0
+- pip=9.0.1=py27_1
+- python=2.7.14=4
+- readline=7.0=0
+- reportlab=3.4.0=py27_0
+- setuptools=38.4.0=py27_0
+- wheel=0.30.0=py27_2
+#- bz2file=0.98=py27_0
+- ca-certificates=2017.08.26=h1d4fec5_0
+- intel-openmp=2018.0.0=hc7b2577_8
+- libffi=3.2.1=hd88cf55_4
+- libgcc=7.2.0=h69d50b8_2
+- libgcc-ng=7.2.0=h7cc24e2_2
+- libgfortran-ng=7.2.0=h9f7466a_2
+- libstdcxx-ng=7.2.0=h7a57d05_2
+- mkl=2018.0.1=h19d6760_4
+- numpy=1.14.0=py27h3dfced4_0
+- openssl=1.0.2n=hb7f436b_0
+- sqlite=3.20.1=hb898158_2
+- tk=8.6.7=hc745277_3
+- xz=5.2.3=h55aa19d_2
+- zlib=1.2.11=ha838bed_2
+prefix: /home/t.v.schaik/mydata/miniconda3/envs/4DN_parser
+

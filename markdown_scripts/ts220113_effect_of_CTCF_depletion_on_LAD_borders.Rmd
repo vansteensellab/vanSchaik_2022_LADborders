@@ -1,0 +1,1731 @@
+---
+title: "Effect of CTCF depletion on LAD borders"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+In a previous document, I classified LAD borders as 1) CTCF-bound or not 2) 
+shared or unique. Here, I will visualize what the effect is of CTCF depletion on
+the various types of LAD borders. Also, the effect of the other depletions.
+
+
+### Method
+
+Load (z-scale) DamID tracks and plot effect on different types of LAD borders.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(caTools))
+suppressPackageStartupMessages(library(yaml))
+suppressPackageStartupMessages(library(M3C))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(broom))
+suppressPackageStartupMessages(library(corrr))
+
+bin.size <- "10kb"
+damid.dir <- file.path("../results_NQ/normalized/", paste0("bin-", bin.size))
+
+# Prepare output 
+output.dir <- "ts220113_effect_of_CTCF_depletion_on_LAD_borders"
+dir.create(output.dir, showWarnings = FALSE)
+
+
+# Prepare input
+input.dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+metadata.borders <- readRDS(file.path(input.dir, "metadata.rds"))
+LADs <- readRDS(file.path(input.dir, "LADs.rds")) 
+LAD.borders <- readRDS(file.path(input.dir, "LAD_borders.rds"))
+CTCF.sites <- readRDS(file.path(input.dir, "CTCF_sites.rds"))
+
+LADs <- readRDS(file.path(input.dir, "LADs_pA.rds"))
+LAD.borders <- readRDS(file.path(input.dir, "LAD_borders_pA.rds"))
+
+borders <- LAD.borders[["mESC_pA_PT"]]
+borders$class <- "xxx"
+
+```
+
+Prepare knitr output.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, cache = T,
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output.dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+List functions.
+
+```{r functions}
+
+LoadDamID <- function(metadata, damid.dir, column = "file") {
+  
+  # Load data
+  tib <- purrr::reduce(lapply(1:nrow(metadata),
+                              function(i) {
+                                f <- metadata[i, ] %>% pull(column)
+                                s <- as.character(metadata$sample)[i]
+                                tmp <- read_tsv(file.path(damid.dir, f), 
+                                                col_names = c("seqnames", "start", "end", s))
+                              }),
+                       full_join)
+  
+  # Convert to GRanges
+  tib$start <- tib$start + 1
+  gr <- as(tib, "GRanges")
+  
+  # Filter chromosomes
+  gr <- gr[seqnames(gr) %in% c(paste0("chr", 1:22), "chrX")]
+  gr
+  
+}
+
+LoadDamIDCounts <- function(metadata, damid.dir.counts, 
+                            yaml = "../bin/snakemake/config.yaml") {
+  
+  # List samples from yaml file
+  yaml_list <- read_yaml(yaml)
+  
+  # Read lmnb1 counts
+  idx <- which(names(yaml_list$dam_controls) %in% unlist(yaml_list$replicates))
+  
+  lmnb1_files <- names(yaml_list$dam_controls)[idx]
+  dam_files <- unlist(yaml_list$dam_controls)[idx]
+  
+  # Prepare counts metadata
+  metadata_counts <- tibble(lmnb1 = lmnb1_files,
+                            dam = dam_files) %>%
+    mutate(sample = str_remove(lmnb1, "pADamID_NQ_"),
+           sample = str_remove(sample, "pADamID_"),
+           sample = str_remove(sample, "-")) %>%
+    separate(sample, c("condition", "timepoint", "replicate"), remove = F) %>%
+    mutate(idx = match(paste0(condition, timepoint),
+                       paste0(metadata$condition, metadata$timepoint)),
+           group = metadata$sample[idx],
+           lmnb1 = paste0(lmnb1, "-10kb.counts.txt.gz"),
+           dam = paste0(dam, "-10kb.counts.txt.gz")) %>%
+    arrange(idx, replicate)
+  
+  # Read lmnb1 files
+  gr_lmnb1 <- LoadDamID(metadata_counts, damid.dir.counts, column = "lmnb1")
+  
+  # CPM and mean of replicates
+  tib <- as_tibble(mcols(gr_lmnb1)) %>%
+    mutate_all(function(x) x / sum(x) * 1e6) %>%
+    add_column(bin = 1:nrow(.)) %>%
+    gather(key, value, -bin) %>%
+    mutate(sample = metadata_counts$group[match(key, metadata_counts$sample)]) %>%
+    group_by(bin, sample) %>%
+    summarise(mean = mean(value)) %>%
+    ungroup() %>%
+    spread(sample, mean) %>%
+    dplyr::select(-bin)
+  
+  mcols(gr_lmnb1) <- tib
+  
+  # Read dam files
+  gr_dam <- LoadDamID(metadata_counts, damid.dir.counts, column = "dam")
+  
+  # CPM and mean of replicates
+  tib <- as_tibble(mcols(gr_dam)) %>%
+    mutate_all(function(x) x / sum(x) * 1e6) %>%
+    add_column(bin = 1:nrow(.)) %>%
+    gather(key, value, -bin) %>%
+    mutate(sample = metadata_counts$group[match(key, metadata_counts$sample)]) %>%
+    group_by(bin, sample) %>%
+    summarise(mean = mean(value)) %>%
+    ungroup() %>%
+    spread(sample, mean) %>%
+    dplyr::select(-bin)
+  
+  mcols(gr_dam) <- tib
+  
+  list(gr_lmnb1, gr_dam)
+  
+}
+
+PlotDensity <- function(damid, title, xlimits = NULL, replicate = F, conditions = NULL) {
+  
+  if (replicate) {
+    tib <- as_tibble(mcols(damid)) %>%
+      gather() %>%
+      separate(key, c("condition", "timepoint", "replicate"), remove = F, sep = "_") %>%
+      mutate(condition = factor(condition, levels = levels(metadata.damid$condition)),
+             timepoint = factor(timepoint, levels = levels(metadata.damid$timepoint)),
+             replicate = factor(replicate, levels = paste0("r", 1:10))) %>%
+      drop_na()
+  } else {
+    tib <- as_tibble(mcols(damid)) %>%
+      gather() %>%
+      separate(key, c("condition", "timepoint"), remove = F, sep = "_") %>%
+      mutate(condition = factor(condition, levels = levels(metadata.damid$condition)),
+             timepoint = factor(timepoint, levels = levels(metadata.damid$timepoint))) %>%
+      drop_na()
+  }
+  
+  nrow <- 2
+  if (! is.null(conditions)) {
+    tib <- tib %>%
+      filter(condition %in% conditions)
+    nrow <- 1
+  }
+  
+  plt <- tib %>%
+    ggplot(aes(x = value, col = timepoint)) +
+    #geom_density() +
+    facet_wrap( ~ condition, nrow = nrow) +
+    ggtitle(title) +
+    xlab("DamID score") +
+    ylab("Density") +
+    scale_color_brewer(palette = "Dark2") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  if (replicate) {
+    plt <- plt + geom_density(aes(linetype = replicate))
+  } else {
+    plt <- plt + geom_density()
+  }
+  
+  if (! is.null(xlimits)) {
+    plt <- plt +
+      coord_cartesian(xlim = xlimits)
+  }
+  
+  plt
+  
+}
+
+ScaleDamID <- function(damid) {
+  tib <- as_tibble(mcols(damid))
+  tib.scaled <- as_tibble(scale(tib))
+  mcols(damid) <- tib.scaled
+  damid
+}
+
+grMid <- function(gr) {
+  start(gr) <- end(gr) <- rowMeans(cbind(start(gr), end(gr)))
+  gr
+}
+
+DistanceToLADBorder <- function(sites, borders, nearest = T, border.class = F) {
+  # Given a GRanges of damid and LAD borders, calculate the 
+  # distance to the preceding and following LAD. Return a new GRanges
+  
+  # Make sure the chromosomes are as they should be - especially for the bins
+  sites <- sites[seqnames(sites) %in% c(paste0("chr", 1:22),
+                                        "chrX")]
+  borders <- borders[seqnames(borders) %in% c(paste0("chr", 1:22),
+                                              "chrX")]
+  
+  # Preceding distance
+  sites$dis.precede <- sites$strand.precede <- 
+    sites$border.class.precede <- sites$border.ctcf.precede <- NA
+  idx.precede <- precede(sites, borders, ignore.strand = T, select = "all")
+  sites$dis.precede[queryHits(idx.precede)] <- distance(sites[queryHits(idx.precede)], 
+                                                        borders[subjectHits(idx.precede)], 
+                                                        ignore.strand = T)
+  sites$strand.precede[queryHits(idx.precede)] <- strand(borders[subjectHits(idx.precede)])
+  
+  sites$border.class.precede[queryHits(idx.precede)] <- borders$class[subjectHits(idx.precede)]
+  sites$border.ctcf.precede[queryHits(idx.precede)] <- borders$CTCF[subjectHits(idx.precede)]
+  
+  
+  # Following distance
+  sites$dis.follow <- sites$strand.follow <- 
+    sites$border.class.follow <- sites$border.ctcf.follow <- NA
+  idx.follow <- follow(sites, borders, ignore.strand = T, select = "all")
+  sites$dis.follow[queryHits(idx.follow)] <- distance(sites[queryHits(idx.follow)], 
+                                                      borders[subjectHits(idx.follow)], 
+                                                      ignore.strand = T)
+  sites$strand.follow[queryHits(idx.follow)] <- strand(borders[subjectHits(idx.follow)])
+  
+  sites$border.class.follow[queryHits(idx.follow)] <- borders$class[subjectHits(idx.follow)]
+  sites$border.ctcf.follow[queryHits(idx.follow)] <- borders$CTCF[subjectHits(idx.follow)]
+  
+  
+  # Exception: overlapping (follow = distance (0), precede = NA)
+  idx.overlap <- findOverlaps(sites, borders, ignore.strand = T)
+  sites$dis.follow[queryHits(idx.overlap)] <- distance(sites[queryHits(idx.overlap)], 
+                                                       borders[subjectHits(idx.overlap)], 
+                                                       ignore.strand = T)
+  sites$dis.precede[queryHits(idx.overlap)] <- NA
+  sites$strand.follow[queryHits(idx.overlap)] <- sites$strand.precede[queryHits(idx.overlap)] <- 
+    strand(borders[subjectHits(idx.overlap)])
+  
+  sites$border.class.precede[queryHits(idx.overlap)] <- 
+    sites$border.class.follow[queryHits(idx.overlap)] <-
+    borders$class[subjectHits(idx.overlap)]
+  sites$border.ctcf.precede[queryHits(idx.overlap)] <- 
+    sites$border.ctcf.follow[queryHits(idx.overlap)] <-
+    borders$CTCF[subjectHits(idx.overlap)]
+  
+  
+  # Alternative: only use information from the nearest hit
+  if (nearest) {
+    # Remove precede information if follow is smaller
+    idx.remove.precede <- which(sites$dis.follow < sites$dis.precede)
+    sites$dis.precede[idx.remove.precede] <- NA
+    # Remove follow information if precede is smaller
+    idx.remove.follow <- which(sites$dis.follow > sites$dis.precede)
+    sites$dis.follow[idx.remove.follow] <- NA
+  }
+  
+  sites
+  
+}
+
+CountPerBins <- function(sites, bin.size = 10000) {
+  
+  tib <- as_tibble(mcols(sites)) %>%
+    add_column(number = 1:nrow(.)) %>%
+    mutate(dis.precede.group = as.numeric(cut(dis.precede, 
+                                              breaks = seq(0, max(dis.precede, na.rm = T) + 1, 
+                                                           by = bin.size))) - 1,
+           dis.follow.group = as.numeric(cut(dis.follow, 
+                                             breaks = seq(0, max(dis.follow, na.rm = T) + 1, 
+                                                          by = bin.size))) - 1) %>%
+    dplyr::select(-dis.precede, -dis.follow) %>%
+    mutate(dis.precede.group = ifelse(strand.precede == "+", 
+                                      -dis.precede.group, dis.precede.group),
+           dis.follow.group = ifelse(strand.follow == "+", 
+                                     dis.follow.group, -dis.follow.group)) %>%
+    dplyr::select(-strand.precede, -strand.follow) %>%
+    gather(key, value, dis.precede.group, dis.follow.group) %>%
+    drop_na() %>%
+    mutate(border.class = ifelse(key == "dis.precede.group", 
+                                 border.class.precede, border.class.follow),
+           border.ctcf = ifelse(key == "dis.precede.group", 
+                                border.ctcf.precede, border.ctcf.follow)) %>%
+    dplyr::select(-border.class.precede, -border.class.follow, 
+                  -border.ctcf.precede, -border.ctcf.follow) %>%
+    gather(sample, score, -number, -key, -value, -border.class, -border.ctcf) %>%
+    group_by(value, border.class, border.ctcf, sample) %>%
+    summarise(count = n(),
+              mean = mean(score)) %>%
+    ungroup() %>%
+    mutate(sample = factor(sample, levels = levels(metadata.damid$sample)),
+           border.ctcf = factor(border.ctcf, levels = c("nonCTCF", "CTCF")),
+           border.class = factor(border.class, levels = c("shared", "unique"))) %>%
+    arrange(sample, border.class, border.ctcf)
+  
+  tib
+  
+}
+
+PlotDamIDScoresAndDifferences <- function(damid.summary, 
+                                          xlimits = c(-0.4, 0.4),
+                                          ylimits.diff = c(-0.3, 0.2),
+                                          extra_grouping = NULL) {
+  tib <- damid.summary %>%
+    mutate(mean = runmean(mean, k = 5)) %>%
+    group_by_at(c("sample", "value", extra_grouping)) %>%
+    summarise(combined.count = sum(count),
+              combined.mean = weighted.mean(mean, count)) %>%
+    filter(combined.count > 20) %>%
+    separate(sample, c("condition", "timepoint"), remove = F) %>%
+    mutate(condition = factor(condition, levels = levels(metadata.damid$condition)),
+           timepoint = factor(timepoint, levels = levels(metadata.damid$timepoint))) %>%
+    ungroup()
+  
+  plt <- tib %>%
+    ggplot(aes(x = value / 100, y = combined.mean, col = border.ctcf)) +
+    annotate("rect", xmin = 0, xmax = 1e3, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(size = 1) +
+    facet_grid(as.formula(paste(paste(c("condition"), 
+                                      collapse = " + "), 
+                                "~", "timepoint"))) +
+    ggtitle("DamID scores at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("DamID (z-score)") +
+    coord_cartesian(xlim = xlimits, ylim = c(-1, 1)) +
+    scale_color_manual(values = c("blue", "red")) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  # Also, plot the difference between 0h and the others
+  tib.difference <- tib %>%
+    dplyr::select(-sample, -combined.count) %>%
+    spread(key = timepoint, value = combined.mean) %>%
+    mutate(diff.6h = `6h` - `0h`,
+           diff.24h = `24h` - `0h`,
+           diff.96h = `96h` - `0h`) %>%
+    dplyr::select(-`0h`, -`6h`, -`24h`, -`96h`) %>%
+    gather(timepoint, combined.difference, diff.6h, diff.24h, diff.96h) %>%
+    mutate(timepoint = factor(timepoint, levels = c("diff.6h", "diff.24h", "diff.96h")))
+  
+  plt <- tib.difference %>%
+    ggplot(aes(x = value / 100, y = combined.difference, col = border.ctcf)) +
+    annotate("rect", xmin = 0, xmax = 1e3, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(size = 1) +
+    facet_grid(as.formula(paste(paste(c("condition"), 
+                                      collapse = " + "), 
+                                "~", "timepoint"))) +
+    ggtitle("DamID difference at LAD borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("DamID difference (z-score)") +
+    coord_cartesian(xlim = xlimits, ylim = ylimits.diff) +
+    scale_color_manual(values = c("blue", "red")) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  # Also, plot the difference between CTCF and non-CTCF borders
+  tib.difference <- tib %>%
+    dplyr::select(-sample, -combined.count) %>%
+    spread(key = border.ctcf, value = combined.mean) %>%
+    mutate(diff = CTCF - nonCTCF) %>%
+    dplyr::select(-nonCTCF, -CTCF)
+  
+  plt <- tib.difference %>%
+    ggplot(aes(x = value / 100, y = diff, col = timepoint)) +
+    annotate("rect", xmin = 0, xmax = 1e3, ymin = -1, ymax = 5, 
+             fill = "grey", alpha = 0.3) +  
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+    geom_line(size = 1) +
+    facet_wrap( ~ condition, nrow = 2) +
+    ggtitle("DamID difference at CTCF borders") +
+    xlab("Distance from LAD border (Mb)") +
+    ylab("DamID difference (z-score)") +
+    coord_cartesian(xlim = xlimits, ylim = ylimits.diff) +
+    scale_color_brewer(palette = "Set1") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+}
+
+```
+
+
+### 1. Load data
+
+#### 1.1 Previous data
+
+Load the required data. First, the previous data sets that I need.
+
+```{r load previous data}
+
+# See above
+
+```
+
+#### 1.2 DamID data
+
+Also, load DamID data. I will work with combined data tracks of replicates.
+
+Also, load the counts. These can be used to illustrate whether any effects are 
+caused by a change in accessibility or Lamin B1 reads.
+
+```{r load damid, message = F, warning = F, cache = T}
+
+# Prepare DamID metadata
+metadata.damid <- tibble(dir(damid.dir, pattern = "combined.*norm.txt.gz"),
+                         .name_repair = ~ c("file")) %>%
+  mutate(sample = str_remove(str_remove(file, "pADamID_"),
+                             paste0("-", bin.size, ".*"))) %>%
+  mutate(sample = str_remove(sample, "^NQ_")) %>%
+  mutate(sample = str_replace_all(sample, "-", "")) %>%
+  separate(sample, c("condition", "timepoint"), remove = F, sep = "_") %>%
+  mutate(condition = factor(condition, levels = c("PT", "CTCFEL", "CTCFNQ", 
+                                                  "CTCF", "RAD21", "WAPL", "CTCFWAPL")),
+         timepoint = factor(timepoint, levels = c("0h", "6h", "24h", "96h"))) %>%
+  arrange(condition, timepoint) %>%
+  add_column(cell = factor("mESC")) %>%
+  mutate(sample = factor(sample, levels = unique(sample))) %>%
+  drop_na()
+
+# Load DamID
+damid <- LoadDamID(metadata.damid, damid.dir)
+
+# Load DamID counts
+damid.counts <- LoadDamIDCounts(metadata.damid, 
+                                str_replace(damid.dir,
+                                            "normalized",
+                                            "counts"))
+damid.lmnb1 <- damid.counts[[1]]
+damid.dam <- damid.counts[[2]]
+
+```
+
+I want to show the effect of scaling using one sample - do that here.  Note that
+this is done on individual replicates.
+
+```{r load damid and show scaling, message = F, warning = F, cache = T, fig.width = 8, fig.height = 3.5}
+
+# Prepare DamID metadata
+metadata.scaling <- tibble(file = dir(damid.dir, pattern = ".*norm.txt.gz")) %>%
+  filter(! grepl("combined", file)) %>%
+  filter(! grepl("RAD21_r9", file)) %>%
+  #filter(grepl("CTCF-WAPL", file)) %>%
+  mutate(sample = str_remove(str_remove(file, "pADamID_"),
+                             paste0("-", bin.size, ".*"))) %>%
+  mutate(sample = str_remove(sample, "^NQ_")) %>%
+  mutate(sample = str_replace_all(sample, "-", "")) %>%
+  filter(! grepl("DMSO|EED|GSK", sample)) %>%
+  separate(sample, c("condition", "timepoint", "replicate"), remove = F, sep = "_") %>%
+  mutate(condition = factor(condition, levels = c("PT", "CTCFEL", "CTCFNQ", 
+                                                  "CTCF", "WAPL", "CTCFWAPL",
+                                                  "RAD21")),
+         timepoint = factor(timepoint, levels = c("0h", "6h", "24h", "96h"))) %>%
+  arrange(condition, timepoint) %>%
+  add_column(cell = factor("mESC")) %>%
+  mutate(sample = factor(sample, levels = unique(sample))) %>%
+  filter(! (condition == "CTCFNQ" & replicate == "r4"),
+         ! (condition == "RAD21" & replicate == "r3"),
+         ! (condition == "PT" & replicate %in% c("r4", "r5", "r6")),
+         ! (condition == "CTCFWAPL" & replicate == "r2" & timepoint == "24h"),
+         ! (condition == "CTCFWAPL" & replicate == "r8"))
+
+# Load DamID
+damid.without.scaling <- LoadDamID(metadata.scaling, damid.dir)
+ 
+# Scaling 
+PlotDensity(damid.without.scaling, "Density before scaling", xlimits = c(-4, 3), 
+            replicate = T)
+damid_replicates <- damid.scaling <- ScaleDamID(damid.without.scaling)
+PlotDensity(damid.scaling, "Density after scaling", xlimits = c(-3, 2.5), 
+            replicate = T)
+
+```
+
+This nicely illustrates that data scaling is required. The dynamic range simply 
+varies between replicates. 
+
+Update ts220203: can we translate the z-scaled values to log2-ratios? This 
+translation is different for every sample. But, we can show all these 
+correlations. Let's do that here. The goal is to determine the range of 
+ratios that a difference of 1 in z-space corresponds to.
+
+```{r z values to log2 ratios, fig.width = 5, fig.height = 3.5}
+
+# The easiest way to do this is to determine the standard deviation of
+# every sample.
+df_unscaled <- as_tibble(mcols(damid.without.scaling)) %>%
+  summarise_all(function(x) sd(x, na.rm = T)) %>%
+  t()
+
+df_scaled <- as_tibble(mcols(damid.scaling)) %>%
+  summarise_all(function(x) sd(x, na.rm = T)) %>%
+  t()
+
+# Combine these
+tib_conversion <- tibble(samples = row.names(df_unscaled),
+                         unscaled = df_unscaled[, 1],
+                         scaled = df_scaled[, 1]) %>%
+  mutate(ratio = unscaled / scaled)
+
+# And plot
+tib_conversion %>%
+  ggplot(aes(x = 1, y = ratio)) +
+  geom_quasirandom(col = "darkgrey") +
+  geom_boxplot(fill = NA, col = "black", outlier.shape = NA) +
+  geom_hline(yintercept = c(1), col = "black", linetype = "dashed") +
+  scale_x_continuous(breaks = NULL) +
+  coord_cartesian(ylim = c(0.5, 1.5)) +
+  ylab("Conversion z-score to log2-ratio") +
+  theme_bw() +
+  theme(aspect.ratio = 3,
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+# Determine the mean and confidence interval
+tib_conversion
+
+mean(tib_conversion$ratio)
+quantile(tib_conversion$ratio, c(0.025, 0.975))
+
+```
+
+Let's try to summarise all the data in a PCA plot.
+
+```{r PCA plot all samples, fig.width = 5, fig.height = 3.5, cache = T}
+
+# Calculate PCA
+tib <- as_tibble(mcols(damid.scaling)) %>%
+  dplyr::select(-contains("NQ")) %>%
+  drop_na()
+
+pca <- prcomp(t(tib))
+
+# Gather information from PCA
+tib_pca <- as_tibble(pca$x) %>%
+  dplyr::select(1:5) %>%
+  add_column(sample = names(tib)) %>%
+  separate(sample, c("condition", "timepoint", "replicate"), remove = F) %>%
+  mutate(condition = factor(condition, levels = levels(metadata.damid$condition)),
+         timepoint = factor(timepoint, levels = levels(metadata.damid$timepoint)))
+
+var_explained <- pca$sdev^2/sum(pca$sdev^2)
+
+# Plot
+tib_pca %>%
+  ggplot(aes(x = PC1, y = PC2, col = timepoint, shape = condition)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1 (", 
+              round(var_explained[1]*100, 2),
+              "%)")) +
+  ylab(paste0("PC2 (", 
+              round(var_explained[2]*100, 2),
+              "%)")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+
+# umap plot
+tib_umap <- as_tibble(umap(tib)$data) %>%
+  add_column(sample = names(tib)) %>%
+  separate(sample, c("condition", "timepoint", "replicate"), remove = F) %>%
+  mutate(condition = factor(condition, levels = levels(metadata.damid$condition)),
+         timepoint = factor(timepoint, levels = levels(metadata.damid$timepoint)))
+
+#colors <- c("grey30", "red", "blue", "darkgreen", "purple")
+tib_umap %>%
+  ggplot(aes(x = X1, y = X2, col = timepoint, shape = condition)) +
+  geom_point(size = 3) +
+  xlab("UMAP 1") +
+  ylab("UMAP 2") +
+  #scale_color_manual(values = colors, name = "Cell line") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+
+```
+
+I like the UMAP best. It shows the main conclusions: most changes occur for the 
+WAPL and CTCF-WAPL cell lines.
+
+Also, make some plots to show that replicate experiments correlate.
+
+```{r replicate plots, cache = T, fig.width = 5, fig.height = 3.5}
+
+# Plot correlations
+CompareReplicates <- function(tib, condition, r1, r2, limits = c(-3.5, 3)) {
+  
+  # Select data
+  tib_filtered <- tib %>%
+    dplyr::select(contains(condition)) %>%
+    dplyr::select(contains(r1),
+                  contains(r2)) %>%
+    rename_all(function(x) str_replace(x, paste0(condition, "_"), "")) %>%
+    rename_all(function(x) str_replace(x, paste0(r1), "r1")) %>%
+    rename_all(function(x) str_replace(x, paste0(r2), "r2")) %>%
+    drop_na()
+  
+  # Base plot
+  plt_base <- tib_filtered %>%
+    ggplot() +
+    geom_vline(xintercept = 0, col = "blue", linetype = "dashed") +
+    geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+    geom_abline(slope = 1, intercept = 0, col = "red") +
+    coord_cartesian(xlim = limits, ylim = limits) +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  # Plots for all time points
+  plt_0h <- plt_base +
+    geom_bin2d(aes(x = `0h_r1`, y = `0h_r2`), bins = 100) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$`0h_r1`,
+                                                   tib_filtered$`0h_r2`),
+                                               2))) +
+    xlab("t=0h r1") +
+    ylab("t=0h r2")
+  plot(plt_0h)
+  
+  if (grepl("PT", condition)) return()
+  
+  plt_6h <- plt_base +
+    geom_bin2d(aes(x = `6h_r1`, y = `6h_r2`), bins = 100) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$`6h_r1`,
+                                                   tib_filtered$`6h_r2`),
+                                               2))) +
+    xlab("t=6h r1") +
+    ylab("t=6h r2")
+  plot(plt_6h)
+  
+  plt_24h <- plt_base +
+    geom_bin2d(aes(x = `24h_r1`, y = `24h_r2`), bins = 100) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$`24h_r1`,
+                                                   tib_filtered$`24h_r2`),
+                                               2))) +
+    xlab("t=24h r1") +
+    ylab("t=24h r2")
+  plot(plt_24h)
+  
+  # Plot the differences
+  tib_filtered <- tib_filtered %>%
+    mutate(diff_6h_r1 = `6h_r1` - `0h_r1`,
+           diff_24h_r1 = `24h_r1` - `0h_r1`,
+           diff_6h_r2 = `6h_r2` - `0h_r2`,
+           diff_24h_r2 = `24h_r2` - `0h_r2`)
+  
+  plt_base <- tib_filtered %>%
+    ggplot() +
+    geom_vline(xintercept = 0, col = "blue", linetype = "dashed") +
+    geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+    coord_cartesian(xlim = c(-2.5, 2.5), ylim = c(-2.5, 2.5)) +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plt_6h <- plt_base +
+    geom_bin2d(aes(x = diff_6h_r1, y = diff_6h_r2), bins = 100) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$diff_6h_r1,
+                                                   tib_filtered$diff_6h_r2),
+                                               2))) +
+    xlab("diff t=6h r1") +
+    ylab("diff t=6h r2")
+  plot(plt_6h)
+  
+  plt_24h <- plt_base +
+    geom_bin2d(aes(x = diff_24h_r1, y = diff_24h_r2), bins = 100) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$diff_24h_r1,
+                                                   tib_filtered$diff_24h_r2),
+                                               2))) +
+    xlab("diff t=24h r1") +
+    ylab("diff t=24h r2")
+  plot(plt_24h)
+  
+}
+CompareReplicatesLADs <- function(tib, condition, r1, r2) {
+  
+  # Select data
+  tib_filtered <- tib %>%
+    dplyr::select(contains(condition)) %>%
+    dplyr::select(contains(r1),
+                  contains(r2)) %>%
+    rename_all(function(x) str_replace(x, paste0(condition, "_"), "")) %>%
+    rename_all(function(x) str_replace(x, paste0(r1), "r1")) %>%
+    rename_all(function(x) str_replace(x, paste0(r2), "r2")) %>%
+    drop_na()
+  
+  # Base plot
+  plt_base <- tib_filtered %>%
+    ggplot() +
+    geom_vline(xintercept = 0, col = "blue", linetype = "dashed") +
+    geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+    coord_cartesian(xlim = c(-1, 1.5), ylim = c(-1, 1.5)) +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  # Plots for all time points
+  plt_0h <- plt_base +
+    geom_point(aes(x = `0h_r1`, y = `0h_r2`), 
+               alpha = 0.3, size = 1) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$`0h_r1`,
+                                                   tib_filtered$`0h_r2`),
+                                               2))) +
+    xlab("t=0h r1") +
+    ylab("t=0h r2")
+  plot(plt_0h)
+  
+  if (grepl("PT", condition)) return()
+  
+  plt_6h <- plt_base +
+    geom_point(aes(x = `6h_r1`, y = `6h_r2`), 
+               alpha = 0.3, size = 1) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$`6h_r1`,
+                                                   tib_filtered$`6h_r2`),
+                                               2))) +
+    xlab("t=6h r1") +
+    ylab("t=6h r2")
+  plot(plt_6h)
+  
+  plt_24h <- plt_base +
+    geom_point(aes(x = `24h_r1`, y = `24h_r2`), 
+               alpha = 0.3, size = 1) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$`24h_r1`,
+                                                   tib_filtered$`24h_r2`),
+                                               2))) +
+    xlab("t=24h r1") +
+    ylab("t=24h r2")
+  plot(plt_24h)
+  
+  # Plot the differences
+  tib_filtered <- tib_filtered %>%
+    mutate(diff_6h_r1 = `6h_r1` - `0h_r1`,
+           diff_24h_r1 = `24h_r1` - `0h_r1`,
+           diff_6h_r2 = `6h_r2` - `0h_r2`,
+           diff_24h_r2 = `24h_r2` - `0h_r2`)
+  
+  plt_base <- tib_filtered %>%
+    ggplot() +
+    geom_vline(xintercept = 0, col = "blue", linetype = "dashed") +
+    geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+    coord_cartesian(xlim = c(-1, 1), ylim = c(-1, 1)) +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plt_6h <- plt_base +
+    geom_point(aes(x = diff_6h_r1, y = diff_6h_r2), 
+               alpha = 0.3, size = 1) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$diff_6h_r1,
+                                                   tib_filtered$diff_6h_r2),
+                                               2))) +
+    xlab("diff t=6h r1") +
+    ylab("diff t=6h r2")
+  plot(plt_6h)
+  
+  plt_24h <- plt_base +
+    geom_point(aes(x = diff_24h_r1, y = diff_24h_r2), 
+               alpha = 0.3, size = 1) +
+    ggtitle(paste0(condition, " - Rsq=", round(cor(tib_filtered$diff_24h_r1,
+                                                   tib_filtered$diff_24h_r2),
+                                               2))) +
+    xlab("diff t=24h r1") +
+    ylab("diff t=24h r2")
+  plot(plt_24h)
+  
+}
+
+# Compare replicates bewteen bins
+tib <- as_tibble(mcols(damid.scaling))
+
+CompareReplicates(tib, "PT", "r8", "r9")
+CompareReplicates(tib, "CTCFEL", "r1", "r4")
+CompareReplicates(tib, "RAD21", "r4", "r5")
+CompareReplicates(tib, "WAPL", "r1", "r2")
+CompareReplicates(tib, "CTCFWAPL", "r6", "r7")
+
+# I also want to prepare a figure that shows all the correlation values
+# Do this without data scaling!
+tib <- as_tibble(mcols(damid.without.scaling))
+
+CompareReplicates(tib, "PT", "r8", "r9", limits = c(-3.5, 2.5))
+
+tib_cor <- tib %>%
+  mutate(bin = 1:nrow(.)) %>%
+  drop_na() %>%
+  gather(key, value, -bin) %>%
+  mutate(idx = match(key, metadata.scaling$sample),
+         condition = metadata.scaling$condition[idx],
+         timepoint = metadata.scaling$timepoint[idx],
+         replicate = metadata.scaling$replicate[idx])
+#separate(key, c("condition", "timepoint", "replicate"), remove = F) %>%
+
+tib_cor <- tib_cor %>%
+  group_by(condition, timepoint) %>%
+  nest() %>%
+  mutate(data2 = map(data, 
+                     function(df) select(df, -replicate, -idx)),
+         data2 = map(data2, 
+                     spread, key = key, value = value),
+         data2 = map(data2, 
+                     function(df) select(df, -bin)),
+         pearson = map(data2, cor),
+         pearson = map(pearson, 
+                       function(df) gather(as_tibble(df),
+                                           key = key, value = value))) %>%
+  unnest(pearson) %>%
+  dplyr::select(-contains("data")) %>%
+  ungroup()
+
+tib_cor <- tib_cor %>%
+  group_by(condition, timepoint) %>%
+  mutate(target = rep(unique(key), 
+                      length(unique(key)))) %>%
+  ungroup() %>%
+  filter(key != target,
+         key > target)
+
+# Plot
+tib_cor %>%
+  ggplot(aes(x = 1, y = value)) +
+  geom_quasirandom(col = "darkgrey") +
+  geom_boxplot(fill = NA, col = "black", outlier.shape = NA) +
+  geom_hline(yintercept = c(0, 1), col = "black", linetype = "dashed") +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_x_continuous(breaks = NULL) +
+  ylab("Pearson") +
+  theme_bw() +
+  theme(aspect.ratio = 3,
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+tib_cor %>%
+  ggplot(aes(x = 1, y = value)) +
+  geom_quasirandom(aes(col = condition == "PT")) +
+  geom_boxplot(fill = NA, col = "black", outlier.shape = NA) +
+  geom_hline(yintercept = c(0, 1), col = "black", linetype = "dashed") +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_x_continuous(breaks = NULL) +
+  scale_color_manual(values = c("darkgrey", "red")) +
+  ylab("Pearson") +
+  theme_bw() +
+  theme(aspect.ratio = 3,
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+
+# LAD analyses
+tib <- as_tibble(mcols(damid.scaling))
+ovl <- as_tibble(findOverlaps(damid.scaling,
+                              LADs[[1]]))
+
+tib_inLADs <- tib %>%
+  mutate(queryHits = 1:nrow(.)) %>%
+  full_join(ovl) %>%
+  drop_na(subjectHits) %>%
+  group_by(subjectHits) %>%
+  dplyr::summarise_all(function(x) mean(x, na.rm = T))
+
+CompareReplicatesLADs(tib_inLADs, "PT", "r8", "r9")
+CompareReplicatesLADs(tib_inLADs, "CTCFEL", "r1", "r4")
+CompareReplicatesLADs(tib_inLADs, "RAD21", "r4", "r5")
+CompareReplicatesLADs(tib_inLADs, "WAPL", "r1", "r2")
+CompareReplicatesLADs(tib_inLADs, "CTCFWAPL", "r6", "r7")
+
+
+# Finally, all LAD correlations
+tib_cor <- tib_inLADs %>%
+  mutate(bin = 1:nrow(.)) %>%
+  drop_na() %>%
+  gather(key, value, -bin) %>%
+  mutate(idx = match(key, metadata.scaling$sample),
+         condition = metadata.scaling$condition[idx],
+         timepoint = metadata.scaling$timepoint[idx],
+         replicate = metadata.scaling$replicate[idx])
+#separate(key, c("condition", "timepoint", "replicate"), remove = F) %>%
+
+tib_cor <- tib_cor %>%
+  group_by(condition, timepoint) %>%
+  nest() %>%
+  mutate(data2 = map(data, 
+                     function(df) select(df, -replicate, -idx)),
+         data2 = map(data2, 
+                     spread, key = key, value = value),
+         data2 = map(data2, 
+                     function(df) select(df, -bin)),
+         pearson = map(data2, cor),
+         pearson = map(pearson, 
+                       function(df) gather(as_tibble(df),
+                                           key = key, value = value))) %>%
+  unnest(pearson) %>%
+  dplyr::select(-contains("data")) %>%
+  ungroup()
+
+tib_cor <- tib_cor %>%
+  group_by(condition, timepoint) %>%
+  mutate(target = rep(unique(key), 
+                      length(unique(key)))) %>%
+  ungroup() %>%
+  filter(key != target,
+         key > target) %>% 
+  drop_na()
+
+tib_cor %>% 
+  print(n = 40)
+
+# Plot
+tib_cor %>%
+  ggplot(aes(x = 1, y = value)) +
+  geom_quasirandom(col = "darkgrey") +
+  geom_boxplot(fill = NA, col = "black", outlier.shape = NA) +
+  geom_hline(yintercept = c(0, 1), col = "black", linetype = "dashed") +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_x_continuous(breaks = NULL) +
+  ylab("Pearson") +
+  theme_bw() +
+  theme(aspect.ratio = 3,
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+tib_cor %>%
+  ggplot(aes(x = 1, y = value)) +
+  geom_quasirandom(aes(col = condition == "PT")) +
+  geom_boxplot(fill = NA, col = "black", outlier.shape = NA) +
+  geom_hline(yintercept = c(0, 1), col = "black", linetype = "dashed") +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_x_continuous(breaks = NULL) +
+  scale_color_manual(values = c("darkgrey", "red")) +
+  ylab("Pearson") +
+  theme_bw() +
+  theme(aspect.ratio = 3,
+        axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank()) 
+
+```
+
+The most important figure here is the Pearson correlation distribution between
+all replicate experiments. For the rest, the figures show that replicates
+correlate (linearly), but also that the differences over time are only somewhat 
+correlating. Thus, the effect size is small and per-bin analyses are not going
+to work.
+
+Before I can continue with the DamID data, I want to convert the values first to
+z-scores. Also, make density plots.
+
+```{r convert damid to z-score, fig.width = 10, fig.height = 3.5, cache = T}
+
+# Scale DamID, plot density before and after
+PlotDensity(damid, "Density before scaling", xlimits = c(-4, 3))
+damid <- ScaleDamID(damid)
+PlotDensity(damid, "Density after scaling", xlimits = c(-3, 2.5))
+PlotDensity(damid, "Density after scaling", xlimits = c(-3, 2.5),
+            conditions = c("CTCFEL", "WAPL", "CTCFWAPL", "RAD21"))
+
+# Also scale counts - this is a bit weird at z-scale, but hey 
+# damid.lmnb1 <- ScaleDamID(damid.lmnb1)
+# damid.dam <- ScaleDamID(damid.dam)
+
+
+```
+
+Finally, prepare PCA plots for the combined samples.
+
+```{r PCA plot combined samples, fig.width = 5, fig.height = 3.5, cache = T}
+
+# Calculate PCA
+tib <- as_tibble(mcols(damid)) %>%
+  drop_na() %>%
+  dplyr::select(-contains("CTCF_"))
+
+pca <- prcomp(t(tib))
+
+# Gather information from PCA
+tib_pca <- as_tibble(pca$x) %>%
+  dplyr::select(1:5) %>%
+  add_column(sample = names(tib)) %>%
+  separate(sample, c("condition", "timepoint"), remove = F) %>%
+  mutate(condition = factor(condition, levels = levels(metadata.damid$condition)),
+         timepoint = factor(timepoint, levels = levels(metadata.damid$timepoint)))
+
+var_explained <- pca$sdev^2/sum(pca$sdev^2)
+
+# Plot
+tib_pca %>%
+  ggplot(aes(x = PC1, y = PC2, col = timepoint, shape = condition)) +
+  geom_point() +
+  xlab(paste0("PC1 (", 
+              round(var_explained[1]*100, 2),
+              "%)")) +
+  ylab(paste0("PC2 (", 
+              round(var_explained[2]*100, 2),
+              "%)")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+```
+
+Good.
+
+
+### 2. DamID scores at LAD borders
+
+I need to add the distance to LAD border (and which LAD border) to the DamID
+data. First, filter LAD borders for positioning near active genes.
+
+Note that most of these analyses are old and removed. Instead, see below for 
+better analyses of LAD borders, where I process all borders individually.
+
+```{r overlay damid and LAD borders, cache = T}
+
+# Only for borders without genes
+borders <- borders[borders$ovl_gene == F] 
+
+```
+
+Having these distances, I can now start plotting the DamID profile around LAD
+borders. Also, I can plot the difference between the later timepoints and 0h.
+
+
+### 3. Individual LAD borders
+
+The previous plots are all based on average effects. Here, I will try to work
+with individual LAD borders, to see if the real differences are only for a 
+subset of CTCF borders.
+
+First, I will determine the distance to LAD borders for all genomic bins. Use
+LAD borders defined in the pA-DamID data for the parental clone.
+
+```{r gather individual borders, fig.width = 5, fig.height = 3.5, warning = F, message = F, cache = T}
+
+GatherBorders <- function(damid, borders, lads) {
+  
+  # Get the distances to the nearest LAD borders for all damid bins
+  damid.mid <- damid
+  start(damid.mid) <- end(damid.mid) <- (start(damid.mid) + end(damid.mid)) / 2
+  
+  dis <- as_tibble(distanceToNearest(damid.mid, borders))
+  
+  # Round distances to the nearest 5kb
+  dis <- dis %>%
+    mutate(distance = ceiling(distance / 5000) * 5000)
+  
+  # Also, determine which bins overlap with lads
+  ovl <- damid.mid %over% lads
+  
+  # Process data as tibble
+  tib <- as_tibble(damid.mid) %>%
+    add_column(border_idx = dis$subjectHits,
+               border_ctcf = borders$CTCF[dis$subjectHits],
+               border_ctcf_n = borders$CTCF.count[dis$subjectHits],
+               border_ctcf_strand = borders$CTCF_strand[dis$subjectHits],
+               distance = dis$distance,
+               within_lad = ovl) %>%
+    mutate(distance = case_when(within_lad == 1 ~ distance,
+                                T ~ -distance),
+           border_ctcf_strand = factor(border_ctcf_strand,
+                                       levels = c("outwards", "inwards",
+                                                  "ambiguous", "nonCTCF")),
+           border_ctcf_n = case_when(border_ctcf_n >= 3 ~ ">=3", 
+                                     border_ctcf_n == 2 ~ "2",
+                                     border_ctcf_n == 1 ~ "1",
+                                     T ~ "nonCTCF"),
+           border_ctcf_n = factor(border_ctcf_n,
+                                  levels = c("nonCTCF", "1", "2", ">=3"))) %>%
+    filter(abs(distance) < 2e5)
+  
+  # # Only work with "complete" borders (remove small iLADs / LADs)
+  # borders_complete <- which(as.numeric(table(tib$border_idx)) > 25)
+  # 
+  # tib <- tib %>%
+  #   filter(border_idx %in% borders_complete)
+  
+  # Plot all lines as "test"
+  tib %>%
+    ggplot(aes(x = distance / 1e3, y = PT_0h)) +
+    #geom_line(aes(group = border_idx), alpha = 0.1) +
+    geom_smooth(aes(group = border_ctcf, col = border_ctcf), se = T) +
+    xlab("Distance to LAD border (kb)") +
+    ylab("pA-DamID (z-score)") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  tib
+  
+}
+
+tib_damid <- GatherBorders(damid, borders = borders, 
+                           lads = LADs[["mESC_pA_PT"]])
+tib_damid_lmnb1 <- GatherBorders(damid.lmnb1, borders = borders, 
+                                 lads = LADs[["mESC_pA_PT"]])
+tib_damid_dam <- GatherBorders(damid.dam, borders = borders, 
+                               lads = LADs[["mESC_pA_PT"]])
+
+
+```
+
+Next, plot the effect of depletion at LAD borders. I will prepare several
+figures / results here:
+
+  * Average profile (+ conf. int.) of all borders.
+  * Per-border effect outside of LAD borders.
+  * Statistics of this.
+  
+Not only do this for depletions at +/- CTCF borders, but also based on 
+CTCF strand and CTCF count. Also, for the unnormalized data (as cpm) to 
+illustrate whether the effects are caused by differences in LaminB1 or 
+Dam signal.
+
+```{r plot individual borders, fig.width = 5, fig.height = 10, warning = F, message = F, cache = T}
+
+sd_fun <- function(x, y = 1.3) {
+  return(data.frame(y = y, label = round(sd(x), 2)))
+}
+
+PlotBordersWithConfidenceIntervals <- function(tib, samples,
+                                               ylim = c(-0.9, 0.65),
+                                               smooth = 1,
+                                               group = "border_ctcf",
+                                               keep_PT = F,
+                                               filter_96h = T) {
+  
+  if (filter_96h) {
+    samples <- samples[! grepl("96h", samples)]
+  }
+  
+  # Gather tib
+  if (smooth != 1) {
+    tib <- tib %>%
+      mutate_at(vars(ends_with("h")), runmean, k = smooth, endrule = "mean")
+  }
+  
+  tib_gather <- tib %>%
+    gather(key, value, 
+           grep("[0-9]+h$", names(tib), value = T)) %>%
+    mutate(key = factor(key, levels = levels(metadata.damid$sample)))
+  tib_gather$group <- tib_gather %>% pull(group)
+  
+  if (keep_PT) {
+    plt <- tib_gather %>%
+      filter(key %in% samples) %>%
+      ggplot(aes(x = distance / 1e3, y = value, 
+                 group = key, col = key, fill = key)) +
+      annotate("rect", xmin = 0, xmax = 300, ymin = -10, ymax = 10, 
+               fill = "grey", alpha = 0.3) +  
+      geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+      geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+      #geom_line(aes(group = border_idx), alpha = 0.1) +
+      #geom_smooth(aes(group = key, col = key), se = T) +
+      stat_summary(fun = mean, geom = "line", size = 1) +
+      stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+                   fun.args = list(mult = 1.96)) +
+      #facet_grid(. ~ border_ctcf) +
+      facet_grid(group ~ .) +
+      xlab("Distance to LAD border (kb)") +
+      ylab("pA-DamID (z-score)") +
+      coord_cartesian(xlim = c(-200, 200), ylim = ylim, expand = F) +
+      scale_color_brewer(palette = "Set1", name = "Border class") +
+      scale_fill_brewer(palette = "Set1", name = "Border class", guide = "none") +
+      theme_bw() +
+      theme(aspect.ratio = 1,
+            axis.text.x = element_text(angle = 90, hjust = 1))
+    plot(plt)
+    
+    samples_without_pt <- samples
+    
+    if (length(samples) == 1) return(NULL)
+    
+  } else {
+    
+    # Plot some tracks
+    plt <- tib_gather %>%
+      filter(key %in% samples & key != "PT_0h") %>%
+      ggplot(aes(x = distance / 1e3, y = value, 
+                 group = key, col = key, fill = key)) +
+      annotate("rect", xmin = 0, xmax = 300, ymin = -10, ymax = 10, 
+               fill = "grey", alpha = 0.3) +  
+      geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+      geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+      #geom_line(aes(group = border_idx), alpha = 0.1) +
+      #geom_smooth(aes(group = key, col = key), se = T) +
+      stat_summary(fun = mean, geom = "line", size = 1) +
+      stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+                   fun.args = list(mult = 1.96)) +
+      #facet_grid(. ~ border_ctcf) +
+      facet_grid(group ~ .) +
+      xlab("Distance to LAD border (kb)") +
+      ylab("pA-DamID (z-score)") +
+      coord_cartesian(xlim = c(-200, 200), ylim = ylim, expand = F) +
+      scale_color_brewer(palette = "Set1", name = "Border class") +
+      scale_fill_brewer(palette = "Set1", name = "Border class", guide = "none") +
+      theme_bw() +
+      theme(aspect.ratio = 1,
+            axis.text.x = element_text(angle = 90, hjust = 1))
+    plot(plt)
+    
+    samples_without_pt <- samples[2:length(samples)]
+    
+  }
+  
+  # # Can I also quantify the difference within the LAD?
+  # tib_ctcf <- tib %>%
+  #   filter(distance > 20e3 & distance < 120e3) %>%
+  #   dplyr::select(border_idx, all_of(samples_without_pt), all_of(group)) %>%
+  #   dplyr::rename_at(vars(group), ~ "group") %>%
+  #   group_by(border_idx, group) %>%
+  #   summarise_at(samples_without_pt, mean, na.rm = T) %>%
+  #   ungroup() %>%
+  #   dplyr::rename_at(samples_without_pt[1], ~c("base")) %>%
+  #   mutate_at(samples_without_pt[2:length(samples_without_pt)], 
+  #             function(x) x - .$base) %>%
+  #   dplyr::select(border_idx, group, 
+  #                 samples_without_pt[2:length(samples_without_pt)]) %>%
+  #   gather(key, value, -group, -border_idx) %>%
+  #   mutate(key = factor(key, samples_without_pt),
+  #          group = factor(group, levels = c("nonCTCF",
+  #                                           "CTCF",
+  #                                           "outwards", "inwards", "ambiguous",
+  #                                           "1", "2", ">=3")))
+  # 
+  # # Plot by time point
+  # plt <- tib_ctcf %>%
+  #   ggplot(aes(x = group, y = value, col = group)) +
+  #   geom_quasirandom() +
+  #   geom_boxplot(fill = NA, col = "black", outlier.shape = NA) +
+  #   geom_hline(yintercept = 0, col = "darkgrey", linetype = "dashed") +
+  #   facet_grid(. ~ key) +
+  #   coord_cartesian(ylim = c(-1.5, 1.5)) +
+  #   scale_color_brewer(palette = "Set2", guide = "none") +
+  #   xlab("") +
+  #   ylab("Difference within LAD with t=0h") +
+  #   theme_bw() +
+  #   theme(aspect.ratio = 1.5,
+  #         axis.text.x = element_text(angle = 90, hjust = 1))
+  # plot(plt)
+  
+  
+  # Can I also quantify the difference between the local CTCF depletion?
+  tib_ctcf <- tib %>%
+    filter(distance > -20e3 & distance < 0) %>%
+    dplyr::select(border_idx, all_of(samples_without_pt), all_of(group)) %>%
+    dplyr::rename_at(vars(group), ~ "group") %>%
+    group_by(border_idx, group) %>%
+    summarise_at(samples_without_pt, mean, na.rm = T) %>%
+    ungroup() %>%
+    dplyr::rename_at(samples_without_pt[1], ~c("base")) %>%
+    mutate_at(samples_without_pt[2:length(samples_without_pt)], 
+              function(x) x - .$base) %>%
+    dplyr::select(border_idx, group, 
+                  samples_without_pt[2:length(samples_without_pt)]) %>%
+    gather(key, value, -group, -border_idx) %>%
+    mutate(key = factor(key, samples_without_pt),
+           group = factor(group, levels = c("nonCTCF",
+                                            "CTCF",
+                                            "outwards", "inwards", "ambiguous",
+                                            "1", "2", ">=3")))
+  
+  # Plot by time point
+  plt <- tib_ctcf %>%
+    ggplot(aes(x = group, y = value, col = group)) +
+    geom_quasirandom() +
+    geom_boxplot(fill = NA, col = "black", outlier.shape = NA) +
+    geom_hline(yintercept = 0, col = "darkgrey", linetype = "dashed") +
+    stat_summary(fun.data = sd_fun, geom = "text", col = "black") +
+    facet_grid(. ~ key) +
+    coord_cartesian(ylim = c(-1.5, 1.5)) +
+    scale_color_brewer(palette = "Set2", guide = "none") +
+    xlab("") +
+    ylab("Difference outside LAD border with t=0h") +
+    theme_bw() +
+    theme(aspect.ratio = 1.5,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  # # Plot by border class
+  # plt <- tib_ctcf %>%
+  #   ggplot(aes(x = key, y = value, col = key)) +
+  #   geom_quasirandom() +
+  #   geom_boxplot(fill = NA, col = "black", outlier.shape = NA) +
+  #   geom_hline(yintercept = 0, col = "darkgrey", linetype = "dashed") +
+  #   facet_grid(. ~ group) +
+  #   scale_color_brewer(palette = "Set1", guide = F) +
+  #   xlab("") +
+  #   ylab("Difference outside LAD border with t=0h") +
+  #   theme_bw() +
+  #   theme(aspect.ratio = 1.5,
+  #         axis.text.x = element_text(angle = 90, hjust = 1))
+  # plot(plt)
+  
+  # Statistics - difference from diff = 0
+  tib_ctcf %>%
+    group_by(group, key) %>%
+    dplyr::summarise(pvalue = wilcox.test(value)$p.value) %>%
+    ungroup() %>%
+    mutate(padj = p.adjust(pvalue),
+           sign = padj < 0.05) %>%
+    print(n = 40)
+  
+  # Statistics - difference with nonCTCF borders
+  tib_stat <- tibble()
+  
+  for (current_group in levels(tib_ctcf$group)) {
+    for (current_key in levels(tib_ctcf$key)) {
+      
+      if (! current_group %in% tib_ctcf$group) next
+      if (current_group %in% "nonCTCF") next
+      if (! current_key %in% tib_ctcf$key) next
+      
+      
+      tmp <- wilcox.test(tib_ctcf %>%
+                           filter(group == current_group &
+                                    key == current_key) %>%
+                           pull(value),
+                         tib_ctcf %>%
+                           filter(group == "nonCTCF" &
+                                    key == current_key) %>%
+                           pull(value))
+      
+      tib_stat <- bind_rows(tib_stat,
+                            tibble(group = current_group,
+                                   key = current_key,
+                                   pvalue = tmp$p.value))
+    }
+  }
+  
+  tib_stat %>%
+    mutate(padj = p.adjust(pvalue),
+           sign = padj < 0.05) %>%
+    print(n = 40)
+  
+  tib_stat
+  
+}
+
+# CTCF vs non-CTCF
+PlotBordersWithConfidenceIntervals(tib_damid, 
+                                   c("PT_0h", "CTCFEL_0h",
+                                     "RAD21_0h", "WAPL_0h",
+                                     "CTCFWAPL_0h"),
+                                   keep_PT = T)
+
+tib_stat <- tibble()
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "PT_24h"),
+                                          keep_PT = T, ylim = c(-0.7, 0.7))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "PT_24h", "CTCFEL_0h", "CTCFEL_6h", 
+                                            "CTCFEL_24h", "CTCFEL_96h"), 
+                                          keep_PT = T, ylim = c(-0.7, 0.7))
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "CTCFEL_0h", "CTCFEL_6h", 
+                                            "CTCFEL_24h", "CTCFEL_96h"), 
+                                          ylim = c(-0.7, 0.7))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+PlotBordersWithConfidenceIntervals(tib_damid, 
+                                   c("PT_0h", "CTCFNQ_0h", "CTCFNQ_6h", 
+                                     "CTCFNQ_24h", "CTCFNQ_96h"))
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "WAPL_0h", "WAPL_6h", 
+                                            "WAPL_24h", "WAPL_96h"),
+                                          ylim = c(-0.95, 0.6))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "CTCFWAPL_0h", "CTCFWAPL_6h", 
+                                            "CTCFWAPL_24h", "CTCFWAPL_96h"),
+                                          ylim = c(-0.95, 0.6))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "RAD21_0h", "RAD21_6h", 
+                                            "RAD21_24h"),
+                                          ylim = c(-0.95, 0.6))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tib_stat %>% 
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05) %>%
+  print(n = 40)
+
+# CTCF + orientation vs non-CTCF
+tib_stat <- tibble()
+
+PlotBordersWithConfidenceIntervals(tib_damid, 
+                                   c("PT_0h"),
+                                   group = "border_ctcf_strand",
+                                   ylim = c(-0.80, 0.80),
+                                   keep_PT = T)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "PT_24h"),
+                                          group = "border_ctcf_strand",
+                                          ylim = c(-0.80, 0.80),
+                                          keep_PT = T)
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "CTCFEL_0h", "CTCFEL_6h", 
+                                            "CTCFEL_24h", "CTCFEL_96h"),
+                                          group = "border_ctcf_strand",
+                                          ylim = c(-0.80, 0.80))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+PlotBordersWithConfidenceIntervals(tib_damid, 
+                                   c("PT_0h", "CTCFNQ_0h", "CTCFNQ_6h", 
+                                     "CTCFNQ_24h", "CTCFNQ_96h"),
+                                   group = "border_ctcf_strand",
+                                   ylim = c(-0.80, 0.80))
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "WAPL_0h", "WAPL_6h", 
+                                            "WAPL_24h", "WAPL_96h"),
+                                          group = "border_ctcf_strand",
+                                          ylim = c(-1.05, 0.75))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "CTCFWAPL_0h", "CTCFWAPL_6h", 
+                                            "CTCFWAPL_24h", "CTCFWAPL_96h"),
+                                          group = "border_ctcf_strand",
+                                          ylim = c(-1.05, 0.75))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "RAD21_0h", "RAD21_6h", 
+                                            "RAD21_24h"),
+                                          group = "border_ctcf_strand",
+                                          ylim = c(-1.05, 0.75))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tib_stat %>% 
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05) %>%
+  print(n = 40) 
+
+# Plot counts
+PlotBordersWithConfidenceIntervals(tib_damid_lmnb1, 
+                                   c("PT_0h", "CTCFEL_0h", "CTCFEL_6h", 
+                                     "CTCFEL_24h", "CTCFEL_96h"),
+                                   ylim = c(0, 7))
+
+PlotBordersWithConfidenceIntervals(tib_damid_dam, 
+                                   c("PT_0h", "CTCFEL_0h", "CTCFEL_6h", 
+                                     "CTCFEL_24h", "CTCFEL_96h"),
+                                   ylim = c(0, 7))
+
+
+PlotBordersWithConfidenceIntervals(tib_damid_lmnb1, 
+                                   c("PT_0h", "WAPL_0h", "WAPL_6h", 
+                                     "WAPL_24h", "WAPL_96h"),
+                                   ylim = c(0, 7))
+
+PlotBordersWithConfidenceIntervals(tib_damid_dam, 
+                                   c("PT_0h", "WAPL_0h", "WAPL_6h", 
+                                     "WAPL_24h", "WAPL_96h"),
+                                   ylim = c(0, 7))
+
+PlotBordersWithConfidenceIntervals(tib_damid_lmnb1, 
+                                   c("PT_0h", "CTCFWAPL_0h", "CTCFWAPL_6h", 
+                                     "CTCFWAPL_24h", "CTCFWAPL_96h"),
+                                   ylim = c(0, 7))
+
+PlotBordersWithConfidenceIntervals(tib_damid_dam, 
+                                   c("PT_0h", "CTCFWAPL_0h", "CTCFWAPL_6h", 
+                                     "CTCFWAPL_24h", "CTCFWAPL_96h"),
+                                   ylim = c(0, 7))
+
+
+PlotBordersWithConfidenceIntervals(tib_damid_lmnb1, 
+                                   c("PT_0h", "RAD21_0h", "RAD21_6h", 
+                                     "RAD21_24h"),
+                                   ylim = c(0, 7))
+
+PlotBordersWithConfidenceIntervals(tib_damid_dam, 
+                                   c("PT_0h", "RAD21_0h", "RAD21_6h", 
+                                     "RAD21_24h"),
+                                   ylim = c(0, 7))
+
+
+```
+
+```{r lad borders with 96h, fig.width = 5, fig.height = 10, warning = F, message = F, cache = T}
+
+# CTCF vs non-CTCF
+PlotBordersWithConfidenceIntervals(tib_damid, filter_96h = F, 
+                                   c("PT_0h", "CTCFEL_0h", "CTCFEL_6h", 
+                                     "CTCFEL_24h", "CTCFEL_96h"))
+
+PlotBordersWithConfidenceIntervals(tib_damid, filter_96h = F, 
+                                   c("PT_0h", "WAPL_0h", "WAPL_6h", 
+                                     "WAPL_24h", "WAPL_96h"))
+
+PlotBordersWithConfidenceIntervals(tib_damid, filter_96h = F, 
+                                   c("PT_0h", "CTCFWAPL_0h", "CTCFWAPL_6h", 
+                                     "CTCFWAPL_24h", "CTCFWAPL_96h"))
+
+# With CTCF orientation
+PlotBordersWithConfidenceIntervals(tib_damid, filter_96h = F, 
+                                   c("PT_0h", "CTCFEL_0h", "CTCFEL_6h", 
+                                     "CTCFEL_24h", "CTCFEL_96h"),
+                                   group = "border_ctcf_strand",
+                                   ylim = c(-0.95, 0.80))
+
+PlotBordersWithConfidenceIntervals(tib_damid, filter_96h = F, 
+                                   c("PT_0h", "WAPL_0h", "WAPL_6h", 
+                                     "WAPL_24h", "WAPL_96h"),
+                                   group = "border_ctcf_strand",
+                                   ylim = c(-0.95, 0.80)) 
+
+PlotBordersWithConfidenceIntervals(tib_damid, filter_96h = F, 
+                                   c("PT_0h", "CTCFWAPL_0h", "CTCFWAPL_6h", 
+                                     "CTCFWAPL_24h", "CTCFWAPL_96h"),
+                                   group = "border_ctcf_strand",
+                                   ylim = c(-0.95, 0.80))
+
+```
+
+As mentioned, also plot borders with multiple CTCF sites.
+
+```{r load borders with multiple CTCF sites, fig.width = 5, fig.height = 10, warning = F, message = F, cache = T}
+
+# CTCF + number vs non-CTCF
+tib_stat <- tibble()
+
+PlotBordersWithConfidenceIntervals(tib_damid, 
+                                   c("PT_0h"),
+                                   group = "border_ctcf_n",
+                                   ylim = c(-1.25, 0.90),
+                                   keep_PT = T)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid,  
+                                          c("PT_0h", "PT_24h"),
+                                          group = "border_ctcf_n",
+                                          ylim = c(-1.25, 0.90),
+                                          keep_PT = T)
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "CTCFEL_0h", "CTCFEL_6h", 
+                                            "CTCFEL_24h", "CTCFEL_96h"),
+                                          group = "border_ctcf_n",
+                                          ylim = c(-1.25, 0.90))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "WAPL_0h", "WAPL_6h", 
+                                            "WAPL_24h", "WAPL_96h"),
+                                          group = "border_ctcf_n",
+                                          ylim = c(-1.25, 0.90))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "CTCFWAPL_0h", "CTCFWAPL_6h", 
+                                            "CTCFWAPL_24h", "CTCFWAPL_96h"),
+                                          group = "border_ctcf_n",
+                                          ylim = c(-1.25, 0.90))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tmp <- PlotBordersWithConfidenceIntervals(tib_damid, 
+                                          c("PT_0h", "RAD21_0h", "RAD21_6h", 
+                                            "RAD21_24h"),
+                                          group = "border_ctcf_n",
+                                          ylim = c(-1.25, 0.90))
+tib_stat <- bind_rows(tib_stat, tmp)
+
+tib_stat %>% 
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05) %>%
+  print(n = 40)
+
+```
+
+Good.
+
+
+
+### 4. Save data
+
+
+```{r save data}
+
+saveRDS(metadata.damid, 
+        file.path(output.dir, "metadata_damid.rds"))
+saveRDS(damid, 
+        file.path(output.dir, "damid.rds"))
+saveRDS(bin.size, 
+        file.path(output.dir, "bin_size.rds"))
+
+# Also, as tsv file
+tib_damid <- as_tibble(damid) %>%
+  dplyr::select(-width, -strand) %>%
+  dplyr::select(-contains("CTCF_"), -contains("CTCFNQ_"))
+print(names(tib_damid))
+
+tib_damid <- tib_damid  %>%
+  rename_all(function(x) str_replace(x, "CTCFEL", "CTCF")) 
+print(names(tib_damid))
+
+write_tsv(tib_damid,
+          file.path(output.dir, "damid_average_replicates.tsv"))
+
+# Also, for replicates individually
+damid_replicates <- as_tibble(damid_replicates) %>%
+  dplyr::select(-width, -strand, 
+                -contains("NQ"))
+print(names(damid_replicates))
+
+damid_replicates <- damid_replicates %>%
+  rename_all(~ c("seqnames", "start", "end",
+                 "PT_0h_r1", "PT_0h_r2",
+                 "PT_24h_r1", "PT_24h_r2",
+                 "CTCF_0h_r1", "CTCF_0h_r2",
+                 "CTCF_6h_r1", "CTCF_6h_r2",
+                 "CTCF_24h_r1", "CTCF_24h_r2",
+                 "CTCF_96h_r1", "CTCF_96h_r2",
+                 "WAPL_0h_r1", "WAPL_0h_r2", "WAPL_0h_r3",
+                 "WAPL_6h_r1", "WAPL_6h_r2", "WAPL_6h_r3",
+                 "WAPL_24h_r1", "WAPL_24h_r2", "WAPL_24h_r3",
+                 "WAPL_96h_r1", "WAPL_96h_r2", "WAPL_96h_r3",
+                 "CTCFWAPL_0h_r1", "CTCFWAPL_0h_r2", 
+                 "CTCFWAPL_0h_r3", "CTCFWAPL_0h_r4",
+                 "CTCFWAPL_6h_r1", "CTCFWAPL_6h_r2", 
+                 "CTCFWAPL_6h_r3", "CTCFWAPL_6h_r4",
+                 "CTCFWAPL_24h_r1", 
+                 "CTCFWAPL_24h_r3", "CTCFWAPL_24h_r4",
+                 "CTCFWAPL_96h_r1", "CTCFWAPL_96h_r2", 
+                 "CTCFWAPL_96h_r3",
+                 "RAD21_0h_r1", "RAD21_0h_r2",
+                 "RAD21_6h_r1", "RAD21_6h_r2",
+                 "RAD21_24h_r1", "RAD21_24h_r2"))
+print(names(damid_replicates))
+
+write_tsv(damid_replicates,
+          file.path(output.dir, "damid_individual_replicates.tsv"))
+
+```
+
+
+### Conclusion
+
+CTCF depletion and the other depletion do not have very strong effects on LAD
+border positioning. I can see effects outside the borders overlapping with the
+CTCF site.
+
+Also, this document veries reproducibility between replicate experiments and 
+PCA plots summarize the global trends.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,1229 @@
+---
+title: "DamID LAD changes versus various features"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+I have previously correlated DamID changes of LADs with size and score. Here,
+I will extend these comparisons with more features. Including:
+
+  (1. LAD score)
+  2. LAD size
+  3. (Active) gene density
+  4. CTCF density
+  5. Distance to centromeres (left arm)
+  6. Distance to telomeres (right arm)
+  7. Local LAD density
+  8. ...
+
+
+### Method
+
+Generate a heatmap with spearman correlations. I might change this into 
+something more sophisticated later to account for feature correlations, for 
+example linear modeling.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(broom))
+suppressPackageStartupMessages(library(corrr))
+suppressPackageStartupMessages(library(RColorBrewer))
+suppressPackageStartupMessages(library(ggrastr))
+
+# Prepare output 
+output.dir <- "ts220113_LAD_changes_versus_features"
+dir.create(output.dir, showWarnings = FALSE)
+
+# Load input
+input.dir <- "ts220113_DamID_changes_versus_LAD_size_and_score"
+gr_LADs_list <- readRDS(file.path(input.dir, "LADs_list.rds"))
+gr_LAD_consensus <- readRDS(file.path(input.dir, "LADs_consensus.rds"))
+
+gr_ctcf <- import("Data_NQ/ChIP_NQ/CohesinFactors/2_Wapl-0D-antiCtcf_sampleOnly_peaks.narrowPeak")
+
+input.dir <- "ts220113_GeneExpression"
+gr_genes <- readRDS(file.path(input.dir, "genes.rds"))
+tib_genes <- readRDS(file.path(input.dir, "genes_fpkm_mean.rds"))
+
+input.dir <- "ts220113_effect_of_CTCF_depletion_on_LAD_borders"
+gr_damid <- readRDS(file.path(input.dir, "damid.rds"))
+tib_metadata <- readRDS(file.path(input.dir, "metadata_damid.rds"))
+
+```
+
+Prepare knitr.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, cache = T,
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output.dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+Functions.
+
+```{r functions}
+
+
+
+```
+
+
+### 1. Get all parameters
+
+First,  I will add all the features to the LADs.
+
+```{r add consensus to LAD list for now}
+
+gr_LADs_list <- c(gr_LADs_list, list(consensus = gr_LAD_consensus))
+
+```
+
+
+#### 1.1 LAD score
+
+This is already included in the LAD list: the first column.
+
+```{r lad score, cache = T}
+
+gr_LADs_list <- purrr::map(gr_LADs_list,
+                           function(x) {
+                             #x$score <- mcols(x)[, 1]
+                             x
+                           })
+
+```
+
+
+#### 1.2 LAD size
+
+Size in bases. In log2 with a pseudocount of 1.
+
+```{r lad size, cache = T}
+
+gr_LADs_list <- purrr::map(gr_LADs_list,
+                           function(x) {
+                             x$size <- log2(width(x) + 1)
+                             x
+                           })
+
+```
+
+
+#### 1.3 Active gene density
+
+Active genes > 1 FPKM. Count overlap, irrespective of gene length.
+In log2 with a pseudocount of 1.
+
+```{r active gene density, cache = T}
+
+# Extend
+extend <- 0e5
+
+# Determine active genes
+cutoff <- 1
+idx <- tib_genes$WT_0h > cutoff
+genes.active <- gr_genes[idx]
+genes.inactive <- gr_genes[! idx]
+
+gr_LADs_list <- purrr::map(gr_LADs_list,
+                           function(x) {
+                             # Get number of overlapping genes 
+                             # - including 1 base overlap
+                             x.extend <- x
+                             start(x.extend) <- start(x) - extend
+                             end(x.extend) <- end(x) + extend
+                             tmp <- countOverlaps(x.extend, genes.active,
+                                                  ignore.strand = T)
+                             # Convert to number / Mb - active genes
+                             tmp <- tmp / (width(x)/1e6)
+                             x$active_gene_density <- log2(tmp + 1)
+                             # tmp <- countOverlaps(x.extend, genes.inactive,
+                             #                      ignore.strand = T)
+                             # # Convert to number / Mb - inactive genes
+                             # tmp <- tmp / (width(x)/1e6)
+                             # x$inactive_gene_density <- log2(tmp + 1)
+                             x
+                           })
+
+```
+
+
+#### 1.4 CTCF density
+
+CTCF peak density, in log2 with a pseudocount of 1.
+
+```{r ctcf density, cache = T}
+
+# Determine strong ctcf peaks
+#gr_ctcf_filtered <- gr_ctcf[gr_ctcf$score > 100]
+gr_ctcf_filtered <- gr_ctcf
+
+gr_LADs_list <- purrr::map(gr_LADs_list,
+                           function(x) {
+                             # Get number of overlapping peaks 
+                             # - including 1 base overlap
+                             x.extend <- x
+                             start(x.extend) <- start(x) - extend
+                             end(x.extend) <- end(x) + extend
+                             tmp <- countOverlaps(x.extend, gr_ctcf_filtered, 
+                                                  ignore.strand = T)
+                             # Convert to number / Mb
+                             tmp <- tmp / (width(x)/1e6)
+                             x$ctcf_density <- log2(tmp + 1)
+                             x
+                           })
+
+```
+
+
+#### 1.5 Distance to centromeres
+
+Distance to centromere (first base of the genome). Use middle of LADs to 
+determine distance. Distance in Mb.
+
+```{r distance to centromeres, cache = T}
+
+gr_LADs_list <- purrr::map(gr_LADs_list,
+                           function(x) {
+                             x.mid <- x
+                             start(x.mid) <- end(x.mid) <- (start(x.mid) + end(x.mid))/2
+                             x$distance_to_centromere <- start(x.mid) / 1e6
+                             x
+                           })
+
+```
+
+
+#### 1.6 Distance to telomeres
+
+Distance to centromere (last base of the genome). Use middle of LADs to 
+determine distance. Distance in Mb.
+
+```{r distance to telomeres, cache = T}
+
+gr_chromosome <- read_tsv("~/mydata/data/genomes/mm10/mm10.chrom.sizes", 
+                          col_names = c("seqnames", "start")) %>%
+  mutate(end = start) %>%
+  as(., "GRanges")
+
+gr_LADs_list <- purrr::map(gr_LADs_list,
+                           function(x) {
+                             x.mid <- x
+                             start(x.mid) <- end(x.mid) <- (start(x.mid) + end(x.mid))/2
+                             dis <- distanceToNearest(x.mid, gr_chromosome)
+                             x$distance_to_telomere <- mcols(dis)$distance / 1e6
+                             x
+                           })
+
+```
+
+
+#### 1.7 Local LAD density
+
+This one is the most difficult. What is "local" here, should I count weak
+LADs as much as strong LADs and should I include the LAD itself? For now, I 
+will take a random size around each LAD (say, 15Mb) and simply count LADs.
+
+```{r local lad density, cache = T}
+
+# Get bins
+idx <- which(rowSums(! is.na(as_tibble(mcols(gr_damid)))) > 0)
+bins <- gr_damid[idx]
+mcols(bins) <- NULL
+
+gr_LADs_list <- purrr::map(gr_LADs_list,
+                           function(x) {
+                             x.extend <- resize(x, 30e6, fix = "center")
+                             # Get LAD bins
+                             bins.lads <- bins[bins %over% x]
+                             ovl.all <- countOverlaps(x.extend, bins)
+                             ovl.bins <- countOverlaps(x.extend, bins.lads)
+                             
+                             x$local_lad_density <- ovl.bins / ovl.all
+                             x
+                           })
+
+```
+
+
+#### 1.8 Chromosome size
+
+Size of the chromosomes.
+
+```{r chromosome size, cache = T}
+
+# Chromosome size
+chrom_sizes <- read_tsv("~/mydata/data/genomes/mm10/mm10.chrom.sizes",
+                        col_names = c("seqnames", "length"))
+
+gr_LADs_list <- purrr::map(gr_LADs_list,
+                           function(x) {
+                             idx <- match(as.character(seqnames(x)), 
+                                          chrom_sizes$seqnames)
+                             x$chrom_size <- chrom_sizes$length[idx] / 1e6
+                             x
+                           })
+
+```
+
+
+#### 1.9 Histone modifications
+
+Average histone modifications for the LADs.
+
+```{r histone modifications, cache = T, message = F, warning = F}
+
+# Prepare output directory
+bedfile.dir <- file.path(output.dir, "bed_files")
+dir.create(bedfile.dir, showWarnings = F)
+
+deeptools.dir <- file.path(output.dir, "deeptools")
+dir.create(deeptools.dir, showWarnings = F)
+
+# Prepare histone modifications
+track_dir <- "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/HistoneModifications/Public_2i_ChIP/"
+
+tracks <- grep("H3K27me1|H3K27me2|H3K9me3", 
+               dir(track_dir, full.names = T, pattern = "E14_2i"),
+               value = T, invert = T)
+
+track_names <- str_remove(str_remove(basename(tracks),
+                                     "E14_2i_"), "_.*")
+
+
+# Coverage over LADs
+gr_LADs_list <- purrr::map(names(gr_LADs_list),
+                           function(x) {
+                             
+                             # Prepare bed file
+                             gr_x <- gr_LADs_list[[x]]
+                             bed_x <- file.path(bedfile.dir, paste0(x, ".bed"))
+                             export.bed(gr_x, bed_x)
+                             output_base_x <- file.path(deeptools.dir, x)
+                             
+                             # Calculate coverage
+                             deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/multiBigwigSummary",
+                                                     "BED-file",
+                                                     "-b", paste(tracks, collapse = " "),
+                                                     "--BED", bed_x,
+                                                     "--outFileName", paste0(output_base_x, ".npz"),
+                                                     "--outRawCounts", paste0(output_base_x, ".tab"))
+                             
+                             system(deeptools_call)
+                             
+                             # Read scores
+                             tib_x <- read_tsv(paste0(output_base_x, ".tab"),
+                                               comment = "#",
+                                               col_names = c("seqnames", "start", "end",
+                                                             track_names)) %>%
+                               dplyr::select(-seqnames, -start, -end)
+                             
+                             mcols(gr_x) <- bind_cols(as_tibble(mcols(gr_x)),
+                                                      tib_x)
+                             
+                             # Save data
+                             gr_LADs_list[[x]] <- gr_x
+                             
+                           })
+
+```
+
+
+#### 1.x Correlation between features
+
+I have now gathered all kinds of features. For interpretation, it's useful to 
+know correlations between them, to prevent wrong interpretation. Use the 
+customized ggpairs for this. Only for one set of LADs : CTCF-WAPL.
+
+```{r correlation between features, cache = T, fig.width = 8, fig.height = 8, warning = F, message = F}
+
+# From Fede:
+# ggpairs custom functions
+corColor <- function(data, mapping, color = I("black"), sizeRange = c(1, 3), ...) {
+
+  x   <- eval_data_col(data, mapping$x)
+  y   <- eval_data_col(data, mapping$y)
+  r   <- cor(x, y, method = "spearman")
+  #rt  <- format(r, digits = 3)
+  rt  <- format(round(r, 2), nsmall = 2)
+  tt  <- as.character(rt)
+  cex <- max(sizeRange)
+
+  # helper function to calculate a useable size
+  percent_of_range <- function(percent, range) {
+    percent * diff(range) + min(range, na.rm = TRUE)
+  }
+
+  # plot correlation coefficient
+  p <- ggally_text(label = tt, mapping = aes(), xP = 0.5, yP = 0.5,
+                   # size = I(percent_of_range(cex * abs(r), sizeRange)), 
+                   size = 6, 
+                   color = color, ...) +
+    theme(panel.grid.minor=element_blank(),
+          panel.grid.major=element_blank())
+
+  corColors <- RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")[2:6]
+
+  if (r <= boundaries[1]) {
+    corCol <- corColors[1]
+  } else if (r <= boundaries[2]) {
+    corCol <- corColors[2]
+  } else if (r < boundaries[3]) {
+    corCol <- corColors[3]
+  } else if (r < boundaries[4]) {
+    corCol <- corColors[4]
+  } else {
+    corCol <- corColors[5]
+  }
+
+  p <- p +
+    theme(panel.background = element_rect(fill = corCol))
+
+  return(p)
+}
+
+customScatter <- function (data, mapping) 
+{
+    p <- ggplot(data = data, mapping) + 
+      rasterize(geom_point(alpha = 0.1, size = 0.5,
+                           shape = 20),
+                dpi = 300) +
+      #geom_smooth(method = "lm", se = T, col = "red") +
+      theme_bw()
+    
+    p 
+}
+
+
+# Levels to plot
+feature_levels <- c("score", 
+                    "size", "ctcf_density", "active_gene_density", 
+                    "inactive_gene_density", 
+                    #"H3K4me1", "H3K27ac", 
+                    "H3K27me3", "H3K9me2",
+                    "local_lad_density", 
+                    "distance_to_centromere", "distance_to_telomere", 
+                    "chrom_size")
+
+
+# Prepare data frame, remove NAs for now
+tib <- as_tibble(mcols(gr_LADs_list[[1]])) %>%
+  dplyr::select(-matches("_[0-9]+h"))
+
+# Use GGally to make correlation plots
+boundaries <- seq(from = -0.3, to = 0.3, length.out = 4)
+
+set.seed(1)
+plt <- ggpairs(tib %>% 
+                 drop_na() %>%
+                 dplyr::select(one_of(feature_levels)),
+               upper = list(continuous = corColor),
+               lower = list(continuous = customScatter),
+               diag = list(continuous = function(data, mapping, ...) {
+                   ggally_densityDiag(data = data, mapping = mapping, alpha = 0.3, fill = "red") +
+                   theme_bw()})) +
+  ggtitle("Correlations LAD features") +
+  xlab("") +
+  ylab("")
+
+print(plt)
+
+# # Repeat, only LADs with size > 2e5
+# plt <- ggpairs(tib[width(gr_LADs_list[[1]]) > 2e5, ] %>% drop_na(),
+#                upper = list(continuous = corColor),
+#                lower = list(continuous = customScatter),
+#                diag = list(continuous = function(data, mapping, ...) {
+#                    ggally_densityDiag(data = data, mapping = mapping, alpha = 0.3, fill = "red") +
+#                    theme_bw()})) +
+#   ggtitle("Correlations LAD features") +
+#   xlab("") +
+#   ylab("")
+# 
+# print(plt)
+
+```
+
+As supplementary figure, this will show that most features are mostly 
+uncorrelated.
+
+Finally, select the consensus model LAD definition. This is the only important
+model.
+
+```{r remove consensus LAD model}
+
+gr_LAD_consensus <- gr_LADs_list[[length(gr_LADs_list)]]
+gr_LADs_list <- gr_LADs_list[-length(gr_LADs_list)]
+
+
+```
+
+
+### 2. Correlations
+
+Now, I want to correlate everything. Include a scatterplot for every
+correlation. Use the Kendall Tau correlation, which is supposedly better at 
+handling ties: https://stackoverflow.com/questions/10711395/spearman-correlation-and-ties.
+
+Instead, I decided to use the Spearman correlation, which may be less suited
+but much more widely-used and appreciated.
+
+```{r correlations, cache = T, fig.width = 10, fig.height = 8}
+
+# Change feature levels
+feature_levels <- rev(feature_levels)
+
+Correlations <- function(gr, make_plot = T, min_width = 2e5) {
+  
+  # Prepare tibble - gathered
+  #gr_filtered <- gr[width(gr) > min_width]
+  #gr_filtered <- gr[gr$active_gene_density != 0 & gr$ctcf_density != 0]
+  
+  tib <- as_tibble(mcols(gr)) %>%
+    rename_at(1, ~ "t_0h") %>%
+    mutate_at(vars(matches("_[0-9]+h")), function(x) x - .$t_0h) %>%
+    dplyr::select(-1) %>%
+    gather(key_timepoint, timepoint_score, matches("_[0-9]+h")) %>%
+    gather(key_feature, feature_score, -contains("timepoint")) %>%
+    filter(key_feature %in% feature_levels) %>%
+    mutate(key_timepoint = factor(key_timepoint, levels = unique(key_timepoint)),
+           key_feature = factor(key_feature, levels = feature_levels))
+  
+  # tib_filtered <- as_tibble(mcols(gr_filtered)) %>%
+  #   rename_at(1, ~ "t_0h") %>%
+  #   mutate_at(vars(matches("_[0-9]+h")), function(x) x - .$t_0h) %>%
+  #   dplyr::select(-1) %>%
+  #   gather(key_timepoint, timepoint_score, matches("_[0-9]+h")) %>%
+  #   gather(key_feature, feature_score, -contains("timepoint")) %>%
+  #   mutate(key_timepoint = factor(key_timepoint, levels = unique(key_timepoint)),
+  #          key_feature = factor(key_feature, levels = feature_levels))
+  
+  # Prepare plot
+  plt <- tib %>%
+    mutate(key_feature = factor(key_feature, 
+                                levels = rev(levels(key_feature)))) %>%
+    ggplot(aes(x = feature_score, y = timepoint_score)) +
+    geom_point(size = 0.15) +
+    geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+    geom_smooth(method = "lm", col = "red") +
+    facet_grid(key_timepoint ~ key_feature, scales = "free_x") +
+    xlab("Feature score") +
+    ylab("DamID difference (z-score)") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  if (make_plot) {
+    plot(plt)
+  }
+  
+  # Prepare correlations
+  tib_summary <- tib %>%
+  #tib_summary <- tib_filtered %>%
+    #filter(! grepl("gene|ctcf", key_feature)) %>%
+    group_by(key_feature, key_timepoint) %>%
+    dplyr::summarize(cor = cor(feature_score, timepoint_score, 
+                               method = "spearman", use = "complete.obs"),
+                     pvalue = cor.test(feature_score, timepoint_score, 
+                                       method = "spearman", 
+                                       use = "complete.obs")$p.value) %>%
+    ungroup() %>%
+    mutate(key_timepoint = as.character(key_timepoint))
+  
+  # # Process gene / ctcf density separately - only meaningful for bigger LADs 
+  # tib_summary_filtered <- tib_filtered %>%
+  #   filter(grepl("gene|ctcf", key_feature)) %>%
+  #   group_by(key_feature, key_timepoint) %>%
+  #   dplyr::summarize(cor = cor(feature_score, timepoint_score, 
+  #                              method = "kendall", use = "complete.obs"),
+  #                    pvalue = cor.test(feature_score, timepoint_score, 
+  #                                      method = "kendall", 
+  #                                      use = "complete.obs")$p.value) %>%
+  #   ungroup() %>%
+  #   mutate(key_timepoint = as.character(key_timepoint))
+  
+  #tib_summary <- bind_rows(tib_summary, tib_summary_filtered)
+  tib_summary
+  
+}
+
+# Get all correlations
+tib_correlations <- purrr::reduce(purrr::map(gr_LADs_list, Correlations),
+                                  bind_rows)
+
+ 
+```
+
+Plot the correlation matrix.
+
+```{r plot correlations, cache = T, fig.width = 6, fig.height = 3.5}
+
+# Process correlations 
+tib_correlations <- tib_correlations %>%
+  mutate(pvalue = p.adjust(pvalue, method = "BH")) %>%
+  separate(key_timepoint, c("condition", "timepoint"), remove = F) %>%
+  mutate(condition = factor(condition, levels = levels(tib_metadata$condition)),
+         timepoint = factor(timepoint, levels = levels(tib_metadata$timepoint))) %>%
+  arrange(condition, timepoint, key_feature) %>%
+  mutate(key_timepoint = factor(key_timepoint, levels = unique(key_timepoint))) %>%
+  filter(! condition %in% c("CTCFNQ", "CTCF"),
+         ! key_feature %in% c("score", "inactive_gene_density"))
+ 
+# Plot
+cor_max <- max(abs(tib_correlations$cor))*1.2
+
+plt <- tib_correlations %>%
+  ggplot(aes(x = key_timepoint, y = key_feature, fill = cor)) +
+  geom_tile() +
+  geom_text(aes(label = ifelse(pvalue < 0.05, "*", ""))) +
+  xlab("") +
+  ylab("") +
+  coord_equal() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       limits = c(-cor_max, cor_max)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+# Plot without 96h
+plt <- tib_correlations %>%
+  filter(! timepoint %in% "96h") %>%
+  ggplot(aes(x = key_timepoint, y = key_feature, fill = cor)) +
+  geom_tile() +
+  geom_text(aes(label = ifelse(pvalue < 0.05, "*", ""))) +
+  xlab("") +
+  ylab("") +
+  coord_equal() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       limits = c(-cor_max, cor_max)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+# Add numbers and shade p-values (reviewer 2)
+plt <- tib_correlations %>%
+  filter(! timepoint %in% "96h") %>%
+  ggplot(aes(x = key_timepoint, y = key_feature, fill = cor)) +
+  geom_tile(aes(color = ifelse(pvalue < 0.05, "*", ""))) +
+  geom_text(aes(label = round(cor, 2)),
+            size = 2) +
+  xlab("") +
+  ylab("") +
+  coord_equal() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       limits = c(-cor_max, cor_max)) +
+  scale_color_manual(values = c("white", "black")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+plt <- tib_correlations %>%
+  filter(! timepoint %in% "96h") %>%
+  ggplot(aes(x = key_timepoint, y = key_feature, fill = cor)) +
+  geom_tile() +
+  geom_text(aes(label = round(cor, 2),
+                color = pvalue < 0.05),
+            size = 2) +
+  xlab("") +
+  ylab("") +
+  coord_equal() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                       limits = c(-cor_max, cor_max)) +
+  scale_color_manual(values = c("grey80", "grey20")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+
+
+```
+
+Various ways of plotting. The last is the best.
+
+
+### 3. Linear model
+
+As I showed in the previous plots, a combination of (partially correlating)
+features explain the effects. Here, I will try simple linear modeling and see
+how much I can explain.
+
+```{r linear model, cache = T, fig.width = 6, fig.height = 3.5, eval = T}
+ 
+lmp <- function (modelobject) {
+  if (class(modelobject) != "lm") stop("Not an object of class 'lm' ")
+  f <- summary(modelobject)$fstatistic
+  p <- pf(f[1],f[2],f[3],lower.tail=F)
+  attributes(p) <- NULL
+  return(p)
+}
+
+LinearModeling <- function(gr, make_plot = T, min_width = 2e5) {
+  
+  # Prepare tibble - gathered
+  tib <- as_tibble(mcols(gr)) %>%
+    rename_at(1, ~ "t_0h") %>%
+    mutate_at(vars(matches("_[0-9]+h")), function(x) x - .$t_0h) %>%
+    dplyr::select(-1) %>%
+    gather(key_timepoint, timepoint_score, matches("_[0-9]+h")) %>%
+    mutate(key_timepoint = factor(key_timepoint, levels = unique(key_timepoint)))
+  
+  # Prepare linear models
+  tib_lm <- tib %>%
+    group_by(key_timepoint) %>%
+    nest() %>%
+    mutate(fit = map(data, ~ lm(timepoint_score ~ size +
+                                  active_gene_density +
+                                  #inactive_gene_density +
+                                  ctcf_density + 
+                                  distance_to_centromere +
+                                  distance_to_telomere + 
+                                  local_lad_density,
+                                  #chrom_size + 
+                                  #H3K4me1 +
+                                  #H3K27me3 +
+                                  #H3K9me2, 
+                                data = .x)),
+           tidied = map(fit, tidy))
+  
+  tib_explained <- tib_lm %>%
+    mutate(summary = map(fit, summary),
+           rsquared = map(summary, function(x) x$adj.r.squared),
+           pvalue = map(fit, lmp)) %>%
+    unnest(rsquared, pvalue) %>%
+    dplyr::select(rsquared, pvalue, key_timepoint) %>%
+    mutate(key_timepoint = as.character(key_timepoint))
+  
+  tib_features <- tib_lm %>%
+    unnest(tidied) %>%
+    mutate(key_timepoint = as.character(key_timepoint))
+  
+  list(tib_explained, tib_features)
+  
+}
+
+# Get all linear models
+list_linear_models <- purrr::map(gr_LADs_list, LinearModeling)
+
+tib_linear_models_explained <- purrr::reduce(lapply(list_linear_models, 
+                                                    function(x) x[[1]]),
+                                             bind_rows) %>%
+  ungroup() %>%
+  separate(key_timepoint, c("condition", "timepoint"), remove = F) %>%
+  filter(! condition %in% c("CTCFNQ", "CTCF")) %>%
+  mutate(key_timepoint = factor(key_timepoint, levels = unique(key_timepoint)),
+         condition = factor(condition, levels = c("CTCFEL", "RAD21",
+                                                  "WAPL", "CTCFWAPL")),
+         timepoint = factor(timepoint, levels = c("6h", "24h", "96h")))
+
+tib_linear_models_features <- purrr::reduce(lapply(list_linear_models, 
+                                                   function(x) x[[2]]),
+                                            bind_rows) %>%
+  dplyr::select(-data, -fit) %>%
+  ungroup() %>%
+  separate(key_timepoint, c("condition", "timepoint"), remove = F) %>%
+  filter(! condition %in% c("CTCFNQ", "CTCF")) %>%
+  mutate(key_timepoint = factor(key_timepoint, levels = unique(key_timepoint)),
+         condition = factor(condition, levels = c("CTCFEL", "RAD21",
+                                                  "WAPL", "CTCFWAPL")),
+         timepoint = factor(timepoint, levels = c("6h", "24h", "96h")),
+         term = factor(term, levels = feature_levels))
+
+# Plot Rsquared and p-values
+plt <- tib_linear_models_explained %>%
+  filter(timepoint != "96h") %>%
+  ggplot(aes(x = key_timepoint, y = rsquared, fill = condition)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Dark2") +
+  xlab("") +
+  ylab("R-squared") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+plt <- tib_linear_models_explained %>%
+  filter(timepoint != "96h") %>%
+  ggplot(aes(x = key_timepoint, y = -log10(pvalue), fill = condition)) +
+  geom_bar(stat = "identity") +
+  scale_fill_brewer(palette = "Dark2") +
+  xlab("") +
+  ylab("-log10(p-value)") +
+  scale_y_log10() +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+# Create heatmap with all features and their significance
+plt <- tib_linear_models_features %>%
+  filter(! timepoint %in% "96h",
+         term != "(Intercept)") %>%
+  ggplot(aes(x = key_timepoint, y = term, 
+             fill = -log10(p.value) * ifelse(estimate > 0, 1, -1))) +
+  geom_tile() +
+  geom_text(aes(label = ifelse(p.value < 0.05, "*", ""))) +
+  xlab("") +
+  ylab("") +
+  coord_equal() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, name = "-log10(p-value)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+```
+
+It looks good, but is too complicated. The actual correlations are more 
+transparent.
+
+
+### 4. Plots consensus model
+
+Something I should have done before: are the differences between the depletion
+experiments similar? 
+
+```{r correlation plot consensus model, fig.width = 10, fig.height = 5.5}
+
+# Get consensus data + calculate differences
+tib <- as_tibble(mcols(gr_LAD_consensus)) %>%
+  mutate(idx = 1:nrow(.),
+         seqnames = as.character(seqnames(gr_LAD_consensus)),
+         seqnames = factor(seqnames, unique(seqnames))) %>%
+  mutate(PT_24h_diff = PT_24h - PT_0h,
+         CTCFEL_6h_diff = CTCFEL_6h - CTCFEL_0h,
+         CTCFEL_24h_diff = CTCFEL_24h - CTCFEL_0h,
+         RAD21_6h_diff = RAD21_6h - RAD21_0h,
+         RAD21_24h_diff = RAD21_24h - RAD21_0h,
+         WAPL_6h_diff = WAPL_6h - WAPL_0h,
+         WAPL_24h_diff = WAPL_24h - WAPL_0h,
+         CTCFWAPL_6h_diff = CTCFWAPL_6h - CTCFWAPL_0h,
+         CTCFWAPL_24h_diff = CTCFWAPL_24h - CTCFWAPL_0h)
+
+
+# GGpairs
+boundaries <- seq(from = 0, to = 0.7, length.out = 4)
+
+plt <- ggpairs(tib %>%
+                 dplyr::select(contains("diff")) %>%
+                 drop_na(),
+               upper = list(continuous = corColor),
+               lower = list(continuous = customScatter),
+               diag = list(continuous = function(data, mapping, ...) {
+                   ggally_densityDiag(data = data, mapping = mapping, alpha = 0.3, fill = "red") +
+                   theme_bw()})) +
+  ggtitle("Correlating all data") +
+  xlab("") +
+  ylab("")
+
+# print(plt)
+
+
+# Correlation plot
+tib_cor <- tib %>%
+  dplyr::select(contains("diff")) %>%
+  drop_na() %>%
+  correlate(method = "spearman") %>%
+  gather(key, value, -term) %>%
+  mutate(value = replace_na(value, 1)) %>%
+  mutate(n1 = str_remove(term, "_diff"),
+         n2 = str_remove(key, "_diff"),
+         n1 = factor(n1, levels(tib_metadata$sample)),
+         n2 = factor(n2, rev(levels(tib_metadata$sample))))
+
+# Plot
+plt <- tib_cor %>%
+  ggplot(aes(x = n1, y = n2, fill = value, label = round(value, 2))) +
+  geom_tile() +
+  geom_text() +
+  xlab("") + ylab("") +
+  scale_fill_gradientn(colors = colorRampPalette(rev(brewer.pal(n = 7, 
+                                                                name = "RdYlBu")))(100),
+                       limits = c(min(-1, tib_cor$value), 1),
+                       name = "Spearman correlation") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+plot(plt)
+
+
+
+
+# Prepare differences for plotting
+tib_diff <- tib %>%
+  dplyr::select(-ends_with("h"))
+
+tib_diff %>%
+  ggplot(aes(x = RAD21_24h_diff, y = CTCFWAPL_24h_diff, 
+             col = distance_to_telomere)) +
+  geom_point() +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  coord_cartesian(xlim = c(-1, 1), ylim = c(-1, 1)) +
+  ggtitle(round(cor(tib_diff$RAD21_24h_diff, tib_diff$CTCFEL_24h_diff)), 2) +
+  scale_color_gradient2(low = "blue", mid = "grey", high = "red",
+                        midpoint = median(tib_diff$distance_to_telomere)) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+tib_plot <- tib_diff %>%
+  gather(key, value, contains("24h")) %>%
+  mutate(key = str_remove(key, "_diff"),
+         key = factor(key, levels(tib_metadata$sample))) 
+
+tib_plot %>%
+  ggplot(aes(x = distance_to_telomere, y = value)) +
+  geom_point(size = 1, alpha = 0.3) +
+  geom_smooth(method = "lm", col = "red") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  #coord_cartesian(ylim = c(-1, 1)) +
+  xlab("Distance to telomere (Mb)") +
+  ylab("LAD difference") +
+  facet_grid(. ~ key) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+tib_plot %>%
+  ggplot(aes(x = distance_to_telomere, y = value, col = seqnames)) +
+  geom_point(size = 0.5) +
+  geom_smooth(method = "lm", col = "red") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  #coord_cartesian(ylim = c(-1, 1)) +
+  xlab("Distance to telomere (Mb)") +
+  ylab("LAD difference") +
+  facet_grid(. ~ key) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+    
+
+```
+
+Conclusion: most LAD differences are very independent. Exception is the WAPL and
+CTCF/WAPL depletion. Makes sense.
+
+Next, make plots of the LAD size. Visualize that this is an important feature.
+
+```{r correlation plot lad size and ctcf density, fig.width = 10, fig.height = 5.5}
+
+# Change size to Mb
+tib_plot <- tib_plot %>%
+  mutate(size_Mb = 2**size - 1,
+         size_Mb = size_Mb / 1e6)
+
+
+tib_plot %>%
+  ggplot(aes(x = size_Mb, y = value)) +
+  geom_point(size = 1, alpha = 0.3) +
+  geom_smooth(method = "lm", col = "red") +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  #coord_cartesian(ylim = c(-1, 1)) +
+  xlab("LAD size (Mb)") +
+  ylab("LAD difference") +
+  facet_grid(. ~ key) +
+  scale_x_log10() +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+tib_plot %>%
+  ggplot(aes(x = size_Mb, y = value, col = seqnames)) +
+  geom_point(size = 0.5) +
+  geom_smooth(method = "lm", col = "red") +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  #coord_cartesian(ylim = c(-1, 1)) +
+  xlab("LAD size (Mb)") +
+  ylab("LAD difference") +
+  facet_grid(. ~ key) +
+  scale_x_log10() +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+
+# Also, plot CTCF density
+tib_plot %>%
+  ggplot(aes(x = ctcf_density, y = value)) +
+  geom_point(size = 1, alpha = 0.3) +
+  geom_smooth(method = "lm", col = "red") +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  #coord_cartesian(ylim = c(-1, 1)) +
+  xlab("LAD size (Mb)") +
+  ylab("LAD difference") +
+  facet_grid(. ~ key) +
+  scale_x_log10() +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+     
+
+```
+
+
+### 5. Differential analysis based on PT values
+
+Above, I tried to provide a convincing story using a correlation matrix. This 
+resulted in some resistance. Actual numbers of different regions were requested.
+Here, I will do it differently. I will use the new PT data to estimate a 
+background distribution of differences, and use those to determine LADs that are
+significantly different.
+
+```{r differential analysis of LADs}
+
+#######################################
+### Determine the LAD differences
+
+tib_diff <- as_tibble(mcols(gr_LAD_consensus)) %>%
+  mutate(PT_diff_24h = PT_24h - PT_0h,
+         CTCFEL_diff_6h = CTCFEL_6h - CTCFEL_0h,
+         CTCFEL_diff_24h = CTCFEL_24h - CTCFEL_0h,
+         RAD21_diff_6h = RAD21_6h - RAD21_0h,
+         RAD21_diff_24h = RAD21_24h - RAD21_0h,
+         WAPL_diff_6h = WAPL_6h - WAPL_0h,
+         WAPL_diff_24h = WAPL_24h - WAPL_0h,
+         CTCFWAPL_diff_6h = CTCFWAPL_6h - CTCFWAPL_0h,
+         CTCFWAPL_diff_24h = CTCFWAPL_24h - CTCFWAPL_0h)
+
+
+#######################################
+### Plot the differences
+clones <- c("PT", "CTCFEL", "RAD21", "WAPL", "CTCFWAPL")
+timepoints <- c("0h", "6h", "24h")
+
+tib_diff_toplot <- tib_diff %>%
+  gather(key, value, contains("diff")) %>%
+  mutate(clone = str_remove(key, "_.*"),
+         timepoint = str_remove(key, ".*_")) %>%
+  mutate(clone = factor(clone, levels = clones),
+         timepoint = factor(timepoint, levels = timepoints))
+
+sd_fun <- function(x){
+  return(data.frame(y = 1.25, label = round(sd(x), 2)))
+}
+
+tib_diff_toplot %>%
+  ggplot(aes(x = clone, y = value, col = clone)) +
+  geom_quasirandom() +
+  geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+  stat_summary(fun.data = sd_fun, geom = "text", col = "black") +
+  geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+  facet_grid(. ~ timepoint) +
+  xlab("") +
+  ylab("LAD difference (z-score)") +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+#######################################
+### Repeat plot, but highlight "differential LADs"
+
+diff_range <- quantile(tib_diff$PT_diff_24h, c(0.001, 0.999), na.rm = T)
+
+tib_diff_toplot <- tib_diff_toplot %>%
+  mutate(diff = value < diff_range[1] | value > diff_range[2],
+         class = case_when(value < diff_range[1] ~ "down",
+                           value > diff_range[2] ~ "up", 
+                           T ~ "stable"))
+
+# Same plot as before
+tib_diff_toplot %>%
+  ggplot(aes(x = clone, y = value, col = diff)) +
+  geom_quasirandom() +
+  geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+  stat_summary(fun.data = sd_fun, geom = "text", col = "black") +
+  geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+  facet_grid(. ~ timepoint) +
+  xlab("") +
+  ylab("LAD difference (z-score)") +
+  scale_color_manual(values = c("grey70", "red")) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Amount of differential LADs
+tib_diff_toplot %>%
+  group_by(clone, timepoint) %>%
+  dplyr::summarise(diff_n = sum(diff, na.rm = T),
+                   diff_fraction = mean(diff, na.rm = T)) %>%
+  ungroup() %>%
+  add_row(clone = "PT", timepoint = "6h", diff_fraction = 0, diff_n = 0) %>%
+  mutate(clone = factor(clone, levels = clones),
+         timepoint = factor(timepoint, levels = timepoints)) %>%
+  
+  ggplot(aes(x = clone, y = diff_fraction, fill = timepoint)) + 
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = diff_n, y = diff_fraction + 0.005), 
+            position = position_dodge(width = 0.9),
+            angle = 90, hjust = 0) +
+  xlab("") +
+  ylab("Fraction LADs different") +
+  scale_fill_grey() +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+The results above provide numbers how many LADs are different. Bas liked it. I
+can add this to the manuscript.
+
+Next, I tried to compare differential LADs with the LAD features.
+
+```{r features by differential class, fig.width = 8, fig.height = 10}
+
+#######################################
+### Compare differential groups with features
+
+# Prepare tibble with features
+tib_diff_features <- tib_diff_toplot %>%
+  dplyr::select(-ends_with("h")) %>%
+  dplyr::select(-ATAC, -H3K27ac, -H3K36me3, -H3K4me1, -H3K4me3) %>%
+  gather(feature, feature_value, 
+         -key, -clone, -value, -timepoint, -diff, -class) %>%
+  mutate(feature = factor(feature,
+                          levels = c("size", 
+                                     "ctcf_density",
+                                     "active_gene_density",
+                                     "H3K27me3",
+                                     "H3K9me2",
+                                     "local_lad_density",
+                                     "distance_to_centromere",
+                                     "distance_to_telomere",
+                                     "chrom_size"))) %>%
+  filter(clone != "PT") %>%
+  arrange(feature, clone, timepoint) %>%
+  mutate(key = factor(key, levels = unique(key)))
+
+# Plot as boxplot
+tib_diff_features %>%
+  ggplot(aes(x = timepoint, y = feature_value, fill = class, 
+             col = class, group = interaction(timepoint, class))) +
+  geom_boxplot(outlier.shape = NA, col = "black",
+               position = position_dodge(width = 1)) +
+  facet_grid(feature ~ clone, scales = "free_y") +
+  scale_fill_manual(values = c("blue", "grey70", "red")) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+#######################################
+### Determine significant correlations
+
+wilcox_test_against_stable <- function(x, class, effect = "down") {
+  wilcox.test(x[class == "stable"], x[class == effect])$p.value
+}
+
+direction_against_stable <- function(x, class, effect = "down") {
+  ifelse(mean(x[class == "stable"], na.rm = T) > 
+           mean(x[class == effect], na.rm = T),
+         "lower", "higher")
+}
+
+# Determine significance for up and down separately
+tib_diff_sign <- tib_diff_features %>%
+  group_by(key, clone, timepoint, feature) %>%
+  dplyr::summarise(down = wilcox_test_against_stable(feature_value, class, "down"),
+                   down_direction = direction_against_stable(feature_value, class, "down"),
+                   up = wilcox_test_against_stable(feature_value, class, "up"),
+                   up_direction = direction_against_stable(feature_value, class, "up")) %>%
+  ungroup() %>%
+  gather(direction, pvalue, down, up) %>%
+  mutate(padj = p.adjust(pvalue),
+         sign = padj < 0.05,
+         feature = factor(feature, levels = rev(levels(feature))),
+         key = str_remove(key, "_diff"),
+         key = factor(key, levels = unique(key))) %>%
+  # Determine -log10(padj), where the direction is up/down
+  mutate(padj_log10 = -log10(padj),
+         padj_log10 = case_when(direction == "down" & 
+                                  down_direction == "lower" ~ -padj_log10,
+                                direction == "up" & 
+                                  up_direction == "lower" ~ -padj_log10,
+                                T ~ padj_log10))
+
+# Plot
+tib_diff_sign %>%
+  ggplot(aes(x = key, y = feature, fill = padj_log10, label = round(padj_log10, 0))) +
+  geom_tile() +
+  geom_text(data = tib_diff_sign %>% filter(sign == T)) +
+  facet_grid(. ~ direction) +
+  xlab("") + 
+  ylab("") +
+  scale_fill_gradient2(high = "red", mid = "white", low = "blue", midpoint = 0) +
+  theme_bw() +
+  theme(aspect.ratio = 9/8,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+I don't like this. As you can see in the LAD size figure, small LADs are simply
+more variable between conditions. I think that this is because small LADs have
+fewer bins and therefore more intrinsic variation in their scores. I want to 
+include the "differential analysis", but that use the correlation matrix 
+afterwards. This prevents the wrong message, that small LADs are both increasing
+and decreasing.
+
+
+
+### Conclusion
+
+LAD features can explain a portion of the data. This is nice to add to the 
+manuscript. It doesn't functionally explain the data, but that's also not the
+goal.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,1148 @@
+---
+title: "Experiment Statistics"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+```{r setup}
+
+```
+
+### Overview
+
+This document provides quality control figures for a typical DamID experiment.
+Basic numbers (total reads, mapped reads, ...) can be found in a different file;
+only the (normalized) counts are used here.
+
+### Set-up 
+
+```{r temporary set-up, include = FALSE} 
+
+# # Libraries used
+# library(GenomicRanges)
+# library(GenomicAlignments)
+# library(rtracklayer)
+# library(ggplot2)
+# library(reshape2)
+# 
+# # Basenames
+# basename <- "HFF-r2-4xAP3"
+# dam_only <- "HFF-r2-Dam0_1"
+# 
+# # Bin sizes
+# bins <- c("5", "20", "80")
+# bins.kb <- paste0(bins, "kb")
+# bins.with_gatc <- c("gatc", paste0(bins, "kb"))
+# 
+# bins.count <- length(bins.with_gatc)
+# 
+# # Input directories
+# map_dir <- "results/mapped"
+# counts_dir <- "results/counts"
+# norm_dir <- "results/normalized"
+# hmm_dir <- "results/HMM"
+# 
+# # Centromeres
+# centromeres.bed <- "ts171110_hg38_centromeres.bed.gz"
+# 
+# # Read files
+# target.read_basenames <- "4620_3_HFF-r2-4xAP3"
+# dam_only.read_basenames <- c("4620_1_HFF-r2-Dam0_1", "4621_1_HFF-r2-Dam0_1")
+# 
+# # Output directory
+# supp_dir <- file.path("results/reports/experiment",
+#                       basename)
+# 
+# dir.create(supp_dir, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+```{r damid set-up}
+
+# Libraries used
+library(GenomicRanges)
+library(GenomicAlignments)
+library(rtracklayer)
+library(ggplot2)
+library(reshape2)
+
+# Basenames
+basename <- snakemake@params[["basename"]]
+dam_only <- snakemake@config[["dam_controls"]][[basename]]
+
+# Bin sizes
+bins <- snakemake@config[["bins"]]
+bins <- strsplit(bins, ",")[[1]]
+bins.kb <- paste0(bins, "kb")
+bins.with_gatc <- c("gatc", paste0(bins, "kb"))
+
+bins.count <- length(bins.with_gatc)
+
+# Input directories - note that the .Rmd file is the working directory!
+map_dir <- file.path(snakemake@config[["report_relative_location"]],
+                     snakemake@config[["output_dir"]],
+                     snakemake@config["out_map"])
+counts_dir <- file.path(snakemake@config[["report_relative_location"]],
+                        snakemake@config[["output_dir"]],
+                        snakemake@config[["out_count"]])
+norm_dir <- file.path(snakemake@config[["report_relative_location"]],
+                      snakemake@config[["output_dir"]],
+                      snakemake@config[["out_norm"]])
+hmm_dir <- file.path(snakemake@config[["report_relative_location"]],
+                     snakemake@config[["output_dir"]],
+                     snakemake@config[["out_hmm"]])
+
+# Centromeres
+# centromeres.bed <- file.path(snakemake@config[["report_relative_location"]],
+#                              snakemake@config[["centromeres_bed"]])
+
+# Read files
+target.read_basenames <- names(snakemake@config[["basenames"]][[basename]])
+dam_only.read_basenames <- names(snakemake@config[["basenames"]][[dam_only]])
+
+# Output directory - note that the .Rmd file is the working directory!
+supp_dir <- file.path(snakemake@config[["report_relative_location"]],
+                      snakemake@config[["output_dir"]],
+                      snakemake@config[["out_report_experiment"]],
+                      basename)
+
+dir.create(supp_dir, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+Sample to be analyzed:
+
+```{r damid set-up printed}
+print(basename)
+
+print(dam_only)
+```
+
+### Read-in data
+
+I will read in the data
+
+  * Normalized scores
+  * Raw counts
+  * HMM model
+
+```{r read-in data}
+
+FixGATCsequences <- function(df) {
+  # The GATC fragments have the downside that they overlap, as they end with
+  # GATC and also start with GATC. This function quickly fixes this issue.
+
+  df.gr <- as(df, "GRanges")
+
+  # Fix the start / end
+  start(df.gr) <- start(df.gr) + 2
+  end(df.gr) <- end(df.gr) - 2
+
+  # Also trim the object to be within range
+  df.gr <- trim(df.gr)
+
+  as(df.gr, "data.frame")[, c("seqnames", "start", "end", "score")]
+}
+NormReads <- function(df, n = 1e6) {
+  # Normalize for read number
+
+  df$score <- df$score / sum(df$score) * n
+  df
+}
+
+# 1) Read normalized values
+target.norm <- list()
+
+for (bin in bins.with_gatc) {
+  df.name <- file.path(norm_dir,
+                       paste0("bin-", bin),
+                       paste0(basename,
+                              "-",
+                              bin,
+                              ".norm.txt.gz"))
+
+  df <- read.table(df.name,
+                   sep = "\t", stringsAsFactors = FALSE,
+                   col.names = c("seqnames", "start", "end", "score"))
+
+  if (bin == "gatc") {
+    df <- FixGATCsequences(df)
+  }
+
+  target.norm <- c(target.norm, list(df))
+}
+
+names(target.norm) <- bins.with_gatc
+
+# 2) Read dam-only counts
+target.counts <- list()
+
+for (bin in bins.with_gatc) {
+  df.name <- file.path(counts_dir,
+                       paste0("bin-", bin),
+                       paste0(basename,
+                              "-",
+                              bin,
+                              ".counts.txt.gz"))
+
+  df <- read.table(df.name,
+                   sep = "\t", stringsAsFactors = FALSE,
+                   col.names = c("seqnames", "start", "end", "score"))
+
+  #df <- NormReads(df)
+
+  if (bin == "gatc") {
+    df <- FixGATCsequences(df)
+  }
+
+  target.counts <- c(target.counts, list(df))
+}
+
+names(target.counts) <- bins.with_gatc
+
+# 3) Read target counts
+dam_only.counts <- list()
+
+for (bin in bins.with_gatc) {
+  df.name <- file.path(counts_dir,
+                       paste0("bin-", bin),
+                       paste0(dam_only,
+                              "-",
+                              bin,
+                              ".counts.txt.gz"))
+
+  df <- read.table(df.name,
+                   sep = "\t", stringsAsFactors = FALSE,
+                   col.names = c("seqnames", "start", "end", "score"))
+
+  #df <- NormReads(df)
+
+  if (bin == "gatc") {
+    df <- FixGATCsequences(df)
+  }
+
+  dam_only.counts <- c(dam_only.counts, list(df))
+}
+
+names(dam_only.counts) <- bins.with_gatc
+
+# 4) Read HMM models
+target.hmm <- list()
+
+for (bin in bins.kb) {
+  df.name <- file.path(hmm_dir,
+                       paste0("bin-", bin),
+                       paste0(basename,
+                              "-",
+                              bin,
+                              "_HMM.txt.gz"))
+
+  df <- read.table(df.name,
+                   sep = "\t", stringsAsFactors = FALSE,
+                   col.names = c("seqnames", "start", "end", "score"))
+
+  if (bin == "gatc") {
+    df <- FixGATCsequences(df)
+  }
+
+  target.hmm <- c(target.hmm, list(df))
+}
+
+names(target.hmm) <- bins.kb
+
+# 5) ...
+
+```
+
+Top of the normalized counts:
+
+```{r read-in data printed}
+
+print(head(target.norm[[1]]))
+
+```
+
+### Quality controls
+
+Various quality plots will be shown below. This list is still under construction.
+
+#### 1) Down-sampling
+
+Down-sampling of the reads, to determine how "saturated" the library is. Note
+that is a very rough downsampling. Basically, I randomly sample counts once(!)
+and determine how this affects the autocorrelation.
+
+```{r down-sampling}
+
+# First, a function for downsampling
+Downsampling <- function(df, sampling) {
+  # A function to downsample the data, using random sampling without replacement.
+  # While this function might be a bit slow, it is completely random sampling.
+
+  x <- df[, 4]
+  names(x) <- 1:length(x)
+
+  y <- sample(rep(names(x), x),
+               size=sampling, replace=FALSE)
+  y <- table(factor(y, levels=names(x)))
+
+  df[, 4] <- y
+
+  df
+}
+
+# Second, I need to normalize the sampled counts. For this, I will use the same
+# functions as in the normalize_damid.R script. However, R does not really
+# support easy loading, so I will just write them down again. Of course, this
+# means that this won't change if I change the normalization script.
+norm.reads <- function(counts, n = 1e6) {
+    # This is a target-only reads / M normalization
+
+    # Normalize for library size (in reads / M)
+    counts[, 4] <- counts[, 4] / sum(counts[, 4]) * n
+
+    counts
+}
+norm.dam_log2 <- function(counts, dam_only, pseudo) {
+    # This is the dam-only log2 normalization
+
+    idx.no_reads <- which(counts[, 4] + dam_only[, 4] == 0)
+
+    # Add pseudocount for later divisions
+    counts[, 4] <- counts[, 4] + pseudo
+    dam_only[, 4] <- dam_only[, 4] + pseudo
+
+    # Create normalized table
+    norm <- counts[, 1:3]
+    norm$score <- log2(counts[, 4] / dam_only[, 4])
+
+    # No reads = NA
+    norm[idx.no_reads, "score"] <- NA
+
+    norm
+}
+
+
+# Now, before I start down-sampling, I need to decide which levels to downsample
+# to. Finally, I want to mention that I have actually two libraries to
+# downsample. For now, I will simply downsample both to the same depth.
+
+# After one minute of thinking I have decided to downsample with steps of 1.5
+# until I reach fewer than 1e5 reads.
+total.target.counts <- sum(target.counts[[1]][, 4])
+total.dam_only.counts <- sum(dam_only.counts[[1]][, 4])
+
+total.counts.min <- min(total.target.counts,
+                        total.dam_only.counts)
+current.downsampling <- total.counts.min
+
+downsampling <- c("all", total.counts.min)
+
+while (current.downsampling > 1e5) {
+  current.downsampling <- round(current.downsampling / 1.5)
+  downsampling <- c(downsampling, current.downsampling)
+}
+
+
+# Set-up for the downsampling
+acf.df <- c()
+
+
+for (b in bins.with_gatc) {
+  acf.vec <- c()
+
+  for (d in downsampling) {
+    # Where -b is the bin size and -d is the downsampling
+
+    # First, downsampling of counts
+    if (d == "all") {
+      target.downsampled <- target.counts[[b]]
+      dam_only.downsampled <- dam_only.counts[[b]]
+    } else {
+      target.downsampled <- Downsampling(target.counts[[b]], as.integer(d))
+      dam_only.downsampled <- Downsampling(dam_only.counts[[b]], as.integer(d))
+    }
+
+    # Then, normalize reads to CPM
+    target.downsampled <- norm.reads(target.downsampled)
+    dam_only.downsampled <- norm.reads(dam_only.downsampled)
+
+    # Finally, log2 normalization
+    norm.downsampled <- norm.dam_log2(target.downsampled,
+                                      dam_only.downsampled,
+                                      pseudo = 1)
+
+
+    # Now, with the downsampled data, I can calculate quality metrics:
+    # 1) ACF
+    #    Here, I still have the enormous bias that NAs are removed before
+    #    calculating this.
+    a <- acf(norm.downsampled[, 4], lag.max = 2, na.action = na.pass, plot = F)
+    acf.vec <- c(acf.vec, a$acf[2])
+
+  }
+
+  acf.df <- cbind(acf.df, acf.vec)
+}
+
+# acf.df to dataframe
+acf.df <- data.frame(acf.df)
+names(acf.df) <- bins.with_gatc
+row.names(acf.df) <- downsampling
+
+# Plotting
+# First, only select numbers
+acf.df.copy <- acf.df[2:nrow(acf.df), ]
+
+plot(log10(as.integer(row.names(acf.df.copy))), acf.df.copy[, 1],
+     pch = 19, col = "black",
+     ylim = c(0, 1), xlim = c(4.75, 8),
+     xlab = "# reads (log10)",
+     ylab = "ACF",
+     main = "Downsampling - ACF")
+
+for (i in 2:ncol(acf.df.copy)) {
+  points(log10(as.integer(row.names(acf.df.copy))), acf.df.copy[, i],
+         pch = 19, col = i)
+}
+
+legend("topleft", col = 1:ncol(acf.df.copy), pch = 19,
+       legend = names(acf.df.copy))
+
+# Finally, write this to the supp files
+acf.df$downsample <- row.names(acf.df)
+
+write.table(acf.df, 
+            file.path(supp_dir, paste0(basename, "_ACF.txt")),
+            row.names = F, col.names = T, quote = FALSE, sep= "\t")
+
+```
+
+#### 2) GATCs present
+
+How are the reads divided over the possible GATC sequences?
+
+First of all, an example of the raw counts for the target and dam-only to get an
+idea how many hits you have and how good the quality seems to be. Note that the
+blue boxes represent regions without any reads found. (Note 2: white regions
+without any signal are unknown sequences without any GATC fragments.)
+
+```{r read normalization}
+
+# Before I do anything else, let's first normalize the "counts" to CPM.
+for (i in 1:length(target.counts)) {
+  target.counts[[i]] <- NormReads(target.counts[[i]])
+  dam_only.counts[[i]] <- NormReads(dam_only.counts[[i]])
+}
+
+```
+
+```{r gatc-presence, fig.height = 8, fig.width = 8}
+
+# Note: add mappable genome?
+par(mfcol = c(3, 1))
+
+PlotExampleRegion <- function(target.counts, dam_only.counts, target.norm,
+                              n = 13000:13500, chr = "chr1") {
+  # A function to create an overview figure of the GATC resolution
+
+  # First, filter the sequences
+  t.counts <- target.counts[target.counts$seqnames == chr, ][n, ]
+  d.counts <- dam_only.counts[dam_only.counts$seqnames == chr, ][n, ]
+  t.norm <- target.norm[target.norm$seqnames == chr, ][n, ]
+  
+  # Only useful when not all bins are NA
+  if (all(is.na(t.norm$score))) {
+    print("No normalized values")
+    return()
+  }
+
+  # Select regions without reads in either experiment
+  no_reads.idx <- which(t.counts[, "score"] + d.counts[, "score"] == 0)
+
+  # Set the ranges for the plots
+  x.range <- c(t.counts[, "start"][1],
+               t.counts[, "end"][length(n)])
+  y.range <- c(0,
+               max(c(t.counts[, "score"], d.counts[, "score"])))
+  y.range.norm <- c(min(t.norm[, "score"], na.rm = T),
+                    max(t.norm[, "score"], na.rm = T))
+
+  # Create the plots. First an empty plot, then add rects for the data. Finally,
+  # add blue boxes over zero-regions.
+
+  # 1) Target counts
+  plot(x.range, y.range, type = "n",
+       main = "Target counts",
+       xlab = paste0(chr, " (bp)"),
+       ylab = "counts (cpm)")
+  rect(xleft = t.counts[, "start"],
+       ybottom = 0,
+       xright = t.counts[, "end"],
+       ytop = t.counts[, "score"],
+       col = "black",
+       lwd = 0)
+  rect(xleft = t.counts[, "start"][no_reads.idx],
+       ybottom = y.range[1],
+       xright = t.counts[, "end"][no_reads.idx],
+       ytop = y.range[2],
+       col = alpha("blue", 0.1),
+       lwd = 0)
+
+  # 2) Dam-only counts
+  plot(x.range, y.range, type = "n",
+       main = "Dam-only counts",
+       xlab = paste0(chr, " (bp)"),
+       ylab = "counts (cpm)")
+  rect(xleft = d.counts[, "start"],
+       ybottom = 0,
+       xright = d.counts[, "end"],
+       ytop = d.counts[, "score"],
+       col = "black",
+       lwd = 0)
+  rect(xleft = t.counts[, "start"][no_reads.idx],
+       ybottom = y.range[1],
+       xright = t.counts[, "end"][no_reads.idx],
+       ytop = y.range[2],
+       col = alpha("blue", 0.1),
+       lwd = 0)
+
+  # 3) Normalized scores
+  plot(x.range, y.range.norm, type = "n",
+       main = "Target normalized",
+       xlab = paste0(chr, " (bp)"),
+       ylab = "target / dam-only (log2)")
+  rect(xleft = t.norm[, "start"],
+       ybottom = 0,
+       xright = t.norm[, "end"],
+       ytop = t.norm[, "score"],
+       col = "black",
+       lwd = 0)
+  rect(xleft = t.counts[, "start"][no_reads.idx],
+       ybottom = y.range.norm[1],
+       xright = t.counts[, "end"][no_reads.idx],
+       ytop = y.range.norm[2],
+       col = alpha("blue", 0.1),
+       lwd = 0)
+
+}
+
+PlotExampleRegion(target.counts[[1]], dam_only.counts[[1]], target.norm[[1]],
+                  chr = "chr1", n = 13000:13500)
+
+```
+
+Combine this snapshot into a genome-wide distribution.
+
+```{r size distribution, fig.height = 5, fig.width = 5}
+
+# 1) Histogram of counts
+par(mfcol = c(1, 2))
+
+target.counts.table <- table(target.counts[[1]][, "score"])
+target.counts.table <- target.counts.table / sum(target.counts.table)
+names(target.counts.table) <- round(as.numeric(names(target.counts.table)), 2)
+dam_only.counts.table <- table(dam_only.counts[[1]][, "score"])
+dam_only.counts.table <- dam_only.counts.table / sum(dam_only.counts.table)
+names(dam_only.counts.table) <- round(as.numeric(names(dam_only.counts.table)), 2)
+
+barplot(target.counts.table[1:5],
+        main = "Target counts",
+        ylab = "Fraction",
+        xlab = "reads / bin (cpm)")
+
+barplot(dam_only.counts.table[1:5],
+        main = "Dam-only counts",
+        ylab = "Fraction",
+        xlab = "reads / bin (cpm)")
+
+# 2) Density of GATC sizes and
+#    - Sequenced fragments
+#    - Not sequenced fragments
+#    - Reads
+par(mfcol = c(1, 1))
+density.n <- 5000
+
+gatc.distances <- target.counts[[1]][, "end"] - target.counts[[1]][, "start"]
+
+# Filter to remove absurd long fragments
+size.filter <- gatc.distances < 3000
+
+plot(density(gatc.distances[size.filter],
+              n = density.n),
+     main = "GATC fragment sizes", xlab = "Size (bp)",
+     xlim = c(0, 1500), ylim = c(0, 0.0045), lwd = 1)
+
+scores.summed <- target.counts[[1]][size.filter, "score"] + dam_only.counts[[1]][size.filter, "score"]
+
+idx.zero <- scores.summed == 0
+
+lines(density(gatc.distances[size.filter][idx.zero],
+              n = density.n),
+      col = "red", lwd = 1)
+lines(density(gatc.distances[size.filter][! idx.zero],
+              n = density.n),
+      col = "green", lwd = 1)
+
+lines(density(x = gatc.distances[size.filter],
+              weight = target.counts[[1]][size.filter, "score"] / sum(target.counts[[1]][size.filter, "score"]),
+              n = density.n),
+      col = "blue", lwd = 3)
+
+lines(density(x = gatc.distances[size.filter],
+              weight = dam_only.counts[[1]][size.filter, "score"] / sum(dam_only.counts[[1]][size.filter, "score"]),
+              n = density.n),
+      col = "orange", lwd = 3)
+
+legend("topright", legend = c("All GATC fragments",
+                              "Not sequenced GATC fragments",
+                              "Sequenced GATCs fragments",
+                              "Reads target",
+                              "Reads dam-only"),
+       pch = 19,
+       col = c("black", "red", "green", "blue", "orange"))
+
+# 3) GATC size versus normalized score
+par(mfcol = c(1, 1))
+
+n <- 10000
+
+j <- sample(x = 1:nrow(target.norm[[1]]),
+            size = n,
+            replace = F)
+
+plot(x = target.norm[[1]][j, "end"] - target.norm[[1]][j, "start"],
+     y = target.norm[[1]][j, 4],
+     main = "GATC size vs normalized score (gatc)",
+     xlab = "Size (bp)",
+     ylab = "Target / dam-only (log2)",
+     xlim = c(0, 1500),
+     pch = 20, col = alpha("black", 0.3))
+
+
+```
+
+Something different:
+
+  * Which scores are present - histogram
+  * How do the scores represent to read number
+
+```{r score distribution_1, fig.height = 5, fig.width = 8}
+
+# 1) Which scores are present - violin plot
+
+# First, combine all bins into one big data frame
+target.norm.combined <- data.frame(stringsAsFactors = FALSE)
+
+for (i in 1:bins.count) {
+  # Add the bin to the data frame
+  target.norm.tmp <- cbind(target.norm[[i]],
+                           rep(bins.with_gatc[i],
+                               times = nrow(target.norm[[i]])))
+
+  # Only select complete cases
+  target.norm.tmp <- target.norm.tmp[complete.cases(target.norm.tmp), ]
+
+  # Add to combined data.frame
+  target.norm.combined <- rbind(target.norm.combined,
+                                target.norm.tmp)
+
+}
+names(target.norm.combined)[5] <- "bin"
+# target.norm.combined$bin <- as.character(target.norm.combined$bin)
+
+# Create violin plots per bin
+ggplot(target.norm.combined, aes(x = 1, y = score, fill = bin)) +
+  facet_grid(. ~ bin) +
+  geom_violin() +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  ylab("DamID scores") +
+  ggtitle(basename) +
+  theme_bw() +
+  theme(legend.position="none")
+
+# Clean-up to prevent memory overflow
+rm(target.norm.tmp, target.norm.combined)
+
+```
+
+```{r score distribution_2, fig.height = 10, fig.width = 12}
+
+# 2) How do the scores correspond to read number?
+
+# (Note: this assumes at least 3 bins, including GATC fragments)
+par(mfrow = c(3, 3))
+n <- 10000
+
+for (i in 1:3) {
+
+  j <- sample(x = 1:nrow(target.norm[[i]]),
+              size = n,
+              replace = F)
+
+  plot(target.counts[[i]][j, "score"],
+     target.norm[[i]][j, "score"],
+     pch = 20, col = alpha("black", 0.3),
+     main = paste0("Target counts ; ",
+                   bins.with_gatc[i],
+                   " bins"),
+     xlab = "Counts (cpm)",
+     ylab = "DamID score (log2)")
+
+  plot(dam_only.counts[[i]][j, "score"],
+       target.norm[[i]][j, "score"],
+       pch = 20, col = alpha("black", 0.3),
+     main = paste0("Dam-only counts ; ",
+                   bins.with_gatc[i],
+                   " bins"),
+     xlab = "Counts (cpm)",
+     ylab = "DamID score (log2)")
+
+  plot(target.counts[[i]][j, "score"] + dam_only.counts[[i]][j, "score"],
+       target.norm[[i]][j, "score"],
+       pch = 20, col = alpha("black", 0.3),
+     main = paste0("Combined counts ; ",
+                   bins.with_gatc[i],
+                   " bins"),
+     xlab = "Counts (cpm)",
+     ylab = "DamID score (log2)")
+
+}
+
+```
+
+#### 3) Sequence enrichment
+
+[Skipped for mouse samples.]
+
+<!-- Is there any enrichment for specific sequences, such as centromeres and rDNA? -->
+
+<!-- ```{r sequence enrichment, fig.height = 4, fig.width = 4} -->
+
+<!-- # 0) Read the mapped reads -->
+
+<!-- # Functions -->
+<!-- bam_reader <- function(bam, mapqual, multimap, dup, alignscore) { -->
+<!--     # Read alignments from a bam-file, applying given filters on it. -->
+<!--     param <- get_param(mapqual, dup) -->
+<!--     reads <- readGAlignments(bam, param = param) -->
+
+<!--     if (multimap) { -->
+<!--         # Bowtie-specific! - the XS-flag is only present when multiple  -->
+<!--         # alignments are present -->
+<!--         reads <- reads[is.na(mcols(reads)$XS)] -->
+<!--     }  -->
+<!--     if (! is.na(alignscore)) { -->
+<!--         # Bowtie-specific? - the AS shows how good the mapping is -->
+<!--         reads <- reads[mcols(reads)$AS >= alignscore] -->
+<!--     } -->
+
+<!--     # Convert to GRanges -->
+<!--     reads <- as(reads, "GRanges") -->
+<!--     reads -->
+<!-- } -->
+<!-- get_param <- function(mapqual, dup) { -->
+<!--     # Get the parameter options for reading alignments -->
+<!--     flags <- scanBamFlag(isUnmappedQuery = FALSE, -->
+<!--                          isDuplicate = dup) -->
+<!--     param <- ScanBamParam(flag = flags,  -->
+<!--                           tag = c("XS", "AS"), -->
+<!--                           mapqFilter = mapqual) -->
+<!--     param -->
+<!-- } -->
+
+<!-- # Parameters to read in mapped reads, regardless of unique position -->
+<!-- mapqual = NA -->
+<!-- alignscore = -3 -->
+<!-- multimap = FALSE -->
+<!-- dup = NA -->
+
+<!-- target.read_files <- file.path(map_dir, -->
+<!--                                paste0(target.read_basenames, -->
+<!--                                       ".bam")) -->
+<!-- dam_only.read_files <- file.path(map_dir, -->
+<!--                                  paste0(dam_only.read_basenames, -->
+<!--                                         ".bam")) -->
+
+<!-- # Read in the reads -->
+<!-- target.reads <- dam_only.reads <- GRanges() -->
+
+<!-- for (n in target.read_files) { -->
+<!--   target.reads <- c(target.reads, bam_reader(n, mapqual, multimap, dup, alignscore)) -->
+<!-- } -->
+<!-- for (n in dam_only.read_files) { -->
+<!--   dam_only.reads <- c(dam_only.reads, bam_reader(n, mapqual, multimap, dup, alignscore)) -->
+<!-- } -->
+
+
+
+<!-- # 1) Centromere overlap -->
+
+<!-- # Read in the centromeric locations -->
+<!-- centromeres <- read.table(centromeres.bed,  -->
+<!--                           sep = "\t", header = F) -->
+
+<!-- # Select useful information -->
+<!-- centromeres <- centromeres[, c(2:4)] -->
+<!-- names(centromeres) <- c("seqnames", "start", "end") -->
+
+<!-- # Convert to GRanges -->
+<!-- centromeres <- as(centromeres, "GRanges") -->
+
+<!-- # Filter for seqlevels -->
+<!-- chromosomes.used <- c(paste0("chr", 1:22), "chrX") -->
+<!-- seqlevels(centromeres, pruning.mode = "coarse") <- chromosomes.used -->
+
+<!-- # Also extend the centromere  -->
+<!-- flank <- 2.5e6 -->
+
+<!-- centromeres_extended <- centromeres -->
+<!-- start(centromeres_extended) <- start(centromeres_extended) - flank -->
+<!-- end(centromeres_extended) <- end(centromeres_extended) + flank -->
+
+<!-- # The extension only -->
+<!-- extended <- setdiff(centromeres_extended, centromeres) -->
+
+<!-- # Determine the overlap between reads and centromeres for different libraries -->
+<!-- target.total_reads <- length(target.reads) -->
+<!-- target.centromere.overlap <- sum(target.reads %over% centromeres) -->
+<!-- target.centromere_extended.overlap <- sum(target.reads %over% centromeres_extended) -->
+<!-- target.extended.overlap <- sum(target.reads %over% extended) -->
+
+<!-- dam_only.total_reads <- length(dam_only.reads) -->
+<!-- dam_only.centromere.overlap <- sum(dam_only.reads %over% centromeres) -->
+<!-- dam_only.centromere_extended.overlap <- sum(dam_only.reads %over% centromeres_extended) -->
+<!-- dam_only.extended.overlap <- sum(dam_only.reads %over% extended) -->
+
+<!-- # Put into data frame -->
+<!-- centromere.overlap <- data.frame(total = c(target.total_reads, -->
+<!--                                            dam_only.total_reads), -->
+<!--                                  centromere = c(target.centromere.overlap, -->
+<!--                                                 dam_only.centromere.overlap), -->
+<!--                                  centromere_extended = c(target.centromere_extended.overlap, -->
+<!--                                                          dam_only.centromere_extended.overlap), -->
+<!--                                  extended = c(target.extended.overlap, -->
+<!--                                               dam_only.extended.overlap), -->
+<!--                                  names = c(basename, dam_only), -->
+<!--                                  row.names = c("target", -->
+<!--                                                "dam_only")) -->
+
+<!-- centromere.overlap[, "centromere.fraction"] <- centromere.overlap[, "centromere"] / -->
+<!--   centromere.overlap[, "total"] -->
+<!-- centromere.overlap[, "centromere_extended.fraction"] <- centromere.overlap[, "centromere_extended"] / -->
+<!--   centromere.overlap[, "total"] -->
+<!-- centromere.overlap[, "extended.fraction"] <- centromere.overlap[, "extended"] / -->
+<!--   centromere.overlap[, "total"] -->
+
+<!-- # And plot -->
+<!-- # (That could be optimized...) -->
+<!-- ggplot(centromere.overlap, aes(x = names, y = centromere.fraction, -->
+<!--                                label = round(centromere.fraction, digits = 5))) + -->
+<!--   geom_point(size = 3) + -->
+<!--   ggtitle("Centromere fraction") + -->
+<!--   xlab("Sample") + -->
+<!--   ylab("Read fraction") + -->
+<!--   ylim(0, max(centromere.overlap$centromere.fraction)) + -->
+<!--   geom_text(aes(y = centromere.fraction * 0.95)) + -->
+<!--   theme_bw() + -->
+<!--   theme(axis.text.x = element_text(angle = 90, hjust = 1)) -->
+
+<!-- ggplot(centromere.overlap, aes(x = names, y = centromere_extended.fraction, -->
+<!--                                label = round(centromere_extended.fraction, digits = 5))) + -->
+<!--   geom_point(size = 3) + -->
+<!--   ggtitle("Centromere extended fraction") + -->
+<!--   xlab("Sample") + -->
+<!--   ylab("Read fraction") + -->
+<!--   ylim(0, max(centromere.overlap$centromere_extended.fraction)) + -->
+<!--   geom_text(aes(y = centromere_extended.fraction * 0.95)) + -->
+<!--   theme_bw() + -->
+<!--   theme(axis.text.x = element_text(angle = 90, hjust = 1)) -->
+
+<!-- ggplot(centromere.overlap, aes(x = names, y = extended.fraction, -->
+<!--                                label = round(extended.fraction, digits = 5))) + -->
+<!--   geom_point(size = 3) + -->
+<!--   ggtitle("Centromere extended-only fraction") + -->
+<!--   xlab("Sample") + -->
+<!--   ylab("Read fraction") + -->
+<!--   ylim(0, max(centromere.overlap$extended.fraction)) + -->
+<!--   geom_text(aes(y = extended.fraction * 0.95)) + -->
+<!--   theme_bw() + -->
+<!--   theme(axis.text.x = element_text(angle = 90, hjust = 1)) -->
+
+<!-- # Write to file -->
+<!-- write.table(centromere.overlap,  -->
+<!--             file.path(supp_dir, paste0(basename, "_CentromereEnrichment.txt")), -->
+<!--             row.names = F, col.names = T, quote = FALSE, sep= "\t") -->
+
+<!-- # 2) rDNA enrichment -->
+
+<!-- # As for the centromeres, determine the overlap -->
+<!-- rDNA.overlap <- data.frame(total = c(target.total_reads, -->
+<!--                                      dam_only.total_reads), -->
+<!--                            rDNA = c(sum(seqnames(target.reads) == "U13369.1"), -->
+<!--                                     sum(seqnames(dam_only.reads) == "U13369.1")), -->
+<!--                            rDNA_left = c(length(target.reads[seqnames(target.reads) == "U13369.1" & end(target.reads) < 11000]), -->
+<!--                                          length(dam_only.reads[seqnames(dam_only.reads) == "U13369.1" & end(dam_only.reads) < 11000])), -->
+<!--                            rDNA_right = c(length(target.reads[seqnames(target.reads) == "U13369.1" & end(target.reads) >= 11000]), -->
+<!--                                           length(dam_only.reads[seqnames(dam_only.reads) == "U13369.1" & end(dam_only.reads) >= 11000])), -->
+<!--                            names = c(basename, dam_only), -->
+<!--                            row.names = c("target", "dam_only")) -->
+
+<!-- rDNA.overlap[, "fraction"] <- rDNA.overlap[, "rDNA"] / rDNA.overlap[, "total"] -->
+<!-- rDNA.overlap[, "fraction_left"] <- rDNA.overlap[, "rDNA_left"] / rDNA.overlap[, "total"] -->
+<!-- rDNA.overlap[, "fraction_right"] <- rDNA.overlap[, "rDNA_right"] / rDNA.overlap[, "total"] -->
+
+<!-- # And plot -->
+<!-- ggplot(rDNA.overlap, aes(x = names, y = fraction, -->
+<!--                          label = round(fraction, digits = 5))) + -->
+<!--   geom_point(size = 3) + -->
+<!--   ggtitle("rDNA fraction") + -->
+<!--   xlab("Sample") + -->
+<!--   ylab("Read fraction") + -->
+<!--   ylim(0, max(rDNA.overlap$fraction)) + -->
+<!--   geom_text(aes(y = fraction  * 0.95)) + -->
+<!--   theme_bw() + -->
+<!--   theme(axis.text.x = element_text(angle = 90, hjust = 1)) -->
+
+<!-- # Now, the left part contains the rDNA genes and seemingly the enrichment while  -->
+<!-- # the right part is not very specific it seems. -->
+<!-- ggplot(rDNA.overlap, aes(x = names, y = fraction_left, -->
+<!--                          label = round(fraction_left, digits = 5))) + -->
+<!--   geom_point(size = 3) + -->
+<!--   ggtitle("rDNA fraction left") + -->
+<!--   xlab("Sample") + -->
+<!--   ylab("Read fraction") + -->
+<!--   ylim(0, max(rDNA.overlap$fraction_left)) + -->
+<!--   geom_text(aes(y = fraction_left * 0.95)) + -->
+<!--   theme_bw() + -->
+<!--   theme(axis.text.x = element_text(angle = 90, hjust = 1)) -->
+
+<!-- ggplot(rDNA.overlap, aes(x = names, y = fraction_right, -->
+<!--                          label = round(fraction_right, digits = 5))) + -->
+<!--   geom_point(size = 3) + -->
+<!--   ggtitle("rDNA fraction_right") + -->
+<!--   xlab("Sample") + -->
+<!--   ylab("Read fraction") + -->
+<!--   ylim(0, max(rDNA.overlap$fraction_right)) + -->
+<!--   geom_text(aes(y = fraction_right * 0.95)) + -->
+<!--   theme_bw() + -->
+<!--   theme(axis.text.x = element_text(angle = 90, hjust = 1)) -->
+
+<!-- # Write to file -->
+<!-- write.table(rDNA.overlap,  -->
+<!--             file.path(supp_dir, paste0(basename, "_rDNAEnrichment.txt")), -->
+<!--             row.names = F, col.names = T, quote = FALSE, sep= "\t") -->
+
+<!-- ``` -->
+
+<!-- So, how does this look like in a track? -->
+
+<!-- ```{r rDNA track, fig.width = 8, fig.height = 6} -->
+
+<!-- # 2b) rDNA - plot the track -->
+
+<!-- # Create coverage tracks -->
+<!-- target.cov <- coverage(target.reads[seqnames(target.reads) == "U13369.1" ])[["U13369.1"]] /  -->
+<!--   target.total_reads * 1e6 -->
+<!-- dam_only.cov <- coverage(dam_only.reads[seqnames(dam_only.reads) == "U13369.1" ])[["U13369.1"]] /  -->
+<!--   dam_only.total_reads * 1e6 -->
+
+<!-- # Get the maximum -->
+<!-- max.value <- ceiling(max(c(target.cov, dam_only.cov))) -->
+
+<!-- # And plot -->
+<!-- par(mfrow = c(2, 1)) -->
+
+<!-- plot(target.cov,  -->
+<!--      ylim = c(0, max.value), type = "h", -->
+<!--      xlab = "U13369.1 (bp)", ylab = "CPM", main = "rDNA target") -->
+
+<!-- plot(dam_only.cov,  -->
+<!--      ylim = c(0, max.value), type = "h", -->
+<!--      xlab = "U13369.1 (bp)", ylab = "CPM", main = "rDNA dam-only") -->
+
+
+<!-- ``` -->
+
+#### 4) HMM calling
+
+Looking at the HMM calling and its robustness.
+
+  * Overlap of the HMM called bins, using Vennerable overlap plots?
+  * Normalized score enrichment of the HMM called bins
+
+```{r HMM calling_1, fig.height = 5, fig.width = 5}
+
+# 1) Overlap of the HMM-called bins
+library(Vennerable)
+
+plotVennFromList <- function(df.list) {
+
+  names.plot <- paste0("bin_", names(df.list))
+
+  # Convert HMM list into one GRanges object
+  # For now, this assumes that:
+  # 1) Model go from small to large
+
+  hmm.gr <- as(df.list[[1]],
+                    "GRanges")
+  names(mcols(hmm.gr)) <- names.plot[1]
+
+  for (i in 2:length(df.list)) {
+
+    # Determine overlap
+    ovl <- findOverlaps(hmm.gr,
+                        as(df.list[[i]],
+                           "GRanges"),
+                        type = "within")
+
+    mcols(hmm.gr)[, names.plot[i]] <- df.list[[i]][subjectHits(ovl), "score"]
+
+  }
+
+  # Convert into data frame
+  hmm.df <- as(hmm.gr,
+               "data.frame")
+
+  # Only select the interesting data, and only the complete cases
+  df.tmp <- hmm.df[, c("seqnames", "start", "end", names.plot)]
+  df.tmp <- df.tmp[complete.cases(df.tmp), ]
+
+  # Next, create a vector of overlap
+  if (length(names.plot) == 2) {
+
+    x <- (df.tmp[, names.plot[1]] == "AD")
+    y <- (df.tmp[, names.plot[2]] == "AD")
+
+    ab <- sum(x & y)
+    a <- sum(x & !y)
+    b <- sum(!x & y)
+
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab)
+    plot(w, show = list(Faces = F))
+
+  } else if (length(names.plot) == 3) {
+
+    x <- (df.tmp[, names.plot[1]] == "AD")
+    y <- (df.tmp[, names.plot[2]] == "AD")
+    z <- (df.tmp[, names.plot[3]] == "AD")
+
+    abc <- sum(x & y & z)
+    ab <- sum(x & y & !z)
+    ac <- sum(x & !y & z)
+    bc <- sum(!x & y & z)
+    a <- sum(x & !y & !z)
+    b <- sum(!x & y & !z)
+    c <- sum(!x & !y & z)
+
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab, c, ac, bc, abc)
+    plot(w, show = list(Faces = F))
+
+  } else if (length(names.plot) == 4) {
+
+    x <- (df.tmp[, names.plot[1]] == "AD")
+    y <- (df.tmp[, names.plot[2]] == "AD")
+    z <- (df.tmp[, names.plot[3]] == "AD")
+    q <- (df.tmp[, names.plot[4]] == "AD")
+
+    abcd <- sum(x & y & z & q)
+
+    abc <- sum(x & y & z & !q)
+    abd <- sum(x & y & !z & q)
+    acd <- sum(x & !y & z & q)
+    bcd <- sum(!x & y & z & q)
+
+    ab <- sum(x & y & !z & !q)
+    ac <- sum(x & !y & z & !q)
+    ad <- sum(x & !y & !z & q)
+    bc <- sum(!x & y & z & !q)
+    bd <- sum(!x & y & !z & q)
+    cd <- sum(!x & !y & z & q)
+
+    a <- sum(x & !y & !z & !q)
+    b <- sum(!x & y & !z & !q)
+    c <- sum(!x & !y & z & !q)
+    d <- sum(!x & !y & !z & q)
+
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab, c, ac, bc, abc, d, ad, bd, abd, cd, acd, bcd, abcd)
+    plot(w, show = list(Faces = F))
+
+  } else {
+    stop("Sorry, this number of names is not supported yet")
+  }
+
+}
+
+# Unfortunately, there is a bug in Vennerable. Try it, but don't bother if
+# it doesn't work.
+tryCatch(plotVennFromList(target.hmm),
+         error = function(e) print(e))
+
+```
+
+```{r HMM calling_2, fig.height = 5, fig.width = 8}
+
+# 2) Normalized score insize of the HMM-called bins
+# First, combine all bins into one big data frame
+target.hmm.combined <- data.frame(stringsAsFactors = FALSE)
+
+for (i in 1:length(bins.kb)) {
+
+  # Add the bin to the data frame
+  target.hmm.tmp <- cbind(target.hmm[[i]],
+                          rep(bins.kb[i],
+                              times = nrow(target.hmm[[i]])))
+
+  # And change the name
+  names(target.hmm.tmp)[5] <- "bin"
+
+  # Add normalized ratios
+  target.hmm.tmp[, "norm_score"] <- target.norm[[bins.kb[i]]][, "score"]
+
+  # Only select complete cases
+  target.hmm.tmp <- target.hmm.tmp[complete.cases(target.hmm.tmp), ]
+
+  # Add to combined data.frame
+  target.hmm.combined <- rbind(target.hmm.combined,
+                               target.hmm.tmp)
+
+}
+
+
+
+# Create violin plots per bin
+ggplot(target.hmm.combined, aes(x = score, y = norm_score, fill = score)) +
+  facet_grid(. ~ bin) +
+  geom_violin() +
+  geom_boxplot(width = 0.1, outlier.shape = NA) +
+  ylab("DamID scores") +
+  ggtitle(basename) +
+  theme_bw() +
+  theme(legend.position="none")
+
+# Clean-up to prevent memory overflow
+rm(target.hmm.tmp, target.hmm.combined)
+
+```
+
+
+##### SessionInfo
+
+```{r}
+
+sessionInfo()
+
+```
+

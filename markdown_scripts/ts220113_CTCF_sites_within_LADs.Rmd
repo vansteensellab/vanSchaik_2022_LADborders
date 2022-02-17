@@ -1,0 +1,2913 @@
+---
+title: "Correlating DamID changes in WAPL-AID cells with regard to CTCF sites in LADs"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+These days I've been looking often at the pA-DamID data after CTCF, WAPL or 
+CTCF&WAPL depletion. One striking observation in the WAPL-AID cells was a 
+fast detachment of CTCF sites in LADs for a number of cases. Here, I want to
+formalize this analysis.
+
+The following model would be: cohesin is more stable on the DNA and in the 
+presence of CTCF tends to accumulate there. Additionally, the loops become 
+extended and can (potentially) migrate into the LADs. Logically, this will
+not happen at the NL but just below it(?). This means that you will get these
+local dips.
+
+
+### Method
+
+Use deeptools to make reference-point, averaged heatmaps of the CTCF-peak file
+and plot. 
+
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+library(GenomicRanges)
+library(rtracklayer)
+library(gtools)
+library(tidyverse)
+library(data.table)
+library(dtplyr)
+library(ggbeeswarm)
+library(ggplot2)
+library(broom)
+library(ggrastr)
+
+# Prepare output 
+output_dir <- "ts220113_CTCF_sites_within_LADs"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Load input
+input.dir <- "ts220113_GeneExpression"
+tib_fpkm <- readRDS(file.path(input.dir,
+                              "genes_fpkm_mean.rds"))
+genes <- readRDS(file.path(input.dir,
+                           "genes.rds"))
+
+input.dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+gr_LADs_list <- readRDS(file.path(input.dir, "LADs_pA.rds"))
+gr_ctcf_peaks <- readRDS(file.path(input.dir, "CTCF_sites_pA.rds"))
+gr_border_list <- readRDS(file.path(input.dir, "LAD_borders_pA.rds"))
+
+```
+
+Prepare knitr output.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), 
+               message = F, warning = F,
+               fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+Functions.
+
+```{r functions}
+
+RunDeeptools <- function(regions.bed, tracks, expname, output_dir, labels, 
+                         extend = 200000, bin_size = 10000, cores = 20) {
+  
+  # Prepare deeptools call
+  regions.bed <- paste(regions.bed, collapse = " ")
+  tracks.bw <- paste(tracks, collapse = " ")
+  labels <- paste(labels, collapse = " ")
+  
+  output.matrix <- file.path(output_dir, 
+                             paste0(expname, "-deeptoolsMatrix.gz"))
+  output.table <- file.path(output_dir, 
+                            paste0(expname, "-deeptoolsTable.tab"))
+  
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/computeMatrix",
+                          "reference-point",
+                          "-a", format(extend, scientific = FALSE), 
+                          "-b", format(extend, scientific = FALSE),
+                          "-bs", format(bin_size, scientific = FALSE), 
+                          "-p", cores,
+                          "-R", regions.bed,
+                          "-S", tracks.bw,
+                          "--samplesLabel", labels,
+                          #"--outFileNameMatrix", output.table,
+                          "--outFileName", output.matrix)
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+  
+  # Return location of the table
+  output.matrix
+  
+}
+
+PlotHeatmap <- function(matrix, output.file, range = "1.5") {
+  
+  # Prepare deeptools call
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/plotHeatmap",
+                          "-m", matrix,
+                          "-out", output.file, 
+                          "-min", paste0("-", range),
+                          "-max", range,
+                          "--missingDataColor", "0.5",
+                          "--colorMap", "RdBu")
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+    
+}
+
+PlotProfile <- function(matrix, output.file) {
+  
+  # Prepare deeptools call
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/plotProfile",
+                          "-m", matrix,
+                          "--perGroup",
+                          
+                          "-out", output.file)
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+  
+}
+
+PlotCustomProfileWithTibble <- function(matrix, subgroups.idx = NULL, 
+                                        idx.remove = NULL, 
+                                        filter_groups = NULL,
+                                        filter_96 = T, 
+                                        filter_samples = NULL,
+                                        heatmap_pt = F) {
+  # Rewrite the previous function, making use of tibbles and showing the 
+  # confidence interval
+  
+  # Name of the different groups
+  groups <- c("ctcf", "gene.active", "gene.inactive", "random")
+  
+  # Load the profiles
+  tib_data <- read_tsv(matrix, skip = 1, col_names = F)
+  tib_meta <- tib_data[, 1:6]
+  tib_values <- tib_data[, 7:ncol(tib_data)]
+  
+  # Update metadata
+  tib_meta <- tib_meta %>%
+    mutate(class = rep(groups,
+                       times = c(length(ctcf.peaks), 
+                                          length(gr_fpkm.active.LAD),
+                                          length(gr_fpkm.inactive.LAD),
+                                          length(gr_random))))
+  
+  # If I want to further split the lines - more subgroups
+  # This is a list of length #groups, with a vector of T/F or one NA
+  subgroups <- c()
+  subgroups.n <- c()
+  if (! is.null(subgroups.idx)) {
+    for (i in 1:length(groups)) {
+      group <- groups[i]
+      if (! all(is.na(subgroups.idx[[i]]))) {
+        idx <- which(tib_meta$class == group)
+        tib_meta$class[idx] <- paste0(tib_meta$class[idx],
+                                      ifelse(subgroups.idx[[i]], ".far", ".close"))
+        subgroups <- c(subgroups, 
+                       paste0(group, c(".far", ".close")))
+        subgroups.n <- c(subgroups.n, 
+                         sum(subgroups.idx[[i]]),
+                         sum(! subgroups.idx[[i]]))
+      } else {
+        subgroups <- c(subgroups, group)
+        subgroups.n <- c(subgroups.n, 
+                         sum(tib_meta$class == group))
+      }
+    }} else {
+      subgroups <- groups
+      subgroups.n <- as.numeric(table(tib_meta$class))
+    }
+  tib_meta$class <- factor(tib_meta$class, levels = subgroups)
+  
+  # Also, remove unwanted lines
+  if (! is.null(idx.remove)) {
+    tib_values <- tib_values[idx.remove, ]
+    tib_meta <- tib_meta[idx.remove, ]
+  }
+  if (! is.null(filter_groups)) {
+    idx <- str_remove(tib_meta$class, "\\..*") %in% filter_groups
+    tib_values <- tib_values[idx, ]
+    tib_meta <- tib_meta[idx, ]
+  }
+  
+  # Continue with the values
+  labels <- str_remove(data.labels, "^NQ_")
+  
+  
+  # ts220208 - manual fix of PT samples
+  # I need to put a manual fix in for the PT samples. We have old and new data,
+  # and we would like to include both here. I will therefore rename the PT to
+  # `PTold_0h" and use that as separate "cell line".
+  labels <- str_replace(labels, "PT_old", "PTold_0h")
+  
+  
+  tib_values_gather <- tib_values %>%
+    add_column(class = tib_meta$class,
+               n_feature = 1:nrow(.)) %>%
+    rename_at(1:(ncol(.)-2), 
+              ~ paste(rep(labels, each = 40), 1:40, sep = "_")) %>%
+    gather(key, value, -class, -n_feature) %>%
+    
+    # Added to remove bad tracks (without any timepoint)
+    filter(grepl("h_", key)) %>%
+    filter(! grepl("DMSO|EED|GSK", key)) %>%
+    
+    # Separate is very slow for some reason, replace with a manual mutate
+    # separate(key, c("condition", "timepoint", "bin"), remove = F, sep = "_") %>%
+    mutate(condition = str_remove(key, "_.*"),
+           timepoint = str_remove_all(str_extract(key, "_.*_"), "_"),
+           bin = str_remove(key, ".*_")) %>%
+  
+    mutate(condition = factor(condition,
+                              levels = c("PT", "PTold", "CTCF-EL", "CTCF-NQ", "CTCF", 
+                                         "RAD21", "WAPL", "CTCF-WAPL")),
+           timepoint = factor(timepoint, 
+                              levels = c("0h", "6h", "24h", "96h")),
+           bin = as.numeric(bin),
+           distance = -200000 - 5000 + 10000 * bin,
+           distance = distance / 1e3) %>%
+    mutate(value = as.numeric(value))
+  
+  # Filter samples
+  if (filter_96) tib_values_gather <- tib_values_gather %>%
+    filter(timepoint != "96h")
+  if (! is.null(filter_samples)) tib_values_gather <- tib_values_gather %>%
+    filter(! condition %in% filter_samples)
+  
+  # Add numbers to class names
+  tbl <- table(tib_meta$class)
+  idx <- match(tib_values_gather$class, names(tbl))
+  tib_values_gather <- tib_values_gather %>%
+    mutate(class = paste0(class, " (", tbl[idx], ")"))
+  
+  if (! heatmap_pt) {
+    
+    # Plot
+    plt_base <- tib_values_gather %>%
+      drop_na() %>%
+      ggplot() +
+      geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+      geom_hline(yintercept = 0, linetype = "dashed", col = "black") +
+      scale_color_brewer(palette = "Set1") +
+      scale_fill_brewer(palette = "Set1") +
+      xlab("Distance (kb)") +
+      ylab("pA-DamID") +
+      theme_bw() +
+      theme(aspect.ratio = 1,
+            axis.text.x = element_text(angle = 90, hjust = 1))
+    
+    plt <- plt_base +
+      stat_summary(fun = mean, geom = "line", size = 1,
+                   aes(x = distance, y = value, col = class)) +
+      stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+                   aes(x = distance, y = value, fill = class, group = class),
+                   fun.args = list(mult = 1.96)) +
+      facet_grid(timepoint ~ condition)
+    plot(plt)
+    
+    plt <- plt_base +
+      #geom_line(aes(x = location, y = value, col = timepoint)) +
+      stat_summary(fun = mean, geom = "line", size = 1,
+                   aes(x = distance, y = value, col = timepoint)) +
+      stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+                   aes(x = distance, y = value, group = timepoint, 
+                       fill = timepoint),
+                   fun.args = list(mult = 1.96)) +
+      facet_grid(class ~ condition)
+    plot(plt)
+    
+    # plt <- plt_base +
+    #   geom_line(aes(x = location, y = value, col = group)) +
+    #   facet_grid(target ~ timepoint)
+    # plot(plt)
+    
+  }
+  
+  
+  if (heatmap_pt) {
+    
+    # Select data
+    tib_pt <- tib_values_gather %>%
+      filter(condition == "PT" & 
+               timepoint == "0h")
+    
+    # Set limits
+    limits <- quantile(tib_pt$value, c(0.001, 0.999), na.rm = T)
+    tib_pt <- tib_pt %>%
+      mutate(value = replace(value, value < limits[1], limits[1]),
+             value = replace(value, value > limits[2], limits[2]))
+    
+    # Sort by feature and mean score
+    tib_pt <- tib_pt %>%
+      group_by(n_feature) %>%
+      mutate(feature_mean = mean(value, na.rm = T),
+             feature_mean = replace_na(feature_mean, -100)) %>%
+      ungroup() %>%
+      arrange(class, feature_mean) %>%
+      mutate(y_axis = as.character(n_feature),
+             y_axis = factor(y_axis, levels = unique(y_axis)),
+             y_axis = as.numeric(y_axis))
+    
+    
+    for (c in unique(tib_pt$class)) {
+      
+      # Heatmap
+      plt <- tib_pt %>% 
+        filter(class == c) %>% 
+        #drop_na(feature_mean) %>%
+        ggplot(aes(x = distance, y = y_axis, fill = value)) + 
+        rasterize(geom_tile(),
+                  dpi = 300) + 
+        coord_fixed(expand = F) +
+        ggtitle(c) +
+        xlab("Distance (kb)") +
+        scale_fill_gradient2(limits = limits, na.value = "grey80") +
+        theme_bw() +
+        theme(axis.title.y = element_blank(),
+              axis.text.y = element_blank(),
+              axis.ticks.y = element_blank())
+      plot(plt)
+      
+      # Line plot
+      plt <- tib_pt %>%
+        filter(class == c) %>% 
+        drop_na() %>%
+        ggplot() +
+        geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+        geom_hline(yintercept = 0, linetype = "dashed", col = "black") +
+        stat_summary(fun = mean, geom = "line", size = 1,
+                     aes(x = distance, y = value)) +
+        stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+                     aes(x = distance, y = value),
+                     fun.args = list(mult = 1.96)) + 
+        coord_cartesian(ylim = c(-0.5, 1)) +
+        xlab("Distance (kb)") +
+        ylab("pA-DamID") +
+        theme_bw() +
+        theme(aspect.ratio = 1,
+              axis.text.x = element_text(angle = 90, hjust = 1))
+      plot(plt)
+      
+    }
+    
+  }
+  
+  # Calculate local detachment of all features - especially CTCF sites
+  local_detachment.middle <- tib_values_gather %>%
+    filter(distance > -10 & distance < 10) %>%
+    group_by(class, condition, timepoint, n_feature) %>%
+    dplyr::summarise(middle = mean(value, na.rm = T)) %>%
+    ungroup()
+  
+  local_detachment.flanks <- tib_values_gather %>%
+    filter((distance > -110 & distance < -50) |
+             (distance > 50 & distance < 110)) %>%
+    group_by(class, condition, timepoint, n_feature) %>%
+    dplyr::summarise(flank = mean(value, na.rm = T)) %>%
+    ungroup()
+  
+  # Combine 
+  local_detachment <- full_join(local_detachment.middle,
+                                local_detachment.flanks) %>%
+    mutate(detachment = middle - flank)
+  
+  # Plot 1 - all data
+  plt <- local_detachment %>%
+    ggplot(aes(x = timepoint, y = detachment, fill = timepoint)) +
+    geom_boxplot(outlier.shape = NA)  +
+    facet_grid(class ~ condition) +
+    xlab("") +
+    theme_bw() +
+    theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  # Plot 2 - subset of data
+  plt <- local_detachment %>%
+    filter(condition %in% c("CTCF-EL")) %>%
+    ggplot(aes(x = timepoint, y = detachment, fill = timepoint, color = timepoint)) +
+    rasterize(geom_quasirandom(),
+              dpi = 300) +
+    geom_boxplot(outlier.shape = NA, fill = NA, color = "black")  +
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    facet_grid(. ~ class) +
+    coord_cartesian(ylim = c(-2.5, 1.6)) +
+    xlab("") +
+    scale_color_brewer(palette = "Set1") +
+    theme_bw() +
+    theme(aspect.ratio = 1.5,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  # Plot 3 - differences
+  local_detachment_differences <- local_detachment %>%
+    dplyr::select(-middle, -flank) %>%
+    spread(timepoint, detachment) %>%
+    mutate(diff_6h = `6h` - `0h`,
+           diff_24h = `24h` - `0h`) %>%
+    dplyr::select(-`0h`, -`6h`, -`24h`) %>%
+    gather(timepoint, value, contains("diff")) %>%
+    drop_na() %>%
+    mutate(timepoint = str_remove(timepoint, "diff_"),
+           timepoint = factor(timepoint, levels = c("6h", "24h")))
+    
+  plt <- local_detachment_differences %>%
+    filter(! condition %in% c("CTCF-NQ", "CTCF") &
+             ! grepl("close|inactive", class)) %>%
+    ggplot(aes(x = condition, y = value, fill = condition, color = condition)) +
+    rasterize(geom_quasirandom(),
+              dpi = 300) +
+    geom_boxplot(outlier.shape = NA, fill = NA, color = "black")  +
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    facet_grid(timepoint ~ class) +
+    coord_cartesian(ylim = c(-1.5, 1.5)) +
+    xlab("") +
+    scale_color_brewer(palette = "Set2") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  # Get average difference
+  local_detachment_score <- local_detachment %>%
+    dplyr::select(-middle, -flank) %>%
+    mutate(timepoint = paste0("t_", timepoint)) %>%
+    spread(timepoint, detachment) %>%
+    mutate(`6h` = t_6h - t_0h,
+           `24h` = t_24h - t_0h) %>%
+    dplyr::select(class, condition, n_feature, `6h`, `24h`) %>%
+    gather(timepoint, value, `6h`, `24h`) %>%
+    drop_na() %>%
+    group_by(condition, timepoint, class) %>%
+    dplyr::summarise(diff_mean = mean(value, na.rm = T),
+                     diff_sd = sd(value, na.rm = T)) %>%
+    ungroup()
+  
+  
+  # Get statistics
+  local_detachment_summary <- local_detachment %>%
+    dplyr::select(-middle, -flank) %>%
+    mutate(timepoint = paste0("t_", timepoint)) %>%
+    spread(timepoint, detachment) %>%
+    group_by(condition, class)
+  
+  stat_6h <- local_detachment_summary %>%
+    filter(! condition %in% c("PT", "PTold")) %>%
+    dplyr::summarise(pvalue = wilcox.test(t_0h, 
+                                          t_6h)$p.value) %>%
+    ungroup() %>%
+    add_column(timepoint = "6h")
+  
+  stat_24h <- local_detachment_summary %>%
+    filter(! condition %in% c("PTold")) %>%
+    dplyr::summarise(pvalue = wilcox.test(t_0h, 
+                                          t_24h)$p.value) %>%
+    ungroup() %>%
+    add_column(timepoint = "24h")
+  
+  local_detachment_stat <- bind_rows(stat_6h,
+                                     stat_24h) %>%
+    mutate(padj = p.adjust(pvalue)) %>%
+    full_join(local_detachment_score)
+  
+  # Return effect size and statistics
+  invisible(local_detachment_stat)
+  
+}
+
+PlotCustomProfile <- function(matrix, subgroups.idx = NULL, idx.remove = NULL, 
+                              filter_96 = T, filter_samples = NULL) {
+
+  groups <- c("ctcf", "gene.active", "gene.inactive", "random")
+  
+  # Load the profiles
+  matrix.norm.data <- read.table(matrix, sep = "\t", skip = 1)
+  matrix.norm.meta <- matrix.norm.data[, 1:6]
+  matrix.norm.values <- matrix.norm.data[, 7:ncol(matrix.norm.data)]
+  
+  # Add metadata
+  matrix.norm.meta$class <- rep(groups, 
+                                times = c(length(ctcf.peaks), 
+                                          length(gr_fpkm.active.LAD),
+                                          length(gr_fpkm.inactive.LAD),
+                                          length(gr_random)))
+  
+  # If I want to further split the lines - more subgroups
+  # This is a list of length #groups, with a vector of T/F or one NA
+  subgroups <- c()
+  subgroups.n <- c()
+  if (! is.null(subgroups.idx)) {
+    for (i in 1:length(groups)) {
+      group <- groups[i]
+      if (! is.na(subgroups.idx[[i]][1])) {
+        idx <- which(matrix.norm.meta$class == group)
+        matrix.norm.meta$class[idx] <- paste0(matrix.norm.meta$class[idx],
+                                              ifelse(subgroups.idx[[i]], ".far", ".close"))
+        subgroups <- c(subgroups, 
+                       paste0(group, c(".far", ".close")))
+        subgroups.n <- c(subgroups.n, 
+                         sum(subgroups.idx[[i]]),
+                         sum(! subgroups.idx[[i]]))
+      } else {
+        subgroups <- c(subgroups, group)
+        subgroups.n <- c(subgroups.n, 
+                         sum(matrix.norm.meta$class == group))
+      }
+  }} else {
+      subgroups <- groups
+      subgroups.n <- as.numeric(table(matrix.norm.meta$class))
+  }
+  matrix.norm.meta$class <- factor(matrix.norm.meta$class, levels = subgroups)
+  
+  # Filter certain regions if necessary
+  if (! is.null(idx.remove)) {
+    matrix.norm.values <- matrix.norm.values[idx.remove, ]
+    matrix.norm.meta <- matrix.norm.meta[idx.remove, ]
+  }
+  
+  # Calculate the mean per group
+  matrix.norm.values.flat <- do.call(rbind,
+                                     tapply(1:nrow(matrix.norm.values),
+                                            matrix.norm.meta$class,
+                                            function(x) {
+                                              colMeans(matrix.norm.values[x, ], na.rm = T)
+                                            }))
+  
+  # Separate the different groups
+  groups <- rep(data.labels, each = 40)
+  matrix.norm.values.flat <- data.frame(do.call(rbind, 
+                                                tapply(1:ncol(matrix.norm.values.flat),
+                                                       groups,
+                                                       function(x) matrix.norm.values.flat[, x])))
+  matrix.norm.values.flat$sample <- rep(data.labels, each = length(subgroups))
+  matrix.norm.values.flat$group <- rep(subgroups, 
+                                       times = 12)
+  matrix.norm.values.flat <- melt(matrix.norm.values.flat, 
+                                  id.vars = c("sample", "group"))
+  
+  # Convert variable to value
+  n.bins <- length(unique(matrix.norm.values.flat$variable))
+  bin.size <- 10000
+  
+  matrix.norm.values.flat$location <- -5000 + 10000 * (as.numeric(matrix.norm.values.flat$variable) - 20)
+  matrix.norm.values.flat$location <- matrix.norm.values.flat$location / 1e6
+  
+  # Add other metadata
+  df <- matrix.norm.values.flat
+  df$sample <- gsub("^NQ_", "", df$sample)
+  df$target <- gsub("_.*", "", df$sample)
+  df$target <- gsub("-[0-9].*", "", df$target)
+  df$target <- factor(df$target, 
+                      levels = c("PT", "CTCF-EL", "CTCF-NQ", "CTCF",
+                                 "RAD21", "WAPL", "CTCF-WAPL"))
+  df$timepoint <- gsub(".*[_|-]", "", df$sample)
+  df$timepoint <- factor(df$timepoint, levels = unique(df$timepoint))
+  
+  if (filter_96) df <- df[df$timepoint != "96h", ]
+  if (! is.null(filter_samples)) df <- df[! df$target %in% filter_samples, ]
+  
+  # Add numbers to group names
+  tbl <- table(matrix.norm.meta$class)
+  idx <- match(df$group, names(tbl))
+  df$group <- paste0(df$group, " (", tbl[idx], ")")
+  
+  # Plot
+  plt_base <- ggplot(df) +
+    scale_color_brewer(palette = "Set1") +
+    xlab("Distance (Mb)") +
+    ylab("pA-DamID") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plt <- plt_base +
+    geom_line(aes(x = location, y = value, col = target)) +
+    facet_grid(group ~ timepoint)
+  #plot(plt)
+  
+  plt <- plt_base +
+    geom_line(aes(x = location, y = value, col = timepoint)) +
+    facet_grid(target ~ group)
+  plot(plt)
+  
+  plt <- plt_base +
+    geom_line(aes(x = location, y = value, col = group)) +
+    facet_grid(target ~ timepoint)
+  #plot(plt)
+  
+}
+
+ClassifyAnchor <- function(anchor, LADs, LAD.border, max_distance = 2e4) {
+  
+  # Overlaps with LAD - completely within LAD!
+  anchor$LAD <- findOverlaps(anchor, LADs, ignore.strand = T,
+                             select = "arbitrary")
+  anchor$overlaps_LAD <- ! is.na(anchor$LAD)
+  
+  dis <- as_tibble(distanceToNearest(anchor, LADs, ignore.strand = T))
+  anchor$LAD[dis$queryHits] <- dis$subjectHits
+  
+  # Overlaps with LAD borders
+  ovl <- as_tibble(findOverlaps(anchor, LAD.border, ignore.strand = T))
+  dis <- as_tibble(distanceToNearest(anchor, LAD.border, ignore.strand = T))
+  
+  # Add distances
+  anchor$border <- anchor$distance_to_border <- NA
+  anchor$border[dis$queryHits] <- dis$subjectHits
+  anchor$distance_to_border[dis$queryHits] <- dis$distance
+  
+  # Add overlapping anchors
+  anchor$ovl_border <- case_when(anchor$overlaps_LAD == T ~ F,
+                                 anchor$distance_to_border < (max_distance + 5) ~ 
+                                   T,
+                                 T ~ F)
+  
+  # Add border class
+  anchor$border_class <- LAD.border$CTCF_strand[anchor$border]
+  
+  anchor
+  
+}
+
+```
+
+
+### 1. DeepTools
+
+Run deeptools for CTCF-sites in the WAPL-AID cell line at t=0h. 
+
+First though, prepare the CTCF bed file for CTCFs in LADs. Also, read loop 
+anchors from Bonev, 2017 and overlay these with the CTCF sites. This is all 
+in preparation for later analyses in this document.
+
+```{r prepare CTCF bed file, cache = T}
+
+# Load LADs
+#LADs <- import("../results_NQ/HMM/bin-10kb/pADamID_PT_0h-10kb-combined_AD.bed.gz")
+#LADs <- GenomicRanges::reduce(unlist(as(gr_LADs_list, "GRangesList")))
+LADs <- gr_LADs_list[[1]]
+seqlevels(LADs, pruning = "coarse") <- c(paste0("chr", 1:19), "chrX")
+
+saveRDS(LADs, file.path(output_dir, "LADs.rds"))
+
+# Also, get the LAD border for later on
+#LAD.border <- GRanges(seqnames = rep(seqnames(LADs), times = 2), 
+#                       ranges = IRanges(start = c(start(LADs), end(LADs)),
+#                                        end = c(start(LADs), end(LADs))))
+LAD.border <- gr_border_list[[1]]
+LAD.border$CTCF_strand <- factor(LAD.border$CTCF_strand,
+                                 levels = c("outwards", "inwards", 
+                                            "ambiguous", "nonCTCF"))
+
+# Load CTCF peaks
+ctcf.peaks.all <- gr_ctcf_peaks[[1]]
+
+
+
+# Update 200804 - also filter for loop anchors rather than CTCF peaks only
+loops <- read_tsv("Data_NQ/HiC/Bonev_mESC_mm10_loops.txt",
+                  col_types = cols(.default = col_double(),
+                                   color = col_character(),
+                                   chr1 = col_character(),
+                                   chr2 = col_character())) %>%
+  drop_na() %>%
+  mutate(chr1 = paste0("chr", chr1),
+         chr2 = paste0("chr", chr2))
+
+loop.anchors <- bind_rows(loops[, 1:3] %>% 
+                            rename_all(~ c("seqnames", "start", "end")),
+                          loops[, 4:6] %>% 
+                            rename_all(~ c("seqnames", "start", "end"))) %>%
+  as(., "GRanges") %>%
+  GenomicRanges::reduce(.) %>%
+  sort(.)
+
+export.bed(loop.anchors,
+           file.path(output_dir, "loop_anchors.bed"))
+
+# Link the loop anchors to CTCF peaks
+# Get anchors first
+anchor_1 <- loops[, 1:3] %>% 
+  rename_all(~ c("seqnames", "start", "end")) %>%
+  add_column(anchor = "anchor_1",
+             anchor_id = 1:nrow(.),
+             loops_with = 1:nrow(.)) %>%
+  as("GRanges")
+anchor_2 <- loops[, 4:6] %>% 
+  rename_all(~ c("seqnames", "start", "end")) %>%
+  add_column(anchor = "anchor_2",
+             anchor_id = 1:nrow(.),
+             loops_with = 1:nrow(.)) %>%
+  as("GRanges")
+
+# Sort
+idx <- order(anchor_1)
+anchor_1 <- anchor_1[idx]
+anchor_2 <- anchor_2[idx]
+
+# Add information from LADs / borders
+anchor_1 <- ClassifyAnchor(anchor_1, LADs = LADs, LAD.border = LAD.border)
+anchor_2 <- ClassifyAnchor(anchor_2, LADs = LADs, LAD.border = LAD.border)
+
+anchors <- c(anchor_1, anchor_2)
+mcols(anchors) <- as_tibble(anchors) %>%
+  mutate(anchor_id = case_when(anchor == "anchor_2" ~ 
+                                  anchor_id + length(anchor_1),
+                                T ~ anchor_id),
+         loops_with = case_when(anchor == "anchor_1" ~ 
+                                  loops_with + length(anchor_1),
+                                T ~ loops_with)) %>%
+  # Add information of looping partners
+  mutate(partner_overlaps_LAD = overlaps_LAD[match(loops_with, anchor_id)],
+         partner_LAD = LAD[match(loops_with, anchor_id)],
+         partner_distance_to_border = distance_to_border[match(loops_with, anchor_id)],
+         partner_ovl_border = ovl_border[match(loops_with, anchor_id)],
+         partner_border = border[match(loops_with, anchor_id)],
+         partner_border_class = border_class[match(loops_with, anchor_id)]) %>%
+  # Add information on loop length
+  mutate(loop_length = 
+           abs(((start + end) / 2) - 
+                 ((start[match(loops_with, anchor_id)] + 
+                     end[match(loops_with, anchor_id)]) / 2))) %>%
+  dplyr::select(-seqnames, -start, -end, -strand, -width)
+
+# Add directionality based on CTCF motif to the anchors
+tib <- as_tibble(findOverlaps(anchors, ctcf.peaks.all)) %>%
+  mutate(motif = ctcf.peaks.all$motif_strand[subjectHits]) %>%
+  drop_na() %>%
+  group_by(queryHits) %>%
+  dplyr::summarise(strand = case_when(all(motif == "+") ~ "+",
+                                      all(motif == "-") ~ "-",
+                                      T ~ "ambiguous"))
+
+anchors$motif_orientation <- NA
+anchors$motif_orientation[tib$queryHits] <- tib$strand
+
+as_tibble(anchors) %>%
+  mutate(motif_partner = motif_orientation[loops_with]) %>%
+  filter(anchor == "anchor_1") %>%
+  drop_na(motif_orientation, motif_partner) %>%
+  filter(motif_orientation %in% c("+", "-") &
+           motif_partner %in% c("+", "-")) %>%
+  mutate(motif_accordance = case_when(motif_orientation == "+" & 
+                                        motif_partner == "-" ~ "convergent",
+                                      motif_orientation == "-" & 
+                                        motif_partner == "+" ~ "divergent",
+                                      T ~ "tandem")) %>%
+  dplyr::summarise(convergent = mean(motif_accordance == "convergent"),
+                   divergent = mean(motif_accordance == "divergent"),
+                   tandem = mean(motif_accordance == "tandem")) %>%
+  gather(key, value) %>%
+  ggplot(aes(x = 1, y = value, fill = key)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  xlab("") +
+  ylab("Fraction loops") +
+  theme_classic() +
+  theme(aspect.ratio = 1/5)
+
+
+
+
+
+
+# Determine overlap with anchors
+# 1) CTCF peaks
+max_distance <- 1
+
+tib <- as_tibble(findOverlaps(ctcf.peaks.all, anchors)) %>%
+  mutate(anchor_id = anchors$anchor_id[subjectHits]) %>%
+  mutate(loop_length = anchors$loop_length[match(anchor_id, anchors$loops_with)],
+         partner_LAD = anchors$LAD[match(anchor_id, anchors$loops_with)],
+         partner_LAD_distance = anchors$distance_to_border[match(anchor_id, anchors$loops_with)],
+         partner_overlap_LAD = anchors$overlaps_LAD[match(anchor_id, anchors$loops_with)]) %>%
+  group_by(queryHits) %>%
+  summarise(n = n (),
+            LAD = all(partner_overlap_LAD),
+            iLAD = all(! partner_overlap_LAD),
+            loop_length_mean = mean(loop_length),
+            #loop_length_median = median(loop_length),
+            partner_LAD_distance = median(partner_LAD_distance)) %>%
+  mutate(class = case_when(LAD == T ~ "LAD",
+                           #iLAD == T ~ "iLAD",
+                           iLAD == T & partner_LAD_distance > (max_distance+5) ~ 
+                             "iLAD",
+                           iLAD == T & partner_LAD_distance <= (max_distance+5) ~ 
+                             "LAD_border",
+                           T ~ "ambiguous"),
+         class = factor(class,
+                        levels = c("LAD", "LAD_border", "iLAD", "ambiguous")))
+
+ctcf.peaks.all$loops <- ctcf.peaks.all$loop_length <- NA_real_
+ctcf.peaks.all$loops[tib$queryHits] <- tib$n
+ctcf.peaks.all$loop_length[tib$queryHits] <- tib$loop_length_mean
+
+ctcf.peaks.all$overlap_loop <- F
+ctcf.peaks.all$overlap_loop[tib$queryHits] <- T
+ctcf.peaks.all$loop_class <- NA_character_
+ctcf.peaks.all$loop_class[tib$queryHits] <- as.character(tib$class)
+ctcf.peaks.all$loop_class <- factor(ctcf.peaks.all$loop_class,
+                                    levels = levels(tib$class))
+
+ctcf.peaks.all$partner_LAD_distance <- NA
+ctcf.peaks.all$partner_LAD_distance[tib$queryHits] <- tib$partner_LAD_distance
+
+
+
+# 2) LAD borders
+max_distance <- 2e4
+tib <- as_tibble(distanceToNearest(anchors, LAD.border)) %>%
+  filter(distance < (max_distance + 5)) %>%
+  mutate(anchor_id = anchors$anchor_id[queryHits]) %>%
+  mutate(loop_length = anchors$loop_length[match(anchor_id, anchors$loops_with)],
+         partner_LAD = anchors$LAD[match(anchor_id, anchors$loops_with)],
+         partner_LAD_distance = anchors$distance_to_border[match(anchor_id, anchors$loops_with)],
+         partner_overlap_LAD = anchors$overlaps_LAD[match(anchor_id, anchors$loops_with)]) %>%
+  group_by(subjectHits) %>%
+  summarise(n = n (),
+            LAD = all(partner_overlap_LAD),
+            iLAD = all(! partner_overlap_LAD),
+            loop_length_mean = mean(loop_length),
+            loop_length_median = median(loop_length),
+            partner_LAD_distance = median(partner_LAD_distance)) %>%
+  mutate(class = case_when(LAD == T ~ "LAD",
+                           #iLAD == T ~ "iLAD",
+                           iLAD == T & partner_LAD_distance > (max_distance+5) ~ 
+                             "iLAD",
+                           iLAD == T & partner_LAD_distance <= (max_distance+5) ~ 
+                             "LAD_border",
+                           T ~ "ambiguous"),
+         class = factor(class,
+                        levels = c("LAD", "LAD_border", "iLAD", "ambiguous")))
+
+LAD.border$loops <- LAD.border$loop_length <- NA_real_
+LAD.border$loops[tib$subjectHits] <- tib$n
+LAD.border$loop_length[tib$subjectHits] <- tib$loop_length_mean
+
+LAD.border$overlap_loop <- F
+LAD.border$overlap_loop[tib$subjectHits] <- T
+LAD.border$loop_class <- NA_character_
+LAD.border$loop_class[tib$subjectHits] <- as.character(tib$class)
+LAD.border$loop_class <- factor(LAD.border$loop_class,
+                                levels = levels(tib$class))
+
+LAD.border$partner_LAD_distance <- NA
+LAD.border$partner_LAD_distance[tib$subjectHits] <- tib$partner_LAD_distance
+
+
+
+# 3) Add gene expression information to CTCF peaks
+# subset genes for activity
+genes_tss <- genes
+genes_tss$PT_0h <- tib_fpkm$WT_0h
+start(genes_tss) <- end(genes_tss) <- ifelse(strand(genes_tss) == "+",
+                                             start(genes_tss),
+                                             end(genes_tss))
+
+# Overlap with genes
+genes_active <- genes[tib_fpkm$WT_0h >= 1]
+genes_inactive <- genes[tib_fpkm$WT_0h < 1]
+
+ctcf.peaks.all$overlap_genes_active <- overlapsAny(ctcf.peaks.all, 
+                                                   genes_active,
+                                                   ignore.strand = T)
+ctcf.peaks.all$overlap_genes_inactive <- overlapsAny(ctcf.peaks.all, 
+                                                     genes_inactive,
+                                                     ignore.strand = T)
+
+# Distance to active genes
+genes_tss_active <- genes_tss[tib_fpkm$WT_0h >= 1]
+genes_tss_inactive <- genes_tss[tib_fpkm$WT_0h < 1]
+
+dis_active <- as_tibble(distanceToNearest(ctcf.peaks.all, genes_active, ignore.strand = T)) %>%
+  mutate(distance = ifelse(distance > 100e3, 100e3, distance))
+dis_inactive <- as_tibble(distanceToNearest(ctcf.peaks.all, genes_inactive, ignore.strand = T)) %>%
+  mutate(distance = ifelse(distance > 100e3, 100e3, distance))
+
+ctcf.peaks.all$distance_genes_active <- - dis_active$distance
+ctcf.peaks.all$distance_genes_inactive <- - dis_inactive$distance
+
+# Add expression when distance < 100kb or when overlapping
+dis_active_filter <- dis_active %>%
+  filter(distance < 100e3 |
+           queryHits %in% which(ctcf.peaks.all$overlap_genes_active))
+ctcf.peaks.all$expression_genes_active <- NA
+ctcf.peaks.all$expression_genes_active[dis_active_filter$queryHits] <-
+  log2(genes_tss_active$PT_0h[dis_active_filter$subjectHits]+1)
+
+
+# Overlap CTCF with RDC / RSC domains
+cohesin_domains <- read_tsv("ts210322_cohesin_loss_and_NL_changes/rad21_loss_gain_merged_2019-06.bed",
+                            col_names = c("seqnames", "start", "end", "class"))
+
+ctcf.peaks.all$cohesin_change = "stable"
+ctcf.peaks.all$cohesin_change[overlapsAny(ctcf.peaks.all,
+                                          cohesin_domains %>%
+                                            filter(class == "loss") %>%
+                                            as(., "GRanges"),
+                                          ignore.strand = T)] <- "loss"
+ctcf.peaks.all$cohesin_change[overlapsAny(ctcf.peaks.all,
+                                          cohesin_domains %>%
+                                            filter(class == "gain") %>%
+                                            as(., "GRanges"),
+                                          ignore.strand = T)] <- "gain"
+
+
+```
+
+A simple quality control to include is the overlay of CTCF motif orientation 
+with genomic loops. As the figure above shows, we observe the expected 
+enrichment of convergent CTCF sites between genomic loops. This indicates that
+our data processing has been good.
+
+
+### 1.1 Looping domains
+
+Before actually looking at the detachment of CTCF sites within LADs, I first
+compare same numbers. What is everything looping with?
+
+First, look at loop anchors.
+
+```{r ctcf looping, cache = T, fig.width = 5, fig.height = 3.5}
+
+# Question 1) How often are loop anchors overlapping with LAD borders and LADs?
+tib_anchors <- as_tibble(anchors)
+
+tib_anchors %>%
+  mutate(ovl = case_when(overlaps_LAD == T ~ "LAD",
+                         ovl_border == T ~ "border",
+                         T ~ "iLAD"),
+         ovl = factor(ovl, levels = c("LAD", "border", "iLAD"))) %>%
+  group_by(ovl) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x = ovl, y = n)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(aspect.ratio = 3,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+
+# Question 2a) What are LADs looping with?
+tib_plot <- tib_anchors %>%
+  filter(overlaps_LAD == TRUE) %>%
+  mutate(partner = case_when(partner_overlaps_LAD == T & 
+                               partner_LAD == LAD ~ 
+                               "LAD_same",
+                             partner_overlaps_LAD == T & 
+                               partner_LAD != LAD ~ 
+                               "LAD_different",
+                             partner_ovl_border == T &
+                               partner_LAD == LAD ~ 
+                               "border_same",
+                             partner_ovl_border == T &
+                               partner_LAD != LAD ~ 
+                               "border_different",
+                             T ~ "iLAD"),
+         partner = factor(partner, levels = c("LAD_same", "LAD_different",
+                                              "border_same", "border_different",
+                                              "iLAD")))
+
+tib_plot %>%
+  group_by(partner) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x = partner, y = n)) +
+  geom_bar(stat = "identity") +
+  ggtitle("LAD anchors") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_plot %>%
+  ggplot(aes(x = partner, y = loop_length)) +
+  geom_quasirandom() +
+  ggtitle("LAD anchors") +
+  scale_y_log10() +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Question 2b) What are LAD borders looping with?
+tib_plot <- tib_anchors %>%
+  filter(ovl_border == TRUE) %>%
+  mutate(partner = case_when(partner_overlaps_LAD == T & 
+                               partner_LAD == LAD ~ 
+                               "LAD_same",
+                             partner_overlaps_LAD == T & 
+                               partner_LAD != LAD ~ 
+                               "LAD_different",
+                             partner_ovl_border == T &
+                               partner_LAD == LAD ~ 
+                               "border_same",
+                             partner_ovl_border == T &
+                               partner_LAD != LAD ~ 
+                               "border_different",
+                             T ~ "iLAD"),
+         partner = factor(partner, levels = c("LAD_same", "LAD_different",
+                                              "border_same", "border_different",
+                                              "iLAD")))
+
+tib_plot %>%
+  group_by(partner) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x = partner, y = n)) +
+  geom_bar(stat = "identity") +
+  ggtitle("LAD-border anchors") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_plot %>%
+  group_by(partner, border_class) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x = partner, y = n, fill = border_class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  ggtitle("LAD-border anchors") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_plot %>%
+  group_by(partner, border_class) %>%
+  summarise(n = n()) %>%
+  ggplot(aes(x = border_class, y = n, fill = partner)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  ggtitle("LAD-border anchors") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+  
+
+```
+
+I can do a lot of things with this, but these plots are not really addressing
+the questions that I want to address. To do that, I should look at LAD borders
+instead.
+
+```{r lad border looping, cache = T, fig.width = 5, fig.height = 3.5}
+
+# Get data
+tib <- as_tibble(LAD.border) %>%
+  filter(ovl_gene == F)
+
+# Question 1) How many borders are overlapping with looping anchors?
+tib %>%
+  group_by(overlap_loop, CTCF_strand) %>%
+  summarise(n = n()) %>%
+  group_by(CTCF_strand) %>%
+  mutate(fraction = n / sum(n)) %>%
+  filter(overlap_loop == T) %>%
+  ggplot(aes(x = CTCF_strand, y = fraction, fill = CTCF_strand)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("") +
+  ylab("Fraction") +
+  #scale_fill_grey() +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib %>%
+  group_by(overlap_loop, CTCF) %>%
+  summarise(n = n()) %>%
+  group_by(CTCF) %>%
+  mutate(fraction = n / sum(n)) %>%
+  filter(overlap_loop == T) %>%
+  ggplot(aes(x = CTCF, y = fraction, fill = CTCF)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("") +
+  ylab("Fraction") +
+  #scale_fill_grey() +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Answer 1) About 60% when overlapping CTCF
+
+
+# Question 2) What are the borders looping with, for each border class?
+tib %>%
+  filter(overlap_loop == T) %>%
+  group_by(loop_class, CTCF_strand) %>%
+  summarise(n = n()) %>%
+  group_by(CTCF_strand) %>%
+  mutate(fraction = n / sum(n)) %>%
+  ggplot(aes(x = CTCF_strand, y = fraction, fill = loop_class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("") +
+  ylab("Fraction") +
+  scale_fill_grey() +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib %>%
+  drop_na(loop_class) %>%
+  mutate(loop_class = replace(loop_class, loop_class == "LAD_border", "iLAD")) %>%
+  filter(overlap_loop == T) %>%
+  group_by(loop_class, CTCF_strand) %>%
+  summarise(n = n()) %>%
+  group_by(CTCF_strand) %>%
+  mutate(fraction = n / sum(n)) %>%
+  filter(loop_class != "ambiguous") %>%
+  ggplot(aes(x = CTCF_strand, y = fraction, fill = loop_class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("") +
+  ylab("Fraction") +
+  scale_fill_grey() +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+tib %>%
+  drop_na(loop_class) %>%
+  mutate(loop_class = replace(loop_class, loop_class == "LAD_border", "iLAD")) %>%
+  filter(overlap_loop == T) %>%
+  group_by(loop_class, CTCF) %>%
+  summarise(n = n()) %>%
+  group_by(CTCF) %>%
+  mutate(fraction = n / sum(n)) %>%
+  filter(loop_class != "ambiguous") %>%
+  ggplot(aes(x = CTCF, y = fraction, fill = loop_class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("") +
+  ylab("Fraction") +
+  scale_fill_grey() +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Answer 2) A bit of everything. Inwards slightly more with LADs (as expected)
+
+
+# Question 3) What is the loop length at the different borders
+tib %>%
+  filter(overlap_loop == T) %>%
+  ggplot(aes(x = CTCF_strand, y = loop_length)) +
+  geom_quasirandom() +
+  geom_boxplot(col = "red", fill = NA, outlier.shape = NA) +
+  xlab("") +
+  ylab("Loop length") +
+  scale_fill_grey() +
+  scale_y_log10() +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Answer 3) Similar between borders
+
+
+```
+
+This should answer all questions about LAD borders and related looping:
+
+  1. CTCF-overlapping borders are more often involved in looping.
+  2. Inwards CTCF is a bit enriched in LAD partners, but not much.
+  
+  
+That leaves similar questions for CTCF sites within LADs.
+
+```{r ctcf peak looping, cache = T, fig.width = 5, fig.height = 3.5}
+
+# Get data
+tib <- as_tibble(ctcf.peaks.all)
+
+# Question 1) How many ctcf peaks are overlapping with looping anchors?
+tib %>%
+  group_by(overlap_loop, overlap.LAD) %>%
+  summarise(n = n()) %>%
+  group_by(overlap.LAD) %>%
+  mutate(fraction = n / sum(n)) %>%
+  ungroup() %>%
+  filter(overlap_loop == T) %>%
+  mutate(overlap.LAD = ifelse(overlap.LAD, "LAD", "iLAD")) %>%
+  ggplot(aes(x = overlap.LAD, y = fraction)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("") +
+  ylab("Fraction CTCF overlaps with loop") +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Answer 1) About 20% of CTCF sites in iLADs and 30% sites in LADs. Weird.
+
+
+# Question 2) What are the CTCF sites looping with?
+tib %>%
+  filter(overlap_loop == T) %>%
+  mutate(loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", 
+                              "iLAD")) %>%
+  group_by(loop_class, overlap.LAD) %>%
+  summarise(n = n()) %>%
+  group_by(overlap.LAD) %>%
+  mutate(fraction = n / sum(n)) %>%
+  ungroup() %>%
+  filter(loop_class != "ambiguous") %>%
+  mutate(overlap.LAD = ifelse(overlap.LAD, "LAD", "iLAD")) %>%
+  ggplot(aes(x = overlap.LAD, y = fraction, fill = loop_class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  xlab("") +
+  ylab("Fraction looping partner") +
+  scale_fill_grey() +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Answer 2) As expected, CTCF sites within LADs loop mostly with CTCF sites 
+# within LADs. Also for iLADs and iLADs.
+
+
+# Question 3) What is the loop length at the ctcf sites
+tib %>%
+  filter(overlap_loop == T) %>%
+  ggplot(aes(x = overlap.LAD, y = loop_length)) +
+  geom_quasirandom() +
+  geom_boxplot(col = "red", fill = NA, outlier.shape = NA) +
+  xlab("") +
+  ylab("Loop length") +
+  scale_fill_grey() +
+  scale_y_log10() +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Answer 3) LAD loops are longer. Also not new I think but general for B 
+# compartments
+
+# Finally, let's classify CTCF peaks on this, and determine whether they behave
+# differently
+
+```
+
+This should answer all questions about CTCF sites within LADs and related 
+looping:
+
+  1. Strangely enough, CTCF sites within LADs are more often involved in 
+     looping. 
+  2. CTCF siteds within LADs are mostly looping with other LAD sites, and 
+     vice-versa for iLADs.
+  3. Loops in LADs are longer, as previously reported for the B compartment.
+  
+Save the CTCF peaks as bed files for deeptools.  
+
+```{r save ctcf peaks, cache = T}
+
+# Filter for
+# 1) CTCF peaks in LADs
+ctcf.peaks <- ctcf.peaks.all[ctcf.peaks.all$overlap.LAD == T]
+
+# Make a bed file of this
+ctcf.bed <- file.path(output_dir, "ctcf_filtered.bed")
+export.bed(ctcf.peaks, ctcf.bed)
+
+ctcf_filtered_ilad.bed <- file.path(output_dir, "ctcf_filtered_ilad.bed")
+export.bed(ctcf.peaks.all[! ctcf.peaks.all %over% LADs], 
+           ctcf_filtered_ilad.bed)
+
+ctcf_all.bed <- file.path(output_dir, "ctcf_all.bed")
+export.bed(ctcf.peaks.all, 
+           ctcf_all.bed)
+
+```
+
+
+### 1.2 Continue with Deeptools
+
+Continue, with gathering the genes.
+
+```{r prepare genes, cache = T}
+
+# Add expression to genes
+gr_fpkm <- genes
+mcols(gr_fpkm) <- data.frame(ensembl_id = tib_fpkm$ensembl_id,
+                             WT = tib_fpkm$WT_0h)
+
+# Filter chromosomes, "unknown" genes
+gr_fpkm <- gr_fpkm[seqnames(gr_fpkm) %in% c(paste0("chr", 1:19), "chrX")]
+
+gr_fpkm_tss <- gr_fpkm
+start(gr_fpkm_tss) <- end(gr_fpkm_tss) <- ifelse(strand(gr_fpkm_tss) == "+", 
+                                                 start(gr_fpkm_tss),
+                                                 end(gr_fpkm_tss))
+
+# Filter for LADs
+gr_fpkm.active.LAD <- gr_fpkm[gr_fpkm %over% LADs & gr_fpkm$WT >= 1]
+gr_fpkm.inactive.LAD <- gr_fpkm[gr_fpkm %over% LADs & gr_fpkm$WT < 1]
+gr_fpkm.active <- gr_fpkm[gr_fpkm$WT >= 1]
+
+# Export to beds
+genes.active.bed <- file.path(output_dir, "genes.active.bed")
+export.bed(gr_fpkm.active.LAD, genes.active.bed)
+
+genes.inactive.bed <- file.path(output_dir, "genes.inactive.bed")
+export.bed(gr_fpkm.inactive.LAD, genes.inactive.bed)
+
+```
+
+Next, prepare random LAD regions as negative control. Approximately a similar
+number as the CTCF sites should be enough.
+
+```{r prepare random LAD regions, cache = T}
+
+# Generate random DNA sequences
+chr.sizes <- read.table("~/mydata/data/genomes/mm10/mm10.chrom.sizes", sep = "\t")
+
+generateRandomPos <- function(n,chr,chr.sizes,width=1){
+  # https://www.biostars.org/p/225520/
+  random_chr <- sample(x=chr,size=n,prob=chr.sizes,replace=T)
+  random_pos <- sapply(random_chr,function(chrTmp){sample(chr.sizes[chr==chrTmp],1)}) 
+  res <- GRanges(random_chr,IRanges(random_pos,random_pos+width))
+  
+  # Do remove chrY and sort
+  res <- res[! seqnames(res) == "chrY"]
+  seqlevels(res) <- chr
+  return(sort(res))
+}
+set.seed(125)
+gr_random <- generateRandomPos(3000, seqlevels(LADs), 
+                               chr.sizes = chr.sizes[match(seqlevels(LADs), chr.sizes[, 1]), 2])
+gr_random_ilad <- gr_random[! gr_random %over% LADs]
+gr_random <- gr_random[gr_random %over% LADs]
+
+# Make bed file
+random.bed <- file.path(output_dir, "random.bed")
+export.bed(gr_random, random.bed)
+
+random_ilad.bed <- file.path(output_dir, "random_ilad.bed")
+export.bed(gr_random_ilad, random_ilad.bed)
+
+```
+
+Next, save the z-normalized Lamin B1 tracks for deeptools.
+
+```{r prepare scaled data tracks, cache = T}
+
+# Scaled data tracks
+data.tracks <- dir("../results_NQ/tracks/normalized/bin-10kb/", full.names = T)
+data.tracks.combined <- grep("combined", data.tracks, invert = F, value = T)
+
+padamid.scaled.dir <- file.path(output_dir, "bigwig_scaled")
+dir.create(padamid.scaled.dir, showWarnings = FALSE)
+
+for (t in data.tracks.combined) {
+  tmp <- import(t)
+  tmp$score <- scale(tmp$score)
+  export.bw(tmp, file.path(padamid.scaled.dir, basename(t)))
+}
+
+```
+
+And finally, run deeptools.
+
+```{r run deeptools, cache = T}
+
+# Deeptools parameters
+data.tracks <- dir("../results_NQ/tracks/normalized/bin-10kb/", full.names = T)
+data.tracks.norm <- grep("combined", data.tracks, invert = F, value = T)
+data.tracks.norm <- mixedsort(c(data.tracks.norm))
+data.tracks.norm <- data.tracks.norm[! grepl("PT-10|DMSO|EED|GSK", data.tracks.norm)]
+
+data.tracks.scaled <- dir(padamid.scaled.dir, full.names = T)
+data.tracks.scaled <- mixedsort(c(data.tracks.scaled))
+data.tracks.scaled <- data.tracks.scaled[! grepl("PT-10|DMSO|EED|GSK", data.tracks.scaled)]
+
+# data.tracks <- grep("96", data.tracks, invert = T, value = T)
+
+data.labels <- gsub("-10kb.*", "", gsub(".*pADamID_", "", data.tracks.norm))
+
+exp.name <- "pADamID_aroundCTCF"
+exp.name.scaled <- "pADamID_aroundCTCF_scaled"
+
+deeptools.dir <- file.path(output_dir, "deeptools")
+dir.create(deeptools.dir, showWarnings = FALSE)
+
+# # Run
+# # deeptools.matrix <- RunDeeptools(regions.bed = c(ctcf.bed, genes.active.bed,
+# #                                                  genes.inactive.bed, random.bed),
+# #                                  tracks = data.tracks.norm,
+# #                                  expname = exp.name, output_dir = deeptools.dir,
+# #                                  labels = data.labels)
+# # 
+# # PlotHeatmap(matrix = deeptools.matrix,
+# #                            output.file = file.path(deeptools.dir,
+# #                                                    paste0(exp.name, "-heatmap.png")),
+# #                            range = "1.5")
+# # PlotProfile(matrix = deeptools.matrix,
+# #             output.file = file.path(deeptools.dir,
+# #                                     paste0(exp.name, "-profile.png")))
+# 
+# 
+# deeptools.matrix.scaled <- RunDeeptools(regions.bed = c(ctcf.bed, genes.active.bed,
+#                                                         genes.inactive.bed, random.bed),
+#                                         tracks = data.tracks.scaled,
+#                                         expname = exp.name.scaled,
+#                                         output_dir = deeptools.dir,
+#                                         labels = data.labels)
+# 
+# PlotHeatmap(matrix = deeptools.matrix.scaled,
+#                              output.file = file.path(deeptools.dir,
+#                                                      paste0(exp.name.scaled, "-heatmap.png")),
+#                              range = "1.7")
+# PlotProfile(matrix = deeptools.matrix.scaled,
+#             output.file = file.path(deeptools.dir,
+#                                     paste0(exp.name.scaled, "-profile.png")))
+
+deeptools.matrix <- file.path(deeptools.dir, 
+                              paste0(exp.name, "-deeptoolsMatrix.gz"))
+deeptools.matrix.scaled <- file.path(deeptools.dir, 
+                                     paste0(exp.name.scaled, "-deeptoolsMatrix.gz"))
+
+
+# Also, run deeptools on all ctcf peaks
+#exp.name <- "pADamID_aroundAllCTCF"
+exp.name.all.scaled <- "pADamID_aroundAllCTCF_scaled"
+
+# # Run
+# deeptools.matrix.scaled <- RunDeeptools(regions.bed = c(ctcf_all.bed, random.bed),
+#                                         tracks = data.tracks.scaled,
+#                                         expname = exp.name.all.scaled,
+#                                         output_dir = deeptools.dir,
+#                                         labels = data.labels)
+# 
+# PlotHeatmap(matrix = deeptools.matrix.scaled,
+#                              output.file = file.path(deeptools.dir,
+#                                                      paste0(exp.name.all.scaled, "-heatmap.png")),
+#                              range = "1.7")
+# PlotProfile(matrix = deeptools.matrix.scaled,
+#             output.file = file.path(deeptools.dir,
+#                                     paste0(exp.name.all.scaled, "-profile.png")))
+
+deeptools.all.matrix.scaled <- file.path(deeptools.dir, 
+                                         paste0(exp.name.all.scaled, 
+                                                "-deeptoolsMatrix.gz"))
+
+```
+
+
+### 2. Plot profile in R
+
+I would like a little bit more flexibility on the profiles generated. I will do
+this in R. 
+
+```{r plot custom deeptools profiles, fig.width = 12, fig.height = 9, cache = T}
+
+#PlotCustomProfileWithTibble(deeptools.matrix)
+PlotCustomProfileWithTibble(deeptools.matrix.scaled)  
+  
+``` 
+
+Looks good.
+
+Very likely, CTCF peaks and (active) genes are often close together. I would 
+like to know whether the effect above is explained by either of the two 
+features, or whether both are relevant. To do this, I will subset CTCF peaks 
+and genes based on their distance to genes and CTCF peaks, respectively. 
+
+Also, make sure that all feaetures are at least 100 kb from the nearest LAD 
+border to prevent border effects. I'm really looking at isolated features
+within LADs.
+
+```{r custom deeptools profiles subsetted, fig.width = 12, fig.height = 9, cache = T}
+
+# Distance cut-off - initially the window of the profile
+cutoff <- 0.1e6
+
+# First, all regions
+# Subset 
+# 1) CTCF 
+dis <- distanceToNearest(ctcf.peaks, gr_fpkm.active, ignore.strand = T)
+ctcf.idx <- mcols(dis)$distance > cutoff
+
+# 2) genes 
+dis <- distanceToNearest(gr_fpkm.active.LAD, ctcf.peaks.all, ignore.strand = T)
+genes.idx <- mcols(dis)$distance > cutoff 
+
+# 3) genes inactive
+dis <- distanceToNearest(gr_fpkm.inactive.LAD, ctcf.peaks.all, ignore.strand = T)
+genes_inactive.idx <- mcols(dis)$distance > cutoff
+
+# Plot custom profiles by group
+# PlotCustomProfileWithTibble(deeptools.matrix.scaled, 
+#                   subgroups = list(ctcf.idx, genes.idx, genes_inactive.idx, NA))
+
+PlotCustomProfileWithTibble(deeptools.matrix.scaled, 
+                  subgroups = list(ctcf.idx, genes.idx, genes_inactive.idx, NA), 
+                  filter_samples = c("CTCF", "CTCF-NQ"))
+
+
+
+# # Second, subset by cohesin change
+# cutoff <- 1e5
+# 
+# # First, all regions
+# # Remove overlapping hits
+# # 1a) CTCF
+# dis <- distanceToNearest(ctcf.peaks, gr_fpkm)
+# ctcf.idx <- mcols(dis)$distance > cutoff
+# 
+# # 1b) genes
+# dis <- distanceToNearest(gr_fpkm.active.LAD, ctcf.peaks.all)
+# genes.idx <- mcols(dis)$distance > cutoff
+# 
+# # 1c) genes inactive
+# dis <- distanceToNearest(gr_fpkm.inactive.LAD, ctcf.peaks.all)
+# genes_inactive.idx <- mcols(dis)$distance > cutoff
+# 
+# idx.remove <- c(ctcf.idx, genes.idx, genes_inactive.idx,
+#                 rep(T, length(gr_random)))
+# 
+# # Subset distance to loop anchor
+# # 1a) CTCF
+# cutoff <- 2e4
+# dis <- distanceToNearest(ctcf.peaks, cohesin_domains %>%
+#                            filter(class == "gain") %>%
+#                            as(., "GRanges"))
+# ctcf.idx <- mcols(dis)$distance > cutoff
+# 
+# 
+# # Plot custom profiles by group
+# PlotCustomProfileWithTibble(deeptools.matrix.scaled,
+#                   subgroups = list(ctcf.idx, NA, NA, NA),
+#                   idx.remove = idx.remove, filter_samples = c("CTCF", "CTCF-NQ"))
+# 
+# # So, yes, cohesin gain is strongly associated with a detachment from the NL
+# 
+
+
+# Third, filtered for >cutoff distance from LAD border
+# Subset
+LAD_cutoff <- 0.1e6
+
+features <- c(ctcf.peaks, gr_fpkm.active.LAD, gr_fpkm.inactive.LAD, gr_random)
+dis <- distanceToNearest(features, LAD.border, ignore.strand = T)
+idx.remove <- mcols(dis)$distance > LAD_cutoff
+
+# Plot custom profiles by group
+# PlotCustomProfileWithTibble(deeptools.matrix.scaled, 
+#                   subgroups = list(ctcf.idx, genes.idx, genes_inactive.idx, NA),
+#                   idx.remove = idx.remove)
+
+local_detachment_stat <- PlotCustomProfileWithTibble(deeptools.matrix.scaled, 
+                                                     subgroups = list(ctcf.idx, genes.idx, genes_inactive.idx, NA),
+                                                     idx.remove = idx.remove, filter_samples = c("CTCF", "CTCF-NQ"))
+
+# PlotCustomProfileWithTibble(deeptools.matrix.scaled, filter_96 = F, 
+#                   subgroups = list(ctcf.idx, genes.idx, genes_inactive.idx, NA),
+#                   idx.remove = idx.remove)
+
+local_detachment_stat <- local_detachment_stat %>% 
+  filter(! grepl("close|inactive",  class)) %>%
+  mutate(padj = p.adjust(pvalue)) 
+
+local_detachment_stat %>%
+  print(n = 100)
+
+
+
+```
+
+Also, plot the differences in detachment score.
+
+```{r differences in detachment, fig.width = 8, fig.height = 5}
+
+local_detachment_stat %>%
+  ggplot(aes(x = condition, y = class, fill = padj, 
+             label = round(padj, 2))) +
+  geom_tile() +
+  geom_text() +
+  xlab("") +
+  ylab("") +
+  facet_grid(. ~ timepoint) +
+  scale_fill_gradient(high = "white", low = "red") + 
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Prepare another summary figure
+local_detachment_stat %>%
+  filter(! grepl("close|inactive", class)) %>%
+  mutate(timepoint = factor(timepoint, levels = c("6h", "24h"))) %>%
+  ggplot(aes(x = condition, y = class, fill = diff_mean,
+             label = round(diff_mean, 2))) +
+  geom_tile() +
+  geom_text(aes(color = padj < 0.05)) +
+  xlab("") +
+  ylab("") +
+  facet_grid(. ~ timepoint) +
+  scale_fill_gradient2(high = "red", mid = "white", low = "blue", guide = "none") +
+  scale_color_manual(values = c("grey80", "grey20"), guide = "none") +
+  theme_bw() +
+  theme(aspect.ratio = 3/5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+ 
+
+```
+
+Note that the last figures are the ones that I'm interested in, where I removed
+features near borders and separated features based on their relative 
+positioning.
+
+Finally, I will make heatmaps of the individual elements. This is good to show
+that all CTCF sites detach a little bit instead of a few sites a lot.
+
+```{r custom heatmap, fig.width = 2.5, fig.height = 9, cache = T}
+  
+# Only heatmaps for PT
+PlotCustomProfileWithTibble(deeptools.matrix.scaled, 
+                  subgroups = list(ctcf.idx, genes.idx, genes_inactive.idx, NA),  
+                  idx.remove = idx.remove, filter_samples = c("CTCF", "CTCF-NQ"),
+                  heatmap_pt = T) 
+   
+```
+
+
+### 3. Separate on CTCF looping partners
+
+Skipped.
+
+```{r ctcf looping partners, cache = T}
+
+# # Create lists
+# # Filter for distance to active genes and LAD borders
+# dis_cutoff <- 0.1e6
+# 
+# features <- c(ctcf.peaks, gr_fpkm.active.LAD, gr_fpkm.inactive.LAD, gr_random)
+# features$type <- rep(c("ctcf", "gene_active", "gene_inactive", "random"),
+#                      times = c(length(ctcf.peaks),
+#                                length(gr_fpkm.active.LAD),
+#                                length(gr_fpkm.inactive.LAD),
+#                                length(gr_random)))
+# 
+# dis1 <- distanceToNearest(features, LAD.border)
+# dis2 <- distanceToNearest(features, gr_fpkm)
+# idx.remove <- (mcols(dis1)$distance > dis_cutoff) & 
+#   (mcols(dis2)$distance > dis_cutoff) & 
+#   ((! is.na(features$loop_class)) | 
+#      (features$type != "ctcf"))
+# 
+# # Filter for interacting partner (LAD vs iLAD)
+# ctcf.idx <- ctcf.peaks$loop_class == "LAD"
+# ctcf.idx[is.na(ctcf.idx)] <- F
+# 
+# # Plot custom profiles by group
+# PlotCustomProfileWithTibble(deeptools.matrix.scaled, 
+#                             subgroups = list(ctcf.idx, NA, NA, NA),
+#                             filter_groups = c("ctcf", "random"),
+#                             idx.remove = idx.remove, filter_samples = c("CTCF"))
+ 
+```
+
+
+### 4. Gather information on detachment of CTCF peaks in LADs
+
+So, I can see that CTCF, RAD21 and WAPL somehow mediate local detachment. To
+better understand whether this is relevant, I want to figure out whether 
+specific features mediate this detachment. For example, looping with iLAD
+domains. 
+
+I first need to load in the complete data set of all features (also iLAD
+CTCF sites). 
+
+```{r, gather information of detachment at CTCF peaks, cache = T, cache.lazy = F}
+
+# This information is present in the deeptools files. I just need to get it.
+# Name of the different groups
+groups <- c("ctcf", "random")
+
+# Load the profiles
+tib_data <- read_tsv(deeptools.all.matrix.scaled, skip = 1, col_names = F)
+tib_meta <- tib_data[, 1:6]
+tib_values <- tib_data[, 7:ncol(tib_data)]
+
+# Update metadata
+tib_meta <- tib_meta %>%
+  mutate(class = rep(groups,
+                     times = c(length(ctcf.peaks.all), 
+                               length(gr_random))),
+         class = factor(class, levels = groups))
+
+# Continue with the values
+labels <- str_remove(data.labels, "^NQ_")
+
+tib <- tib_values %>%
+  add_column(class = tib_meta$class,
+             peak = 1:nrow(.)) %>%
+  rename_at(1:(ncol(.)-2), 
+            ~ paste(rep(labels, each = 40), 1:40, sep = "_")) %>%
+  gather(key, value, -class, -peak) %>%
+  
+  # Added to remove bad tracks (without any timepoint)
+  filter(grepl("h_", key)) %>%
+  filter(! grepl("DMSO|EED|GSK", key)) %>%
+  
+  # Separate is very slow for some reason, replace with a manual mutate
+  # separate(key, c("condition", "timepoint", "bin"), remove = F, sep = "_") %>%
+  mutate(condition = str_remove(key, "_.*"),
+         timepoint = str_remove_all(str_extract(key, "_.*_"), "_"),
+         bin = str_remove(key, ".*_")) %>%
+  dplyr::select(-key) %>%
+  
+  mutate(condition = factor(condition,
+                            levels = c("PT", "CTCF-EL", "CTCF-NQ", "CTCF", 
+                                       "RAD21", "WAPL", "CTCF-WAPL")),
+         timepoint = factor(timepoint, 
+                            levels = c("0h", "6h", "24h", "96h")),
+         bin = paste0("bin_", bin)) %>%
+  mutate(value = as.numeric(value)) %>%
+  #drop_na() %>%
+  spread(bin, value)
+
+# Remove random peaks - I don't really need those anymore
+tib <- tib %>%
+  filter(class == "ctcf")
+
+# What is the middle?
+bins <- tibble(bin = 1:40) %>%
+  mutate(distance = -200000 - 5000 + 10000 * bin,
+         distance = distance / 1e3)
+
+middle <- bins %>%
+  filter(distance > -10, distance < 10) %>%
+  pull(bin)
+middle.idx <- which(names(tib) %in% paste0("bin_", middle))
+
+flanks <- bins %>%
+  filter((distance > -110 & distance < -50) |
+         (distance > 50 & distance < 110)) %>%
+  pull(bin)
+flanks.idx <- which(names(tib) %in% paste0("bin_", flanks))
+
+# Add mean score per middle and flanks and remove all bins
+tib <- tib %>%
+  mutate(middle = rowMeans(tib[, middle.idx]),
+         flanks = rowMeans(tib[, flanks.idx])) %>%
+  mutate(depletion = middle - flanks) %>%
+  dplyr::select(-starts_with("bin"))
+
+# Add data from CTCF peaks to this object
+tib <- tib %>%
+  mutate(signal = ctcf.peaks.all$signalValue[peak],
+         motif_strand = ctcf.peaks.all$motif_strand[peak],
+         overlap_LAD = ctcf.peaks.all$overlap.LAD[peak],
+         which_LAD = ctcf.peaks.all$which.LAD[peak],
+         distance_to_LAD = ctcf.peaks.all$distance[peak], 
+         overlap_border = ctcf.peaks.all$at_border[peak],
+         which_border = ctcf.peaks.all$border_idx[peak],
+         location_border = ctcf.peaks.all$border[peak],
+         overlap_loop = ctcf.peaks.all$overlap_loop[peak],
+         loop_class = ctcf.peaks.all$loop_class[peak],
+         loop_number = ctcf.peaks.all$loops[peak],
+         overlap_active_genes = ctcf.peaks.all$overlap_genes_active[peak],
+         overlap_inactive_genes = ctcf.peaks.all$overlap_genes_inactive[peak],
+         distance_to_active_genes = ctcf.peaks.all$distance_genes_active[peak],
+         distance_to_inactive_genes = ctcf.peaks.all$distance_genes_inactive[peak],
+         expression_active_genes = ctcf.peaks.all$expression_genes_active[peak],
+         cohesin_change = ctcf.peaks.all$cohesin_change[peak])
+ 
+```
+
+I also determined a "detachment score", which measure the amount of detachment
+from a single CTCF site. I can use this as quantification to determine which
+features are important.
+
+This object (called "tib") should allow me to prepare various plots. Let's start
+with some simple ones. Note that these initial plots are only for the PT_0h 
+condition, represting the basal condition.
+
+```{r simple plots for ctcf peaks, cache = T, fig.width = 5, fig.height = 3.5}
+
+tib_PT <- tib %>%
+  filter(condition == "PT" & 
+           timepoint == "0h") 
+
+# 1) Difference between LAD and iLAD local detachment - binary
+tib_PT %>%
+  ggplot(aes(x = overlap_LAD, y = depletion)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("Overlapping LAD") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 3,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+# Conclusion: LAD CTCF sites have a stronger local depletion
+
+# 2) Difference between LAD and iLAD local detachment - using flank scores
+tib_PT %>%
+  ggplot(aes(x = flanks, y = depletion)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_smooth(col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("pA-DamID flanks") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+tib_PT %>%
+  ggplot(aes(x = flanks, y = depletion)) +
+  geom_bin2d(bins = 100) +
+  geom_smooth(col = "red", fill = "red", se = T) +
+  geom_hline(yintercept = 0, col = "grey") + 
+  xlab("pA-DamID flanks") +
+  ylab("Local depletion") +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+# Conclusion: CTCF sites detach when the basal score is > -1 roughly
+
+
+# 3) Effect of peak strength on local detachment - LAD sites only
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) %>%
+  ggplot(aes(x = signal, y = depletion)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_smooth(col = "red", fill = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("CTCF peak signal") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) %>%
+  ggplot(aes(x = signal, y = depletion)) +
+  geom_bin2d(bins = 100) +
+  geom_smooth(col = "red", fill = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  xlab("CTCF peak signal") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+# There is a weak correlation between local depletion and CTCF peak signal
+
+# 4) Effect of distance to LAD border
+tib_PT %>%
+  filter(overlap_LAD == T) %>%
+  ggplot(aes(x = distance_to_LAD / 1e3, y = depletion)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_smooth(col = "red", fill = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  coord_cartesian(xlim = c(0, 2000)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+tib_PT %>%
+  filter(overlap_LAD == T) %>%
+  ggplot(aes(x = distance_to_LAD / 1e3, y = depletion)) +
+  geom_bin2d(bins = 100) +
+  geom_smooth(col = "red", fill = "red") +
+  geom_hline(yintercept = 0, col = "black") +
+  geom_vline(xintercept = 0, col = "black") +
+  geom_vline(xintercept = 100, col = "blue", linetype = "dashed") +
+  xlim(c(0, 3000)) +
+  coord_cartesian(xlim = c(0, 2000)) +
+  xlab("Distance to LAD border (kb)") +
+  ylab("Local depletion") +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+# There is no clear correlation between local depletion and distance to border
+
+# 4b) Zoom-in of #4
+tib_PT %>%
+    filter(distance_to_LAD < 500e3) %>%
+    filter(overlap_LAD == T) %>%
+    ggplot(aes(x = distance_to_LAD / 1e3, y = depletion)) +
+    geom_point(alpha = 0.2, size = 0.5) +
+    geom_smooth(col = "red") +
+    geom_hline(yintercept = 0, col = "grey") +
+    xlab("Distance to LAD border (kb)") +
+    ylab("Local depletion") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+# Isn't there? Yes, this is due to the depletion at LAD borders, obviously..
+
+
+# 5) Overlap loop anchor
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) %>%
+  ggplot(aes(x = overlap_loop, y = depletion)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("Overlap loop anchor") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) %>%
+  ggplot(aes(x = overlap_loop, y = depletion, fill = overlap_loop)) +
+  geom_boxplot(outlier.shape = NA)  +
+  geom_hline(yintercept = 0, linetype = "dashed", col = "red") +
+  coord_cartesian(ylim = c(-1.7, 1)) +
+  xlab("Overlap loop anchor") +
+  ylab("Local depletion") +
+  scale_fill_manual(values = c("grey50", "grey80"), guide = F) +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+# Also, test significance
+tmp <- tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6)
+wilcox.test(tmp$depletion[tmp$overlap_loop == T],
+            tmp$depletion[tmp$overlap_loop == F])
+# CTCF sites overlapping loop anchors show a stronger local depletion
+
+# 6) Loop anchor - number of loops
+tib_PT %>%
+  mutate(loop_number = ifelse(is.na(loop_number),
+                              0, loop_number)) %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6,
+         loop_number < 5) %>%
+  ggplot(aes(x = as.factor(loop_number), y = depletion)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("Number of loops") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_PT %>%
+  mutate(loop_number = ifelse(is.na(loop_number),
+                              0, loop_number)) %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6,
+         loop_number < 5) %>%
+  mutate(loop_number = as.factor(loop_number)) %>%
+  ggplot(aes(x = loop_number, y = depletion, fill = loop_number)) +
+  geom_boxplot(outlier.shape = NA)  +
+  geom_hline(yintercept = 0, linetype = "dashed", col = "red") +
+  coord_cartesian(ylim = c(-1.7, 1)) +
+  xlab("Number of loops") +
+  ylab("Local depletion") +
+  scale_fill_grey(guide = F) +
+  #scale_fill_manual(values = c("grey50", "grey80"), guide = F) +
+  theme_bw() +
+  theme(aspect.ratio = 1.5,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+# More loops correlates with stronger local depletion
+
+# 7) Loop anchor - class of loops
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6,
+         overlap_loop == T) %>%
+  ggplot(aes(x = loop_class, y = depletion)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+# There is no difference between looping partner
+
+# 7b) Loop anchor - class of loops (only LAD / iLAD)
+tib_PT %>%
+  mutate(loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", "iLAD")) %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6,
+         overlap_loop == T,
+         loop_class %in% c("LAD", "iLAD")) %>%
+  ggplot(aes(x = loop_class, y = depletion)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_PT %>%
+  mutate(loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", "iLAD")) %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6,
+         overlap_loop == T,
+         loop_class %in% c("LAD", "iLAD")) %>%
+  ggplot(aes(x = loop_class, y = depletion, fill = loop_class)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_hline(yintercept = 0, col = "red", linetype = "dashed") +
+  xlab("Looping partner") +
+  ylab("Local depletion") +
+  scale_fill_manual(values = c("grey50", "grey80"), guide = F) +
+  coord_cartesian(ylim = c(-1.6, 0.8)) +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+# Also, test significance
+tmp <- tib_PT %>%
+  mutate(loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", "iLAD")) %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6,
+         overlap_loop == T,
+         loop_class %in% c("LAD", "iLAD"))
+wilcox.test(tmp$depletion[tmp$loop_class == "LAD"],
+            tmp$depletion[tmp$loop_class == "iLAD"])
+# There is a small difference between looping partner
+
+# 7c) combination of loop anchor and looping partner
+tib_PT_tmp <- tib_PT %>%
+  mutate(loop_class = as.character(loop_class),
+         loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", "iLAD"),
+         loop_class = replace_na(loop_class, "no_loop")) %>%
+  mutate(distance_to_LAD = abs(distance_to_LAD),
+         distance_to_active_genes = abs(distance_to_active_genes)) %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6,
+         distance_to_active_genes >= 0.1e6,
+         loop_class != "ambiguous") %>%
+  mutate(loop_class = factor(loop_class,
+                             levels = c("no_loop", "LAD", "iLAD")))
+
+tib_PT_tmp %>%
+  ggplot(aes(x = loop_class, y = depletion, fill = loop_class)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_hline(yintercept = 0, col = "red", linetype = "dashed") +
+  xlab("Looping partner") +
+  ylab("Local depletion") +
+  scale_fill_manual(values = c("grey35", "grey65", "grey95"), guide = F) +
+  coord_cartesian(ylim = c(-1, 0.6)) +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_PT_tmp %>%
+  ggplot(aes(x = loop_class, y = depletion, col = loop_class)) +
+  rasterize(geom_quasirandom(),
+            dpi = 300) +
+  geom_boxplot(outlier.shape = NA, fill = NA, color = "black") +
+  geom_hline(yintercept = 0, col = "red", linetype = "dashed") +
+  xlab("Looping partner") +
+  ylab("Local depletion") +
+  scale_color_manual(values = c("grey50", "grey65", "grey80"), guide = "none") +
+  #coord_cartesian(ylim = c(-1, 0.6)) +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Add amounts
+tib_PT_tmp %>%
+  group_by(loop_class) %>%
+  dplyr::summarise(n = n())
+
+# Also, test significance
+tib_sign <- tibble(test = c("no_loop_vs_LAD",
+                            "no_loop_vs_iLAD",
+                            "LAD_vs_iLAD"),
+                   pvalue = c(wilcox.test(tib_PT_tmp$depletion[tib_PT_tmp$loop_class == "no_loop"],
+                                          tib_PT_tmp$depletion[tib_PT_tmp$loop_class == "LAD"])$p.value,
+                              
+                              wilcox.test(tib_PT_tmp$depletion[tib_PT_tmp$loop_class == "no_loop"],
+                                          tib_PT_tmp$depletion[tib_PT_tmp$loop_class == "iLAD"])$p.value,
+                              
+                              wilcox.test(tib_PT_tmp$depletion[tib_PT_tmp$loop_class == "LAD"],
+                                          tib_PT_tmp$depletion[tib_PT_tmp$loop_class == "iLAD"])$p.value)) %>%
+  mutate(padj = p.adjust(pvalue))
+tib_sign
+# There is a small difference between looping partner
+
+# 8a) Overlap active genes
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) %>%
+  ggplot(aes(x = overlap_active_genes, y = depletion)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("Overlap active gene") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) %>%
+  ggplot(aes(x = overlap_inactive_genes, y = depletion)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("Overlap inactive gene") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# 8b) Distance to active genes (TSS)
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) %>%
+  ggplot(aes(x = distance_to_active_genes / 1e3, y = depletion)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_smooth(col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  #coord_cartesian(xlim = c(0, 100)) +
+  xlab("Distance to active (kb)") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+# 8c) Distance to active genes (TSS), for overlapping and not overlapping
+tib_PT %>%
+    filter(overlap_LAD == T,
+           distance_to_LAD > 0.1e6) %>%
+    ggplot(aes(x = distance_to_active_genes / 1e3, y = depletion)) +
+    geom_point(alpha = 0.2, size = 0.5) +
+    geom_smooth(col = "red") +
+    geom_hline(yintercept = 0, col = "grey") +
+    #coord_cartesian(xlim = c(0, 100)) +
+    facet_grid(. ~ overlap_active_genes) +
+    xlab("Distance to active (kb)") +
+    ylab("Local depletion") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+
+# 9) Expression of (close) active genes
+tib_PT %>%
+    filter(overlap_LAD == T,
+           distance_to_LAD > 0.1e6) %>%
+    ggplot(aes(x = expression_active_genes, y = depletion)) +
+    geom_point(alpha = 0.2, size = 0.5) +
+    geom_smooth(col = "red") +
+    geom_hline(yintercept = 0, col = "grey") +
+    coord_cartesian(xlim = c(0, 10)) +
+    xlab("Expression active genes (log2 fpkm)") +
+    ylab("Local depletion") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+
+
+# Update: ts210324
+# x) Overlap with cohesin change
+tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) %>%
+  ggplot(aes(x = cohesin_change, y = depletion)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  xlab("Cohesin domain") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+   
+
+
+```
+
+Let's summarise. What correlates and what does not correlate with local depletion.:
+
+  * Yes: a higher local pA-DamID score correlates
+  * Yes: overlap with looping anchor correlates, even more with multiple
+    overlapping loops
+  * Yes: distance to active genes
+  * Maybe: CTCF peak strength weakly correlates
+  * No: distance to LAD border does not correlate
+  * Yes: looping partner does correlate a little bit
+  * No: overlap with inactive genes
+  * No: expression level
+
+I want to double check that the observation that loops with iLADs are more 
+detached. I will therefore make this figure for all conditions.
+
+```{r loop anchors in all conditions, fig.width = 8, fig.height = 10}
+
+# 7c) combination of loop anchor and looping partner
+tib_tmp <- tib %>%
+  mutate(loop_class = as.character(loop_class),
+         loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", "iLAD"),
+         loop_class = replace_na(loop_class, "no_loop")) %>%
+  mutate(distance_to_LAD = abs(distance_to_LAD),
+         distance_to_active_genes = abs(distance_to_active_genes)) %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6,
+         distance_to_active_genes >= 0.1e6,
+         loop_class != "ambiguous") %>%
+  mutate(loop_class = factor(loop_class,
+                             levels = c("no_loop", "LAD", "iLAD"))) %>%
+  filter(! condition %in% c("CTCF", "CTCF-NQ"))
+
+tib_tmp %>%
+  ggplot(aes(x = loop_class, y = depletion, fill = loop_class)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_hline(yintercept = 0, col = "red", linetype = "dashed") +
+  xlab("Looping partner") +
+  ylab("Local depletion") +
+  scale_fill_manual(values = c("grey35", "grey65", "grey95"), guide = "none") +
+  facet_grid(condition ~ timepoint) +
+  coord_cartesian(ylim = c(-1, 0.6)) +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+So, yes, this is true.
+
+
+There are a few additional comparisons that I want to make, specifically for LAD
+CTCF sites. These are bit more complicated than the previous plots.
+
+  1. LAD distance combined with motif orientation
+  2. Number of previous CTCF sites
+  
+  
+```{r combined plots for ctcf peaks, cache = T, fig.width = 5, fig.height = 3.5}
+ 
+# Calculate new features
+### border orientation
+tib_PT <- tib_PT %>%
+  mutate(border_orientation = case_when(motif_strand == "-" & 
+                                          location_border == "left" ~ 
+                                          "outwards",
+                                        motif_strand == "+" & 
+                                          location_border == "right" ~ 
+                                          "outwards",
+                                        T ~ "inwards"))
+
+### ctcf position
+tib_PT_summarise <- tib_PT %>% 
+  group_by(which_LAD, location_border) %>% 
+  summarise(n = n())
+
+tib_PT <- tib_PT %>%
+  arrange(which_LAD, location_border, peak) %>% 
+  mutate(ctcf_position = unlist(lapply(1:nrow(tib_PT_summarise),
+                                       function(i) {
+                                         ifelse(tib_PT_summarise$location_border[i] == "left",
+                                                list(1:tib_PT_summarise$n[i]),
+                                                list(tib_PT_summarise$n[i]:1))
+                                       }))) %>%
+  arrange(peak)
+
+
+# 10) LAD distance effect combined with motif orientation
+tib_PT %>%
+  filter(overlap_LAD == T,
+         ! is.na(motif_strand)) %>%
+  ggplot(aes(x = distance_to_LAD / 1e6, y = depletion)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_smooth(col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_vline(xintercept = 0, col = "grey") +
+  geom_vline(xintercept = 0.1, col = "blue", linetype = "dashed") +
+  facet_grid(. ~ border_orientation) +
+  coord_cartesian(xlim = c(0, 2)) +
+  xlab("Distance to LAD border (Mb)") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_PT %>%
+  filter(overlap_LAD == T,
+         ! is.na(motif_strand)) %>%
+  ggplot(aes(x = distance_to_LAD / 1e6, y = depletion)) +
+  geom_bin2d(bins = 100) +
+  geom_smooth(col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_vline(xintercept = 0, col = "grey") +
+  geom_vline(xintercept = 0.1, col = "blue", linetype = "dashed") +
+  facet_grid(. ~ border_orientation) +
+  coord_cartesian(xlim = c(0, 2)) +
+  xlim(0, 3) +
+  xlab("Distance to LAD border (Mb)") +
+  ylab("Local depletion") +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+# No, motif orientation relative to LAD border does not play a role in local 
+# detachment
+
+# 11) Number of previous CTCF sites
+tib_PT %>%
+  filter(overlap_LAD == T,
+         ! is.na(motif_strand),
+         ctcf_position <= 6,
+         distance_to_LAD < 0.5e6) %>%
+  ggplot(aes(x = distance_to_LAD / 1e6, y = depletion)) +
+  geom_point(alpha = 0.2, size = 0.5) +
+  geom_smooth(se = F, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  facet_wrap(~ ctcf_position) +
+  coord_cartesian(xlim = c(0, 0.5)) +
+  xlab("Distance to LAD border (Mb)") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_PT %>%
+  filter(overlap_LAD == T,
+         ! is.na(motif_strand),
+         ctcf_position <= 10) %>%
+  ggplot(aes(x = distance_to_LAD / 1e6, y = depletion, col = as.factor(ctcf_position))) +
+  geom_smooth(method = "lm", se = F) +
+  geom_hline(yintercept = 0, col = "grey") +
+  facet_grid(. ~ border_orientation) +
+  coord_cartesian(xlim = c(0, 2)) +
+  xlab("Distance to LAD border (Mb)") +
+  ylab("Local depletion") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+# No, motif orientation relative to LAD border does not play a role in local 
+# detachment
+
+
+# 12a) Number of previous CTCF sites - distance to LAD
+tib_PT %>%
+    filter(overlap_LAD == T,
+           ! is.na(motif_strand),
+           ctcf_position <= 10) %>%
+    ggplot(aes(x = as.factor(ctcf_position), y = distance_to_LAD / 1e6)) +
+    geom_quasirandom() +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+    facet_grid(. ~ border_orientation) +
+    xlab("Distance to LAD border (Mb)") +
+    ylab("Local depletion") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+# 12b) Number of previous CTCF sites - flank LAD score
+tib_PT %>%
+    filter(overlap_LAD == T,
+           ! is.na(motif_strand),
+           ctcf_position <= 10) %>%
+    ggplot(aes(x = as.factor(ctcf_position), y = flanks)) +
+    geom_quasirandom() +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+    facet_grid(. ~ border_orientation) +
+    xlab("Distance to LAD border (Mb)") +
+    ylab("Local depletion") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+# 12c) Number of previous CTCF sites - local depletion score
+tib_PT %>%
+    filter(overlap_LAD == T,
+           distance_to_LAD > 0.1e6,
+           ! is.na(motif_strand),
+           ctcf_position <= 5) %>%
+    ggplot(aes(x = as.factor(ctcf_position), y = depletion)) +
+    geom_quasirandom() +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+    facet_grid(. ~ border_orientation) +
+    xlab("Distance to LAD border (Mb)") +
+    ylab("Local depletion") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_PT %>%
+    filter(overlap_LAD == T,
+           distance_to_LAD > 0.1e6,
+           ! is.na(motif_strand),
+           ctcf_position <= 5) %>%
+    ggplot(aes(x = as.factor(ctcf_position), y = depletion)) +
+    geom_quasirandom() +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+    #facet_grid(. ~ border_orientation) +
+    xlab("Distance to LAD border (Mb)") +
+    ylab("Local depletion") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+# It seems to CTCF sites within LADs are more at the lamina, and therefore have
+# a stronger local depletion 
+ 
+
+```
+
+This results in two more "no's":
+
+  * No: motif orientation is not correlated
+  * No: previous CTCF occurences are not correlated
+  
+Finally, let's try to catch this information in a linear model. What is 
+important for the local depletion?
+
+```{r ctcf peak detachment linear model, cache = T, fig.width = 6, fig.height = 5}
+
+# Prepare data: only LAD CTCF sites
+tib_PT <- tib_PT %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6) 
+
+tib_PT$loop_number[is.na(tib_PT$loop_number)] <- 0
+tib_PT$expression_active_genes[is.na(tib_PT$expression_active_genes)] <- 0
+
+tib_PT <- tib_PT %>%
+  mutate_if(is_double, function(x) scale(x)[, 1]) %>%
+  mutate(loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", "iLAD"))
+
+# Linear model
+ctcf_lm <- lm(depletion ~ 
+                flanks +
+                signal +
+                distance_to_LAD + 
+                loop_number + 
+                loop_class +
+                border_orientation +
+                ctcf_position +
+                distance_to_active_genes +
+                expression_active_genes,
+              data = tib_PT)
+ 
+# Get R2 and tibble of coefficients
+explained <- summary(ctcf_lm)$adj.r.squared
+
+new_names <- c(flanks = "local pA-DamID score",
+               signal = "CTCF peak strength",
+               distance_to_LAD = "distance to LAD border",
+               loop_number = "number of Hi-C loops",
+               # loop_classLAD_border = "looping partner - LAD border",
+               loop_classiLAD = "looping partner - iLAD",
+               loop_classambiguous = "looping partner - ambiguous region",
+               border_orientationoutwards = "ctcf orientation relative to border",
+               ctcf_position = "number of previous ctcf sites",
+               distance_to_active_genes = "distance to TSS of active gene",
+               expression_active_genes = "expression of closest gene (max 100kb)")
+
+tib_coef <- tidy(ctcf_lm) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = recode(term, !!!new_names)) %>%
+  mutate(term = factor(term, levels = unique(term)),
+         p.value = p.adjust(p.value),
+         logpvalue = -log10(p.value))
+ 
+# Plot p-values
+tib_coef %>%
+  ggplot(aes(x = term, y = logpvalue, fill = estimate < 0)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = -log10(0.05), col = "red", linetype = "dashed") +
+  ggtitle(paste0("R-sq: ", round(explained, 3))) +
+  scale_fill_grey(start = 0.8, end = 0.2, name = "Increasing depletion") +
+  xlab("") +
+  ylab("-log10(p-adjust)") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Get coefficients for later
+tib_coef_all <- tib_coef %>%
+  add_column(condition = "PT_0h")
+explained_all <- c(explained) 
+
+
+```
+
+```{r repeat linear model with WAPL 24h, cache = T, fig.width = 6, fig.height = 5}
+
+# Get WAPL tibble
+### border orientation
+tib_WAPL <- tib %>%
+  filter(condition == "WAPL", 
+         timepoint == "24h") %>%
+  mutate(border_orientation = case_when(motif_strand == "-" & 
+                                          location_border == "left" ~ 
+                                          "outwards",
+                                        motif_strand == "+" & 
+                                          location_border == "right" ~ 
+                                          "outwards",
+                                        T ~ "inwards")) 
+ 
+### ctcf position
+tib_WAPL_summarise <- tib_WAPL %>% 
+  group_by(which_LAD, location_border) %>% 
+  summarise(n = n())
+
+tib_WAPL <- tib_WAPL %>%
+  arrange(which_LAD, location_border, peak) %>% 
+  mutate(ctcf_position = unlist(lapply(1:nrow(tib_WAPL_summarise),
+                                       function(i) {
+                                         ifelse(tib_WAPL_summarise$location_border[i] == "left",
+                                                list(1:tib_WAPL_summarise$n[i]),
+                                                list(tib_WAPL_summarise$n[i]:1))
+                                       }))) %>%
+  arrange(peak)
+
+
+
+# Continue
+# Prepare data: only LAD CTCF sites
+tib_WAPL <- tib_WAPL %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6)
+
+tib_WAPL$loop_number[is.na(tib_WAPL$loop_number)] <- 0
+tib_WAPL$expression_active_genes[is.na(tib_WAPL$expression_active_genes)] <- 0
+
+tib_WAPL <- tib_WAPL %>%
+  mutate_if(is_double, function(x) scale(x)[, 1]) %>%
+  mutate(loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", "iLAD"))
+
+# Linear model
+ctcf_lm <- lm(depletion ~ 
+                flanks +
+                signal +
+                distance_to_LAD + 
+                loop_number + 
+                loop_class +
+                border_orientation +
+                ctcf_position +
+                distance_to_active_genes +
+                expression_active_genes,
+              data = tib_WAPL)
+
+# Get R2 and tibble of coefficients
+explained <- summary(ctcf_lm)$adj.r.squared
+
+# new_names <- c(flanks = "local pA-DamID score",
+#                signal = "CTCF peak strength",
+#                distance_to_LAD = "distance to LAD border",
+#                loop_number = "number of Hi-C loops",
+#                loop_classLAD_border = "looping partner - LAD border",
+#                loop_classiLAD = "looping partner - iLAD",
+#                loop_classambiguous = "looping partner - ambiguous region",
+#                border_orientationoutwards = "ctcf orientation relative to border",
+#                ctcf_position = "number of previous ctcf sites")
+
+tib_coef <- tidy(ctcf_lm) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = recode(term, !!!new_names)) %>%
+  mutate(term = factor(term, levels = unique(term)),
+         p.value = p.adjust(p.value),
+         logpvalue = -log10(p.value))
+
+# Plot p-values
+tib_coef %>%
+  ggplot(aes(x = term, y = logpvalue, fill = estimate < 0)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = -log10(0.05), col = "red", linetype = "dashed") +
+  ggtitle(paste0("R-sq: ", round(explained, 3))) +
+  scale_fill_grey(start = 0.8, end = 0.2, name = "Increasing depletion") +
+  xlab("") +
+  ylab("-log10(p-adjust)") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Get coefficients for later
+tib_coef_all <- bind_rows(tib_coef_all,
+                          tib_coef %>%
+                            add_column(condition = "WAPL_24h"))
+explained_all <- c(explained_all, explained)
+
+
+```
+
+```{r repeat linear model with CTCF 24h, cache = T, fig.width = 6, fig.height = 8}
+
+# Get CTCF tibble 
+### border orientation
+tib_CTCF <- tib %>%
+  filter(condition == "CTCF",  
+         timepoint == "24h") %>%
+  mutate(border_orientation = case_when(motif_strand == "-" & 
+                                          location_border == "left" ~ 
+                                          "outwards",
+                                        motif_strand == "+" & 
+                                          location_border == "right" ~ 
+                                          "outwards",
+                                        T ~ "inwards"))
+
+### ctcf position
+tib_CTCF_summarise <- tib_CTCF %>% 
+  group_by(which_LAD, location_border) %>% 
+  summarise(n = n())
+
+tib_CTCF <- tib_CTCF %>%
+  arrange(which_LAD, location_border, peak) %>% 
+  mutate(ctcf_position = unlist(lapply(1:nrow(tib_CTCF_summarise),
+                                       function(i) {
+                                         ifelse(tib_CTCF_summarise$location_border[i] == "left",
+                                                list(1:tib_CTCF_summarise$n[i]),
+                                                list(tib_CTCF_summarise$n[i]:1))
+                                       }))) %>%
+  arrange(peak)
+
+
+
+# Continue
+# Prepare data: only LAD CTCF sites
+tib_CTCF <- tib_CTCF %>%
+  filter(overlap_LAD == T,
+         distance_to_LAD > 0.1e6)
+
+tib_CTCF$loop_number[is.na(tib_CTCF$loop_number)] <- 0
+tib_CTCF$expression_active_genes[is.na(tib_CTCF$expression_active_genes)] <- 0
+
+tib_CTCF <- tib_CTCF %>%
+  mutate_if(is_double, function(x) scale(x)[, 1]) %>%
+  mutate(loop_class = replace(loop_class, 
+                              loop_class == "LAD_border", "iLAD"))
+
+
+# Linear model
+ctcf_lm <- lm(depletion ~ 
+                flanks +
+                signal +
+                distance_to_LAD + 
+                loop_number + 
+                loop_class +
+                border_orientation +
+                ctcf_position +
+                distance_to_active_genes +
+                expression_active_genes,
+              data = tib_CTCF)
+
+# Get R2 and tibble of coefficients
+explained <- summary(ctcf_lm)$adj.r.squared
+
+# new_names <- c(flanks = "local pA-DamID score",
+#                signal = "CTCF peak strength",
+#                distance_to_LAD = "distance to LAD border",
+#                loop_number = "number of Hi-C loops",
+#                loop_classLAD_border = "looping partner - LAD border",
+#                loop_classiLAD = "looping partner - iLAD",
+#                loop_classambiguous = "looping partner - ambiguous region",
+#                border_orientationoutwards = "ctcf orientation relative to border",
+#                ctcf_position = "number of previous ctcf sites")
+
+tib_coef <- tidy(ctcf_lm) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = recode(term, !!!new_names)) %>%
+  mutate(term = factor(term, levels = unique(term)),
+         p.value = p.adjust(p.value),
+         logpvalue = -log10(p.value))
+
+# Plot p-values
+tib_coef %>%
+  ggplot(aes(x = term, y = logpvalue, fill = estimate < 0)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = -log10(0.05), col = "red", linetype = "dashed") +
+  ggtitle(paste0("R-sq: ", round(explained, 3))) +
+  scale_fill_grey(start = 0.8, end = 0.2, name = "Increasing depletion") +
+  xlab("") +
+  ylab("-log10(p-adjust)") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Get coefficients for later
+tib_coef_all <- bind_rows(tib_coef_all,
+                          tib_coef %>%
+                            add_column(condition = "CTCF_24h"))
+explained_all <- c(explained_all, explained)
+
+
+
+# Plot combined
+tib_coef_all %>%
+  mutate(condition = paste0(condition, 
+                            " (R-sq: ",
+                            round(rep(explained_all, 
+                                      each = length(new_names)), 
+                                  3),
+                            ")"),
+         condition = factor(condition, levels = unique(condition))) %>%
+  ggplot(aes(x = term, y = logpvalue, fill = estimate < 0)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = -log10(0.05), col = "red", linetype = "dashed") +
+  facet_grid(. ~ condition) +
+  scale_fill_grey(start = 0.8, end = 0.2, name = "Increasing depletion") +
+  xlab("") +
+  ylab("-log10(p-value)") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib_coef_all %>%
+  mutate(condition = paste0(condition, 
+                            " (R-sq: ",
+                            round(rep(explained_all, 
+                                      each = length(new_names)), 
+                                  3),
+                            ")"),
+         condition = factor(condition, levels = unique(condition))) %>%
+  ggplot(aes(x = term, y = estimate, fill = estimate < 0)) +
+  geom_bar(stat = "identity") +
+  facet_grid(. ~ condition) +
+  scale_fill_grey(start = 0.8, end = 0.2, name = "Increasing depletion") +
+  xlab("") +
+  ylab("Coefficient") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+I would conclude that this is a poor approach to capture the relevant features.
+It feels too unreliable.
+
+Update ts210324: do CTCF sites that overlap with a RDC change more after WAPL
+depletion?
+
+```{r change in NL interactions vs change in cohesin, cache = T, fig.width = 5, fig.height = 3.5}
+
+# Get the data
+tib_WAPL <- tib %>%
+  filter(condition == "WAPL", timepoint != "96h") %>%
+  dplyr::select(-middle, -flanks) %>%
+  spread(timepoint, depletion) %>%
+  mutate(diff_6h = `6h` - `0h`,
+         diff_24h = `24h` - `0h`) %>%
+  dplyr::select(-`6h`, -`24h`) %>%
+  gather(timepoint, value, contains("diff")) %>%
+  mutate(timepoint = factor(timepoint, c("diff_6h", "diff_24h")))
+
+# Plot difference between cohesin changes - LAD only
+tib_WAPL %>%
+  filter(overlap_LAD == T &
+           distance_to_LAD > 0.1e6 & 
+           cohesin_change != "loss") %>%
+  ggplot(aes(x = cohesin_change, y = value)) +
+  geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "red") +
+  geom_hline(yintercept = 0, col = "grey") +
+  facet_grid(. ~ timepoint) +
+  xlab("Cohesin domain") +
+  ylab("Change in detachment with t=0h") +
+  #scale_color_brewer(palette = "Set1", guide = F) +
+  theme_bw() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+Yes. But that's to be expected.
+
+
+
+### x. Save data
+
+
+```{r save data}
+ 
+saveRDS(gr_fpkm.active.LAD, 
+        file.path(output_dir, "genes_LAD_active.rds"))
+saveRDS(gr_fpkm.inactive.LAD, 
+        file.path(output_dir, "genes_LAD_inactive.rds"))
+
+saveRDS(genes.idx, 
+        file.path(output_dir, "genes_LAD_active_CTCFidx.rds"))
+saveRDS(genes_inactive.idx, 
+        file.path(output_dir, "genes_LAD_inactive_CTCFidx.rds"))
+
+# Prepare and export GRanges of features
+features <- c(ctcf.peaks, gr_fpkm.active.LAD, gr_fpkm.inactive.LAD, gr_random)
+features$type <- rep(c("ctcf_peaks", "genes_active", "genes_inactive", "random"),
+                    times = sapply(list(ctcf.peaks, gr_fpkm.active.LAD,
+                                        gr_fpkm.inactive.LAD, gr_random),
+                                   length))
+
+features$subset <- NA_character_
+features$subset[features$type == "ctcf_peaks"] <- ifelse(ctcf.idx,
+                                                         "far", "close")
+features$subset[features$type == "genes_active"] <- ifelse(genes.idx,
+                                                           "far", "close")
+features$subset[features$type == "genes_inactive"] <- ifelse(genes_inactive.idx,
+                                                             "far", "close")
+
+features$ensembl <- NA_character_
+features$ensembl[features$type == "genes_active"] <- 
+  as.character(gr_fpkm.active.LAD$ensembl_id)
+features$ensembl[features$type == "genes_inactive"] <- 
+  as.character(gr_fpkm.inactive.LAD$ensembl_id)
+
+
+features$close_to_border <- ifelse(idx.remove, "far", "close")
+
+mcols(features) <- mcols(features[, c("type", "subset", "close_to_border", "ensembl")])
+saveRDS(features, 
+        file.path(output_dir, "LAD_features.rds"))
+
+# Also, save a tsv file
+write_tsv(as_tibble(features),
+          file.path(output_dir, "LAD_features.tsv"))
+
+
+
+# For later, also prepare the same features for iLADs
+features_iLAD <- as_tibble(ctcf.peaks.all) %>%
+  filter(overlap.LAD == F) %>%
+  dplyr::select(seqnames, start, end) %>%
+  as(., "GRanges")
+
+cutoff <- 0.1e6
+dis <- distanceToNearest(features_iLAD, gr_fpkm, ignore.strand = T)
+ctcf.idx <- mcols(dis)$distance > cutoff
+
+LAD_cutoff <- 0.1e6
+dis <- distanceToNearest(features_iLAD, LAD.border, ignore.strand = T)
+idx.remove <- mcols(dis)$distance > LAD_cutoff
+
+
+mcols(features_iLAD) <- tibble(type = "ctcf_peaks_iLAD",
+                               subset = ifelse(ctcf.idx, "far", "close"),
+                               close_to_border = ifelse(idx.remove, "far", "close"),
+                               ensembl = NA)
+
+saveRDS(features_iLAD, 
+        file.path(output_dir, "iLAD_features.rds"))
+
+
+
+
+```
+
+
+### Conclusion
+
+I find this very interesting. We can see that CTCF detachment within LADs is a 
+real thing, and that this is mediated by CTCF / RAD21. We can correlate the
+detachment with various things, of which loop anchors is the most logical and
+interesting.
+
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

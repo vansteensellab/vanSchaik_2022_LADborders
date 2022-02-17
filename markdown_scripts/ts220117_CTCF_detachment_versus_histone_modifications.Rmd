@@ -1,0 +1,1005 @@
+---
+title: "CTCF detachment versus histone modifications and other changes"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+Look whether a change in CTCF dips is correlated with some (active) feature.
+
+Also, use this script to determine the effect of protein depletion on some newly
+generated data, such as ATAC-seq.
+
+
+### Method
+
+Deeptools of public data.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up, warning = F, message = F}
+
+# Load dependencies
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(ggplot2)
+#library(matrixStats)
+#library(mgcv)
+library(caTools)
+
+
+# Prepare output 
+output_dir <- "ts220117_CTCF_detachment_versus_histone_modifications"
+dir.create(output_dir, showWarnings = FALSE)
+
+```
+
+Knitr setup.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, 
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+Functions.
+
+```{r functions}
+
+
+
+```
+
+
+### 1. List CTCF peaks
+
+Prepare the ctcf sites for deeptools. I focus on CTCF sites that are far from 
+active genes and within LADs.
+
+```{r list ctcf sites}
+
+# Read LAD features
+input_dir <- "ts220113_CTCF_sites_within_LADs"
+features <- readRDS(file.path(input_dir, "LAD_features.rds"))
+features_iLAD <- readRDS(file.path(input_dir, "iLAD_features.rds"))
+
+
+# Prepare bed files for CTCF peaks in LADs
+features_filter <- bind_rows(as_tibble(features),
+                             as_tibble(features_iLAD)) %>%
+  mutate(subset = replace_na(subset, "far")) %>%
+  filter(type %in% c("ctcf_peaks", "genes_active", "ctcf_peaks_iLAD", "random") &
+           subset == "far",
+           close_to_border == "far") %>%
+  as(., "GRanges")
+  
+
+# Prepare output files
+ctcf_lad_bed <- file.path(output_dir, "ctcf_filtered.bed")
+ctcf_ilad_bed <- file.path(output_dir, "ctcf_filtered_ilad.bed")
+genes_active_lad_bed <- file.path(output_dir, "genes_active.bed")
+random_lad_bed <- file.path(output_dir, "random.bed")
+
+#bed_peaks <- paste(ctcf_lad_bed, ctcf_ilad_bed, random_lad_bed)
+bed_peaks <- paste(ctcf_lad_bed, genes_active_lad_bed, random_lad_bed)
+
+
+# Write bed files
+export.bed(features_filter[features_filter$type == "ctcf_peaks"], 
+           ctcf_lad_bed)
+export.bed(features_filter[features_filter$type == "ctcf_peaks_iLAD"], 
+           ctcf_ilad_bed)
+export.bed(features_filter[features_filter$type == "genes_active"], 
+           genes_active_lad_bed)
+export.bed(features_filter[features_filter$type == "random"], 
+           random_lad_bed)
+
+
+
+# ts210702 - also prepare CTCF sites at / near LADs versus iLADs, include random
+features_at_borders <- bind_rows(as_tibble(features),
+                             as_tibble(features_iLAD)) %>%
+  mutate(subset = replace_na(subset, "far")) %>%
+  filter(subset == "far",
+         type %in% c("ctcf_peaks", "ctcf_peaks_iLAD", "random")) %>%
+  mutate(type = case_when(type %in% c("ctcf_peaks", "ctcf_peaks_iLAD") &
+                            close_to_border == "close" ~ "ctcf_peaks_border",
+                          T ~ type)) %>%
+  filter(! (type %in% c("random") & 
+              close_to_border == "close")) %>%
+  as(., "GRanges")
+
+# Export peaks as bed files
+borders_ctcf_lad_bed <- file.path(output_dir, "borders_ctcf_filtered_lad.bed")
+borders_ctcf_ilad_bed <- file.path(output_dir, "borders_ctcf_filtered_ilad.bed")
+borders_ctcf_border_bed <- file.path(output_dir, "borders_ctcf_filtered_border.bed")
+borders_random_lad_bed <- file.path(output_dir, "borders_random_lad.bed")
+
+export.bed(features_at_borders[features_at_borders$type == "ctcf_peaks"], 
+           borders_ctcf_lad_bed)
+export.bed(features_at_borders[features_at_borders$type == "ctcf_peaks_iLAD"], 
+           borders_ctcf_ilad_bed)
+export.bed(features_at_borders[features_at_borders$type == "ctcf_peaks_border"], 
+           borders_ctcf_border_bed)
+export.bed(features_at_borders[features_at_borders$type == "random"], 
+           borders_random_lad_bed)
+
+border_bed_peaks <- paste(borders_ctcf_lad_bed, borders_ctcf_ilad_bed, 
+                          borders_ctcf_border_bed, borders_random_lad_bed)
+
+```
+
+
+### 2. Run Deeptools
+
+Next, run deeptools. I will use the output to make several plots in R. These are
+prettier than figures made with deeptools itself.
+
+```{r run deeptools, cache = T}
+
+# Run deeptools with various tracks
+RunDeeptools <- function(regions.bed, tracks, expname, output_dir, labels, 
+                         extend = 50000, bin_size = 2500, cores = 20) {
+  
+  # Prepare deeptools call
+  regions.bed <- paste(regions.bed, collapse = " ")
+  tracks.bw <- paste(tracks, collapse = " ")
+  labels <- paste(labels, collapse = " ")
+  
+  output.matrix <- file.path(output_dir, 
+                             paste0(expname, "-deeptoolsMatrix.gz"))
+  output.table <- file.path(output_dir, 
+                            paste0(expname, "-deeptoolsTable.tab"))
+  
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/computeMatrix",
+                          "reference-point",
+                          "-a", format(extend, scientific = FALSE), 
+                          "-b", format(extend, scientific = FALSE),
+                          "-bs", format(bin_size, scientific = FALSE), 
+                          "-p", cores,
+                          "-R", regions.bed,
+                          "-S", tracks.bw,
+                          "--referencePoint", "center",
+                          "--samplesLabel", labels,
+                          # "--outFileNameMatrix", output.table,
+                          "--outFileName", output.matrix)
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+  
+  # Return location of the table
+  output.matrix
+  
+}
+
+PlotHeatmap <- function(matrix, output.file, range = "1.5",
+                        labels = c("ctcf_lad", "genes_active_lad", "random_lad")) {
+  
+  # Prepare deeptools call
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/plotHeatmap",
+                          "-m", matrix,
+                          "-out", output.file, 
+                          "-min", paste0("-", range),
+                          "-max", range,
+                          "--missingDataColor", "0.5",
+                          "--xAxisLabel", '"CTCF distance (bp)"',
+                          #"--regionsLabel", "ctcf_lad", "ctcf_ilad", "random_lad",
+                          "--regionsLabel", paste(labels, collapse = " "),
+                          "--colorMap", "RdBu")
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+    
+}
+
+PlotProfile <- function(matrix, output.file,
+                        labels = c("ctcf_lad", "genes_active_lad", "random_lad")) {
+  
+  # Prepare deeptools call
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/plotProfile",
+                          "-m", matrix,
+                          "--perGroup",
+                          #"--regionsLabel", "ctcf_lad", "ctcf_ilad", "random_lad",
+                          "--regionsLabel", paste(labels, collapse = " "),
+                          "-out", output.file)
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+  
+}
+
+# Deeptools input
+extend <- 100000
+bin_size <- 5000
+
+deeptools_dir <- file.path(output_dir, "deeptools")
+dir.create(deeptools_dir, showWarnings = F, recursive = F)
+
+
+# 1) All histone modifications
+exp_name <- "CTCF_peaks"
+
+track_dir <- "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/HistoneModifications/Public_2i_ChIP/"
+
+tracks <- c("/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/2_Wapl-0D-antiCtcf_SF.3517_MQ15_sample.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/5_WaplC6-0h_antiRad21_sample_calibrated.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/ts200714_CTCF_sites_within_LADs/bigwig_scaled/pADamID_PT_0h-10kb-combined.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/ts200714_CTCF_sites_within_LADs/bigwig_scaled/pADamID_CTCF-EL_24h-10kb-combined.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/ts200714_CTCF_sites_within_LADs/bigwig_scaled/pADamID_NQ_WAPL_24h-10kb-combined.bw",
+            grep("H3K27me1|H3K27me2|H3K9me3", 
+                 dir(track_dir, full.names = T, pattern = "E14_2i"),
+                 value = T, invert = T))
+
+track_names <- c("CTCF", "RAD21", "PT-LaminB1", "C_24h-LaminB1", "W_24h-LaminB1",
+                 str_remove(str_remove(basename(tracks[6:length(tracks)]), "E14_2i_"), "_.*"))
+
+# Sort tracks
+idx <- c(3:5, 1:2, 6, 10:12, 7:9)
+tracks <- tracks[idx]
+track_names <- track_names[idx]
+
+track_names_histones <- track_names
+
+deeptools_matrix <- RunDeeptools(bed_peaks, tracks, exp_name, deeptools_dir, track_names,
+                                 extend = extend, bin_size = bin_size)
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")))
+
+
+
+# 2) ATAC - 1x 
+exp_name <- "ATAC"
+
+track_dir <- "Data_NQ/ATAC_AID/1X_genome/"
+
+tracks <- dir(track_dir, full.names = T)
+
+track_names <- str_remove(str_remove(str_remove(basename(tracks), 
+                                                "_final.*"), 
+                                     ".*NQ_"),
+                          "-")
+
+# Sort the track names
+idx <- c(9:10, 7:8, 3:4, 1:2, 5:6)
+tracks <- tracks[idx]
+track_names <- track_names[idx]
+
+track_names_atac <- track_names
+
+deeptools_matrix <- RunDeeptools(bed_peaks, tracks, exp_name, deeptools_dir, track_names,
+                                 extend = extend, bin_size = bin_size)
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")))
+
+
+
+# 3a) Dynamic histone modifications (NQ) - H3K4me1
+exp_name <- "h3k4me1_time_course"
+
+track_dir <- "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/HistoneModifications/Histone_WAPL_CW/"
+
+tracks <- dir(track_dir, full.names = T, pattern = "H3K4me1")[c(5, 7, 6, 8, 1, 3, 2, 4)]
+
+track_names <- str_remove(str_remove(basename(tracks), "_anti.*"), ".*_")
+
+deeptools_matrix <- RunDeeptools(bed_peaks, tracks, exp_name, deeptools_dir, track_names)
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")))
+
+
+# 3b) Dynamic histone modifications (NQ) - others
+exp_name <- "histones_time_course"
+
+track_dir <- "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/HistoneModifications/Histone_WAPL_CW/"
+
+tracks <- grep("H3K4me1", dir(track_dir, full.names = T), value = T, invert = T)
+
+track_names <- str_remove(str_remove(str_remove(basename(tracks), "_samp.*"), 
+                                     "anti"),
+                          "[7|8]_")[c(1, 3, 2, 4, 5, 7, 6, 8)]
+
+deeptools_matrix <- RunDeeptools(bed_peaks, tracks, exp_name, deeptools_dir, track_names)
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")))
+
+
+# 4) Gene expression
+exp_name <- "gene_expression"
+
+track_dir <- "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/RNAseq_all/bigWig/"
+
+tracks <- dir(track_dir, full.names = T, pattern = "RNA")
+
+track_names <- str_replace_all(str_remove(str_remove(basename(tracks), ".fas.*"), 
+                                          "RNA\\d+_"),
+                               "-", "_")
+track_names_expression <- track_names
+
+deeptools_matrix <- RunDeeptools(bed_peaks, tracks, exp_name, deeptools_dir, track_names)
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")))
+
+
+
+
+
+# 5) ts210702 - CTCF sites in and near LADs
+tracks <- c("/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/2_Wapl-0D-antiCtcf_SF.3517_MQ15_sample.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/HistoneModifications/Public_2i_ChIP/E14_2i_H3K27me3_GSM2779214_SRR6025412-5_MQ15_sample.bw")
+
+track_names <- track_names_h3k27me3 <- c("CTCF", "H3K27me3")
+
+
+# Briefly change size parameters
+exp_name <- "h3k27me3_at_borders"
+
+extend <- 100000
+bin_size <- 5000
+
+deeptools_matrix <- RunDeeptools(border_bed_peaks, tracks, exp_name, deeptools_dir, track_names,
+                                 extend = extend, bin_size = bin_size)
+
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")),
+            labels = c("ctcf_lad", "ctcf_ilad", "ctcf_border", "random_lad"))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")),
+            labels = c("ctcf_lad", "ctcf_ilad", "ctcf_border", "random_lad"))
+
+
+# Briefly change size parameters
+exp_name <- "h3k27me3_at_borders_zoom"
+
+extend <- 20000
+bin_size <- 500
+
+deeptools_matrix <- RunDeeptools(border_bed_peaks, tracks, exp_name, deeptools_dir, track_names,
+                                 extend = extend, bin_size = bin_size)
+
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")),
+            labels = c("ctcf_lad", "ctcf_ilad", "ctcf_border", "random_lad"))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")),
+            labels = c("ctcf_lad", "ctcf_ilad", "ctcf_border", "random_lad"))
+
+# I should highlight that the CTCF border sites are not aligned based on LAD
+# border orientation. This means that these tracks are not very trustworthy.
+# Regardless, there is clearly a local decrease in H3K27me3 at CTCF sites
+# themselves.
+
+
+
+# 6) ts220203 - H3K27me3 signal before/after CTCF depletion
+extend <- 100000
+bin_size <- 5000
+
+exp_name <- "H3K27me3_chipseq"
+
+track_dir <- "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CTCF_depletion_H3K27me3/"
+
+tracks <- c("/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results_mouse/tracks/normalized/bin-10kb/mESC_LMNB1-10kb-combined.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/2_Wapl-0D-antiCtcf_SF.3517_MQ15_sample.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/5_WaplC6-0h_antiRad21_sample_calibrated.bw",
+            grep("pdf", 
+                 dir(track_dir, full.names = T, pattern = "AID"),
+                 value = T, invert = T))
+
+track_names_h3k27me3_chip <- c("LMNB1", "CTCF", "RAD21", 
+                               str_remove(str_remove(basename(tracks[4:(length(tracks))]), 
+                                                     "E14_2i_"), 
+                                          "_antiH3K27me3.*"))
+
+deeptools_matrix <- RunDeeptools(bed_peaks, tracks, exp_name, deeptools_dir, track_names_h3k27me3_chip,
+                                 extend = extend, bin_size = bin_size)
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")))
+
+
+# Also, make a few profiles for all CTCF peaks
+bed_peaks_h3k27me3 <- "Data_NQ/ChIP_NQ/GSE94300_E14H3K27me3_MAnorm_unbiased.bed"
+bed_peaks_ctcf <- paste(ctcf_lad_bed, ctcf_ilad_bed, random_lad_bed, bed_peaks_h3k27me3)
+
+exp_name <- "H3K27me3_chipseq_at_ctcf_peaks"
+
+extend <- 100000
+bin_size <- 5000
+
+deeptools_matrix <- RunDeeptools(bed_peaks_ctcf, tracks[4:7], exp_name, deeptools_dir, 
+                                 track_names_h3k27me3_chip[4:7],
+                                 extend = extend, bin_size = bin_size)
+
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")),
+            labels = c("ctcf_lad", "ctcf_ilad", "random_lad", "h3k27me3"))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")),
+            labels = c("ctcf_lad", "ctcf_ilad", "random_lad", "h3k27me3"))
+
+
+# Return size parameters
+extend <- 100000
+bin_size <- 5000
+
+```
+
+
+### 3. Plot in R
+
+I can now use the output from deeptools in R to make prettier plots. Start doing 
+that here.
+
+Start by loading in the features.
+
+```{r prepare regions}
+
+# Load the bed files
+ctcf_lad <- import(ctcf_lad_bed)
+#ctcf_ilad <- import(ctcf_ilad_bed)
+genes_active_lad <- import(genes_active_lad_bed)
+random <- import(random_lad_bed)
+
+```
+
+First, the histone modifications. 
+
+```{r plot histones in r, fig.width = 7, fig.height = 5.5}
+
+# 1) Load data - histones
+
+# Prepare experiment details
+exp_name <- "CTCF_peaks"
+
+# Load deeptools output
+tib_data <- read_tsv(file.path(deeptools_dir, paste0(exp_name, 
+                                                "-deeptoolsMatrix.gz")),
+                skip = 1, col_names = F)
+
+tib_meta <- tib_data[, 1:6]
+tib_values <- tib_data[, 7:ncol(tib_data)]
+
+# Update metadata
+tib_meta <- tib_meta %>%
+  rename_all(~ c("seqnames", "start", "end", "name", "score", "strand")) %>%
+  mutate(class = rep(c("ctcf_lad", "genes_active_lad", "random_lad"),
+                     times = c(length(ctcf_lad), 
+                               length(genes_active_lad), 
+                               length(random))))
+
+tib_values_gather <- tib_values %>%
+  add_column(class = tib_meta$class) %>%
+  rename_at(1:(ncol(.)-1), 
+            ~ paste(rep(track_names_histones, each = 40), 1:40, sep = "_")) %>%
+  mutate(feature = 1:nrow(.)) %>%
+  gather(key, value, -class, -feature) %>%
+  mutate(track = str_remove(key, "_[0-9]+$"),
+         track = factor(track, track_names_histones), 
+         bin = str_remove(key, ".*_"),
+         bin = as.numeric(bin),
+         distance = -extend - bin_size/2 + bin_size * bin,
+         distance = distance / 1e3) %>%
+  filter(! grepl("LaminB1", track)) %>%
+  mutate(value = as.numeric(value))
+  
+  
+# Add numbers to class names
+tbl <- table(tib_meta$class)
+idx <- match(tib_values_gather$class, names(tbl))
+tib_values_gather <- tib_values_gather %>%
+  mutate(class = paste0(class, " (", tbl[idx], ")"))
+
+
+# Remove crazy values to prevent crazy things
+tib_values_gather <- tib_values_gather %>%
+  drop_na() %>%
+  group_by(track) %>%
+  mutate(limit1 = quantile(value, 0.001, na.rm = T),
+         limit2 = quantile(value, 0.999, na.rm = T)) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(value = replace(value, value < limit1, limit1),
+         value = replace(value, value > limit2, limit2)) %>%
+  dplyr::select(-limit1, -limit2) %>%
+  ungroup()
+
+
+# Plot
+plt_base <- tib_values_gather %>%
+  drop_na() %>%
+  ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+  geom_hline(yintercept = 0, linetype = "dashed", col = "black") +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2") +
+  xlab("Distance (kb)") +
+  ylab("Score") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+plt <- plt_base +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = class)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = class, fill = class),
+               fun.args = list(mult = 1.96)) +
+  facet_wrap( ~ track, scales = "free_y")
+plot(plt)
+
+
+
+```
+
+Next, the ATAC-seq data that we generated ourselves.
+
+```{r plot atac in r, fig.width = 7, fig.height = 4, cache = T}
+
+# 1) Load data - first ATAC
+# Prepare experiment details
+exp_name <- "ATAC"
+
+# Load deeptools output
+tib_data <- read_tsv(file.path(deeptools_dir, paste0(exp_name, 
+                                                "-deeptoolsMatrix.gz")),
+                skip = 1, col_names = F)
+
+tib_meta <- tib_data[, 1:6]
+tib_values <- tib_data[, 7:ncol(tib_data)]
+
+# Update metadata
+# tib_meta <- tib_meta %>%
+#   rename_all(~ c("seqnames", "start", "end", "name", "score", "strand")) %>%
+#   mutate(class = rep(c("ctcf_lad", "ctcf_ilad", "random_lad"),
+#                      times = c(length(ctcf_lad), 
+#                                length(ctcf_ilad),
+#                                length(random))))
+tib_meta <- tib_meta %>%
+  rename_all(~ c("seqnames", "start", "end", "name", "score", "strand")) %>%
+  mutate(class = rep(c("ctcf_lad", "genes_active_lad", "random_lad"),
+                     times = c(length(ctcf_lad), 
+                               length(genes_active_lad), 
+                               length(random))))
+
+tib_values_gather <- tib_values %>%
+    add_column(class = tib_meta$class) %>%
+    rename_at(1:(ncol(.)-1), 
+              ~ paste(rep(track_names_atac, each = 40), 1:40, sep = "_")) %>%
+    gather(key, value, -class) %>%
+    mutate(experiment = str_remove(key, "_.*"),
+           condition = str_remove(experiment, "0h|24h"),
+           timepoint = ifelse(grepl("24h", experiment), "24h", "0h"),
+           bin = str_remove(key, ".*_"),
+           condition = factor(condition,
+                              levels = c("PT", "CtcfEN", "Rad21", 
+                                         "Wapl", "CtcfWapl")),
+           timepoint = factor(timepoint, 
+                              levels = c("0h", "24h")),
+           bin = as.numeric(bin),
+           distance = -extend - bin_size/2 + bin_size * bin,
+           distance = distance / 1e3) %>%
+  mutate(value = as.numeric(value))
+
+# Add numbers to class names
+tbl <- table(tib_meta$class)
+idx <- match(tib_values_gather$class, names(tbl))
+tib_values_gather <- tib_values_gather %>%
+  mutate(class = paste0(class, " (", tbl[idx], ")"))
+
+
+# Remove crazy values to prevent crazy things
+tib_values_gather <- tib_values_gather %>%
+  drop_na() %>%
+  group_by(condition) %>%
+  mutate(limit1 = quantile(value, 0.001, na.rm = T),
+         limit2 = quantile(value, 0.999, na.rm = T)) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(value = replace(value, value < limit1, limit1),
+         value = replace(value, value > limit2, limit2)) %>%
+  dplyr::select(-limit1, -limit2) %>%
+  ungroup()
+
+# Plot
+plt_base <- tib_values_gather %>%
+  drop_na() %>%
+  ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2") +
+  xlab("Distance (kb)") +
+  ylab("ATAC") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+plt <- plt_base +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = class)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = class, fill = class),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(timepoint ~ condition)
+plot(plt)
+
+plt <- plt_base +
+  #geom_line(aes(x = location, y = value, col = timepoint)) +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = timepoint)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = timepoint, fill = timepoint),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(class ~ condition)
+plot(plt)
+
+# Without PT
+plt_base <- tib_values_gather %>%
+  filter(condition != "PT") %>%
+  drop_na() %>%
+  ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2") +
+  xlab("Distance (kb)") +
+  ylab("ATAC") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+plt <- plt_base +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = class)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = class, fill = class),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(timepoint ~ condition)
+plot(plt)
+
+plt <- plt_base +
+  #geom_line(aes(x = location, y = value, col = timepoint)) +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = timepoint)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = timepoint, fill = timepoint),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(class ~ condition)
+plot(plt)
+  
+```
+
+Next, make some plots of gene expression.
+
+```{r plot expression in r, fig.width = 7, fig.height = 4, cache = T}
+
+# Load data - expression
+exp_name <- "gene_expression"
+
+# Load deeptools output
+tib_data <- read_tsv(file.path(deeptools_dir, paste0(exp_name, 
+                                                "-deeptoolsMatrix.gz")),
+                skip = 1, col_names = F)
+
+tib_meta <- tib_data[, 1:6]
+tib_values <- tib_data[, 7:ncol(tib_data)]
+
+# Update metadata
+# tib_meta <- tib_meta %>%
+#   rename_all(~ c("seqnames", "start", "end", "name", "score", "strand")) %>%
+#   mutate(class = rep(c("ctcf_lad", "ctcf_ilad", "random_lad"),
+#                      times = c(length(ctcf_lad), 
+#                                length(ctcf_ilad),
+#                                length(random))))
+tib_meta <- tib_meta %>%
+  rename_all(~ c("seqnames", "start", "end", "name", "score", "strand")) %>%
+  mutate(class = rep(c("ctcf_lad", "genes_active_lad", "random_lad"),
+                     times = c(length(ctcf_lad), 
+                               length(genes_active_lad), 
+                               length(random))))
+
+tib_values_gather <- tib_values %>%
+  add_column(class = tib_meta$class) %>%
+  rename_at(1:(ncol(.)-1), 
+            ~ paste(rep(track_names_expression, each = 40), 
+                    1:40, sep = "_")) %>%
+  gather(key, value, -class) %>%
+  # Select only CTCFEL
+  filter(! grepl("NQL", key)) %>%
+  mutate(key = str_replace(key, "CTCF_EN", "CTCFEL")) %>%
+  separate(key, c("condition", "timepoint", "replicate", "bin"), 
+           remove = F) %>%
+  mutate(condition = factor(condition,
+                            levels = c("PT", "CTCFEL", "RAD21", 
+                                       "WAPL", "CTCFWAPL")),
+         timepoint = factor(timepoint, 
+                            levels = c("0h", "6h", "24h", "48h", "96h")),
+         bin = as.numeric(bin),
+         distance = -extend - bin_size/2 + bin_size * bin,
+         distance = distance / 1e3) %>%
+  mutate(value = as.numeric(value))
+
+# Add numbers to class names
+tbl <- table(tib_meta$class)
+idx <- match(tib_values_gather$class, names(tbl))
+tib_values_gather <- tib_values_gather %>%
+  mutate(class = paste0(class, " (", tbl[idx], ")"))
+
+
+# Remove crazy values to prevent crazy things
+tib_values_gather <- tib_values_gather %>%
+  drop_na() %>%
+  group_by(condition) %>%
+  mutate(limit1 = quantile(value, 0.001, na.rm = T),
+         limit2 = quantile(value, 0.999, na.rm = T)) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(value = replace(value, value < limit1, limit1),
+         value = replace(value, value > limit2, limit2)) %>%
+  dplyr::select(-limit1, -limit2) %>%
+  ungroup()
+
+# Plot
+plt_base <- tib_values_gather %>%
+  drop_na() %>%
+  ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  xlab("Distance (kb)") +
+  ylab("Expression") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+plt <- plt_base +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = class)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = class, fill = class),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(timepoint ~ condition)
+plot(plt)
+
+plt <- plt_base +
+  #geom_line(aes(x = location, y = value, col = timepoint)) +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = timepoint)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = timepoint, fill = timepoint),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(class ~ condition)
+plot(plt)
+
+# Without PT
+plt_base <- tib_values_gather %>%
+  filter(condition != "PT") %>%
+  drop_na() %>%
+  ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  xlab("Distance (kb)") +
+  ylab("Expression") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+plt <- plt_base +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = class)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = class, fill = class),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(timepoint ~ condition)
+plot(plt)
+
+plt <- plt_base +
+  #geom_line(aes(x = location, y = value, col = timepoint)) +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = timepoint)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = timepoint, fill = timepoint),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(class ~ condition)
+plot(plt)
+  
+```
+
+Clearly, CTCF sites within LADs are not expressed.
+
+Finally, show plots of H3K27me3 chip-seq
+
+```{r h3k27me3 chipseq, fig.width = 7, fig.height = 4, cache = T}
+
+# 1) Load data
+# Prepare experiment details
+exp_name <- "H3K27me3_chipseq"
+
+# Load deeptools output
+tib_data <- read_tsv(file.path(deeptools_dir, paste0(exp_name, 
+                                                "-deeptoolsMatrix.gz")),
+                skip = 1, col_names = F)
+
+tib_meta <- tib_data[, 1:6]
+tib_values <- tib_data[, 7:ncol(tib_data)]
+
+# Update metadata
+# tib_meta <- tib_meta %>%
+#   rename_all(~ c("seqnames", "start", "end", "name", "score", "strand")) %>%
+#   mutate(class = rep(c("ctcf_lad", "ctcf_ilad", "random_lad"),
+#                      times = c(length(ctcf_lad), 
+#                                length(ctcf_ilad),
+#                                length(random))))
+tib_meta <- tib_meta %>%
+  rename_all(~ c("seqnames", "start", "end", "name", "score", "strand")) %>%
+  mutate(class = rep(c("ctcf_lad", "genes_active_lad", "random_lad"),
+                     times = c(length(ctcf_lad), 
+                               length(genes_active_lad), 
+                               length(random))))
+
+tib_values_gather <- tib_values %>%
+    add_column(class = tib_meta$class) %>%
+    rename_at(1:(ncol(.)-1), 
+              ~ paste(rep(track_names_h3k27me3_chip, each = 40), 
+                      1:40, sep = "_")) %>%
+    gather(key, value, -class) %>%
+    mutate(track = str_remove(key, "_[0-9]+$"),
+           timepoint = ifelse(grepl("24h", track), "24h", "0h"),
+           replicate = ifelse(grepl("r1", track), "r1", "r2"),
+           bin = str_remove(key, ".*_"),
+           timepoint = factor(timepoint, 
+                              levels = c("0h", "24h")),
+           bin = as.numeric(bin),
+           distance = -extend - bin_size/2 + bin_size * bin,
+           distance = distance / 1e3) %>%
+  mutate(value = as.numeric(value))
+
+# Add numbers to class names
+tbl <- table(tib_meta$class)
+idx <- match(tib_values_gather$class, names(tbl))
+tib_values_gather <- tib_values_gather %>%
+  mutate(class = paste0(class, " (", tbl[idx], ")"))
+
+
+# Remove crazy values to prevent crazy things
+tib_values_gather <- tib_values_gather %>%
+  drop_na() %>%
+  group_by(track) %>%
+  mutate(limit1 = quantile(value, 0.001, na.rm = T),
+         limit2 = quantile(value, 0.999, na.rm = T)) %>%
+  ungroup() %>%
+  rowwise() %>%
+  mutate(value = replace(value, value < limit1, limit1),
+         value = replace(value, value > limit2, limit2)) %>%
+  dplyr::select(-limit1, -limit2) %>%
+  ungroup()
+
+# Remove LMNB1 and other base tracks
+tib_values_gather <- tib_values_gather %>%
+  filter(grepl("AID", track))
+
+# Plot
+plt_base <- tib_values_gather %>%
+  drop_na() %>%
+  ggplot() +
+  geom_vline(xintercept = 0, linetype = "dashed", col = "black") +
+  scale_color_brewer(palette = "Set2") +
+  scale_fill_brewer(palette = "Set2") +
+  xlab("Distance (kb)") +
+  ylab("H3K27me3") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# With replicates
+plt <- plt_base +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = class)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = class, fill = class),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(replicate ~ timepoint)
+plot(plt)
+
+plt <- plt_base +
+  #geom_line(aes(x = location, y = value, col = timepoint)) +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = timepoint)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = timepoint, fill = timepoint),
+               fun.args = list(mult = 1.96)) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  facet_grid(replicate ~ class)
+plot(plt)
+  
+
+# Without replicates
+plt <- plt_base +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = class)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = class, fill = class),
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ timepoint)
+plot(plt)
+
+plt <- plt_base +
+  #geom_line(aes(x = location, y = value, col = timepoint)) +
+  stat_summary(fun = mean, geom = "line", size = 1,
+               aes(x = distance, y = value, col = timepoint)) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.15, col = NA,
+               aes(x = distance, y = value, 
+                   group = timepoint, fill = timepoint),
+               fun.args = list(mult = 1.96)) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  facet_grid(. ~ class)
+plot(plt)
+
+```
+
+
+### Conclusion
+
+Looks good.
+
+  * CTCF sites are correlated with various epigenetic features, including an
+    enrichment of H3K27me3 and some active features. Also ATAC-seq. And a 
+    depletion for H3K9me2. No transcription as estimated with H3K36me3 signal.
+    (And gene expression.)
+  * ATAC-seq signal is not affected by a loss of LaminB1 detachment at CTCF
+    sites.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+

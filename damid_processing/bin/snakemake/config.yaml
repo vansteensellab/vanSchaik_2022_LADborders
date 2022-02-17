@@ -1,0 +1,780 @@
+###############################################################################
+## snakemake config - damid pipeline ##########################################
+###############################################################################
+## Tom van Schaik
+## 171120
+## version 1.3
+
+# Introduction snakemake:
+# Snakemake is a bioinformatics pipeline tool written in python. It follows the 
+# 'make'-logic: you determine rules with which files can be generated, and 
+# which input files these require. Snakemake will try to execute the first rule
+# given, and execute other rules based on the input the final rule requires. 
+# In this way, you have a pipeline. 
+# Some cool features of snakemake:
+# - You give input and output file names, and snakemake will do the rest.
+# - If a rule gives an error, the output file is automatically removed, to 
+#   prevent "partial" data files.
+# - Given a number of cores to snakemake, it will automatically parallelize 
+#   things when possible. 
+# - You can create a fancy workflow overview picture.
+
+# This is the config file for a damid snakemake pipeline, where you list 
+# parameters which will be used in the pipeline.
+
+# Versions:
+# 1.0 - Initial version
+# 1.1 - Updated pipeline
+# 1.2 - Added replicates + changed basename scheme
+# 1.3 - Changed mapping to bwa mem for 4DN compatibility
+# Changed to mouse samples (4DN-proof)
+
+###############################################################################
+### Parameters and file locations #############################################
+###############################################################################
+
+# Parsing
+read_parser: bin/read_parser/read_parser.py
+read_structure: bin/read_parser/read_structure.txt
+conda_parser: /home/t.v.schaik/mydata/proj/tests/results/ts181120_pADamID_mouse/bin/read_parser/conda_parser.yaml
+
+# Mapping
+mapper: bin/mapping/mapping_bwa.sh
+genome_index: /DATA/scratch/usr/t.v.schaik/data/genomes/mm10/ENCODE/mm10_no_alt_analysis_set_ENCODE
+conda_mapping: /home/t.v.schaik/mydata/proj/tests/results/ts181120_pADamID_mouse/bin/mapping/conda_mapping.yaml
+
+# Counting
+gatc_counting: bin/gatc_counting/gatc_counting.R
+gatc_gff: /DATA/scratch/usr/t.v.schaik/data/genomes/mm10/ENCODE/mm10_no_alt_analysis_set_ENCODE_gatc_fragments.gff
+bins: "5,10,20,25,50,80,100,160,250"
+#bins: "1,2,5,10,20,25,50,80,100,250"
+
+# Normalizing
+normalize_damid: bin/normalization/normalize_damid.R
+normalize_method: dam-log2
+pseudo: 1
+combine_replicates: bin/normalization/combine_replicates.R
+
+# Tracks
+bed2bigwig: bin/data_tracks/bed2BigWig.R
+chrom_sizes: /DATA/scratch/usr/t.v.schaik/data/genomes/mm10/mm10.chrom.sizes
+
+# HMM
+hmm_calling: "bin/HMM_calling/HMM.R"
+
+# File report - the locations should be relative from the snakemake file
+report_relative_location: "./"    # required for previous versions of snakemake
+file_report: "../../bin/reports/experiment_statistics.Rmd"
+replicate_report: "../../bin/reports/replicate_statistics.Rmd"
+#centromeres_bed: "bin/reports/ts171110_hg38_centromeres.bed.gz"
+
+# Statistics
+gather_statistics: "bin/statistics/gather_statistics.R"
+merge_statistics: "bin/statistics/merge_statistics.R"
+
+###############################################################################
+### Input and output ##########################################################
+###############################################################################
+
+# Note #1: use spaces instead of tabs for some reason!
+
+# Output directories
+output_dir: "results_NQ"
+
+out_parse: parsed
+out_map: mapped
+out_count: counts
+out_norm: normalized
+out_tracks_norm: tracks/normalized
+out_tracks_counts: tracks/counts
+out_hmm: "HMM"
+out_report_experiment: "reports/experiment"
+out_report_replicate: "reports/replicate"
+out_statistics: statistics
+
+
+# Basename target to basename dam-only control list
+basenames:
+  
+  # Replicate 1 - WAPL & CTCF-WAPL
+  pADamID_NQ_CTCF-WAPL_0h_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_1_pADamID_NQ_CTFF-WAPL_0h_AAACATCG_S2_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_6h_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_2_pADamID_NQ_CTFF-WAPL_6h_ACATTGGC_S5_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_3_pADamID_NQ_CTFF-WAPL_24h_ACCACTGT_S4_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_96h_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_4_pADamID_NQ_CTFF-WAPL_96h_AACGTGAT_S8_R1_001.fastq.gz
+  
+  pADamID_NQ_WAPL_0h_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_5_pADamID_NQ_WAPL_0h_CGCTGATC_S9_R1_001.fastq.gz
+  pADamID_NQ_WAPL_6h_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_6_pADamID_NQ_WAPL_6h_CAGATCTG_S7_R1_001.fastq.gz
+  pADamID_NQ_WAPL_24h_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_7_pADamID_NQ_WAPL_24h_ATGCCTAA_S10_R1_001.fastq.gz
+  pADamID_NQ_WAPL_96h_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_8_pADamID_NQ_WAPL_96h_CTGTAGCC_S11_R1_001.fastq.gz
+  
+  pADamID_NQ_CTCF-WAPL_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_9_pADamID_NQ_CTFF-WAPL_0h_Dam_AGTACAAG_S1_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_6h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_10_pADamID_NQ_CTFF-WAPL_6h_Dam_CATCAAGT_S3_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_11_pADamID_NQ_CTFF-WAPL_24h_Dam_AGTGGTCA_S6_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_96h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_12_pADamID_NQ_CTFF-WAPL_96h_Dam_AACAACCA_S12_R1_001.fastq.gz
+  
+  pADamID_NQ_WAPL_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_13_pADamID_NQ_WAPL_0h_Dam_AACCGAGA_S13_R1_001.fastq.gz
+  pADamID_NQ_WAPL_6h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_14_pADamID_NQ_WAPL_6h_Dam_AACGCTTA_S14_R1_001.fastq.gz
+  pADamID_NQ_WAPL_24h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_15_pADamID_NQ_WAPL_24h_Dam_AAGACGGA_S15_R1_001.fastq.gz
+  pADamID_NQ_WAPL_96h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5191/fastq_files/5191_16_pADamID_NQ_WAPL_96h_Dam_AAGGTACA_S16_R1_001.fastq.gz
+  
+  
+  
+  # Replicate 2 - WAPL & CTCF-WAPL
+  pADamID_NQ_CTCF-WAPL_0h_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_13_pADamID_WAPL-CTCF_LMNB1_0h_AACCGAGA_S18_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_6h_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_14_pADamID_WAPL-CTCF_LMNB1_6h_AACGCTTA_S19_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_15_pADamID_WAPL-CTCF_LMNB1_24h_AAGACGGA_S20_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_96h_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_16_pADamID_WAPL-CTCF_LMNB1_96h_AAGGTACA_S21_R1_001.fastq.gz
+  
+  pADamID_NQ_WAPL_0h_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_5_pADamID_WAPL_LMNB1_0h_CGCTGATC_S14_R1_001.fastq.gz
+  pADamID_NQ_WAPL_6h_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_6_pADamID_WAPL_LMNB1_6h_CAGATCTG_S12_R1_001.fastq.gz
+  pADamID_NQ_WAPL_24h_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_7_pADamID_WAPL_LMNB1_24h_ATGCCTAA_S15_R1_001.fastq.gz
+  pADamID_NQ_WAPL_96h_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_8_pADamID_WAPL_LMNB1_96h_CTGTAGCC_S16_R1_001.fastq.gz
+  
+  pADamID_NQ_CTCF-WAPL_0h_Dam_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_9_pADamID_WAPL-CTCF_Dam_0h_AGTACAAG_S6_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_6h_Dam_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_10_pADamID_WAPL-CTCF_Dam_6h_CATCAAGT_S8_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_Dam_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_11_pADamID_WAPL-CTCF_Dam_24h_AGTGGTCA_S11_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_96h_Dam_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_12_pADamID_WAPL-CTCF_Dam_96h_AACAACCA_S17_R1_001.fastq.gz
+  
+  pADamID_NQ_WAPL_0h_Dam_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_1_pADamID_WAPL_Dam_0h_AAACATCG_S7_R1_001.fastq.gz
+  pADamID_NQ_WAPL_6h_Dam_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_2_pADamID_WAPL_Dam_6h_ACATTGGC_S10_R1_001.fastq.gz
+  pADamID_NQ_WAPL_24h_Dam_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_3_pADamID_WAPL_Dam_24h_ACCACTGT_S9_R1_001.fastq.gz
+  pADamID_NQ_WAPL_96h_Dam_r2:
+    - /shared/gcf/t.v.schaik/5313/fastq_files/5313_4_pADamID_WAPL_Dam_96h_AACGTGAT_S13_R1_001.fastq.gz
+  
+  
+  
+  # Replicate 1 - CTCF (2 clones)
+  pADamID_CTCF-NQ_0h_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_5_pADamID_CTCF-1_LMNB1_0h_ACGTATCA_S30_R1_001.fastq.gz
+  pADamID_CTCF-NQ_6h_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_6_pADamID_CTCF-1_LMNB1_6h_ACTATGCA_S28_R1_001.fastq.gz
+  pADamID_CTCF-NQ_24h_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_7_pADamID_CTCF-1_LMNB1_24h_AGAGTCAA_S31_R1_001.fastq.gz
+  pADamID_CTCF-NQ_96h_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_8_pADamID_CTCF-1_LMNB1_96h_AGATCGCA_S32_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_0h_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_13_pADamID_CTCF-2_LMNB1_0h_CAACCACA_S34_R1_001.fastq.gz
+  pADamID_CTCF-EL_6h_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_14_pADamID_CTCF-2_LMNB1_6h_CAAGACTA_S35_R1_001.fastq.gz
+  pADamID_CTCF-EL_24h_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_15_pADamID_CTCF-2_LMNB1_24h_CAATGGAA_S36_R1_001.fastq.gz
+  pADamID_CTCF-EL_96h_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_16_pADamID_CTCF-2_LMNB1_96h_CACTTCGA_S37_R1_001.fastq.gz
+  
+  pADamID_CTCF-NQ_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_1_pADamID_CTCF-1_Dam_0h_ACACAGAA_S23_R1_001.fastq.gz
+  pADamID_CTCF-NQ_6h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_2_pADamID_CTCF-1_Dam_6h_ACAGCAGA_S26_R1_001.fastq.gz
+  pADamID_CTCF-NQ_24h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_3_pADamID_CTCF-1_Dam_24h_ACCTCCAA_S25_R1_001.fastq.gz
+  pADamID_CTCF-NQ_96h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_4_pADamID_CTCF-1_Dam_96h_ACGCTCGA_S29_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_9_pADamID_CTCF-2_Dam_0h_AGCAGGAA_S22_R1_001.fastq.gz
+  pADamID_CTCF-EL_6h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_10_pADamID_CTCF-2_Dam_6h_AGTCACTA_S24_R1_001.fastq.gz
+  pADamID_CTCF-EL_24h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_11_pADamID_CTCF-2_Dam_24h_ATCCTGTA_S27_R1_001.fastq.gz
+  pADamID_CTCF-EL_96h_Dam_r1:
+    - /shared/gcf/t.v.schaik/5314/fastq_files/5314_12_pADamID_CTCF-2_Dam_96h_ATTGAGGA_S33_R1_001.fastq.gz
+  
+  
+  # ts200529 - 3 new replicates for all samples & PT & RAD21
+  # Let's call these r3, r4 and r5 instead of r1, r2 and r3 used in the files
+  
+  # Replicate "3"
+  pADamID_RAD21_0h_r3:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_2_pADamID_mESC_RAD21_0h_r1_LMNB1_AACGTGAT_S81_R1_001.fastq.gz
+  pADamID_RAD21_6h_r3:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_4_pADamID_mESC_RAD21_6h_r1_LMNB1_CAGATCTG_S84_R1_001.fastq.gz
+  pADamID_RAD21_24h_r3:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_6_pADamID_mESC_RAD21_24h_r1_LMNB1_CTGTAGCC_S83_R1_001.fastq.gz
+  pADamID_RAD21_0h_Dam_r3:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_1_pADamID_mESC_RAD21_0h_r1_Dam_ACCACTGT_S78_R1_001.fastq.gz
+  pADamID_RAD21_6h_Dam_r3:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_3_pADamID_mESC_RAD21_6h_r1_Dam_CGCTGATC_S80_R1_001.fastq.gz
+  pADamID_RAD21_24h_Dam_r3:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_5_pADamID_mESC_RAD21_24h_r1_Dam_ATGCCTAA_S85_R1_001.fastq.gz
+  
+  
+  # Replicate "4"
+  pADamID_PT_0h_r4:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_10_pADamID_mESC_PT_0h_r2_LMNB1_AACAACCA_S79_R1_001.fastq.gz
+  pADamID_PT_0h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_9_pADamID_mESC_PT_0h_r2_Dam_AGTGGTCA_S77_R1_001.fastq.gz
+  
+  pADamID_RAD21_0h_r4:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_12_pADamID_mESC_RAD21_0h_r2_LMNB1_AACGCTTA_S88_R1_001.fastq.gz
+  pADamID_RAD21_6h_r4:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_14_pADamID_mESC_RAD21_6h_r2_LMNB1_AAGGTACA_S90_R1_001.fastq.gz
+  pADamID_RAD21_24h_r4:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_16_pADamID_mESC_RAD21_24h_r2_LMNB1_ACAGCAGA_S92_R1_001.fastq.gz
+  pADamID_RAD21_0h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_11_pADamID_mESC_RAD21_0h_r2_Dam_AACCGAGA_S82_R1_001.fastq.gz
+  pADamID_RAD21_6h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_13_pADamID_mESC_RAD21_6h_r2_Dam_AAGACGGA_S89_R1_001.fastq.gz
+  pADamID_RAD21_24h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5959/fastq_files/5959_15_pADamID_mESC_RAD21_24h_r2_Dam_ACACAGAA_S91_R1_001.fastq.gz
+  
+  pADamID_CTCF-NQ_0h_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_10_pADamID_mESC_CTCF-NQ_0h_r2_LMNB1_ATTGAGGA_S93_R1_001.fastq.gz
+  pADamID_CTCF-NQ_6h_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_12_pADamID_mESC_CTCF-NQ_6h_r2_LMNB1_CAAGACTA_S98_R1_001.fastq.gz
+  pADamID_CTCF-NQ_24h_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_14_pADamID_mESC_CTCF-NQ_24h_r2_LMNB1_CAGCGTTA_S106_R1_001.fastq.gz
+  pADamID_CTCF-NQ_96h_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_16_pADamID_mESC_CTCF-NQ_96h_r2_LMNB1_CCAGTTCA_S108_R1_001.fastq.gz
+  pADamID_CTCF-NQ_0h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_9_pADamID_mESC_CTCF-NQ_0h_r2_Dam_ATCCTGTA_S104_R1_001.fastq.gz
+  pADamID_CTCF-NQ_6h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_11_pADamID_mESC_CTCF-NQ_6h_r2_Dam_CAACCACA_S95_R1_001.fastq.gz
+  pADamID_CTCF-NQ_24h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_13_pADamID_mESC_CTCF-NQ_24h_r2_Dam_CACTTCGA_S105_R1_001.fastq.gz
+  pADamID_CTCF-NQ_96h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_15_pADamID_mESC_CTCF-NQ_96h_r2_Dam_CATACCAA_S107_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_0h_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_2_pADamID_mESC_CTCF-EL_0h_r2_LMNB1_ACGCTCGA_S97_R1_001.fastq.gz
+  pADamID_CTCF-EL_6h_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_4_pADamID_mESC_CTCF-EL_6h_r2_LMNB1_ACTATGCA_S100_R1_001.fastq.gz
+  pADamID_CTCF-EL_24h_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_6_pADamID_mESC_CTCF-EL_24h_r2_LMNB1_AGATCGCA_S99_R1_001.fastq.gz
+  pADamID_CTCF-EL_96h_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_8_pADamID_mESC_CTCF-EL_96h_r2_LMNB1_AGTCACTA_S103_R1_001.fastq.gz
+  pADamID_CTCF-EL_0h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_1_pADamID_mESC_CTCF-EL_0h_r2_Dam_ACCTCCAA_S94_R1_001.fastq.gz
+  pADamID_CTCF-EL_6h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_3_pADamID_mESC_CTCF-EL_6h_r2_Dam_ACGTATCA_S96_R1_001.fastq.gz
+  pADamID_CTCF-EL_24h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_5_pADamID_mESC_CTCF-EL_24h_r2_Dam_AGAGTCAA_S101_R1_001.fastq.gz
+  pADamID_CTCF-EL_96h_Dam_r4:
+    - /shared/gcf/t.v.schaik/5960/fastq_files/5960_7_pADamID_mESC_CTCF-EL_96h_r2_Dam_AGCAGGAA_S102_R1_001.fastq.gz
+  
+  
+  # Replicate "5"
+  pADamID_PT_0h_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_2_pADamID_mESC_PT_0h_r3_LMNB1_CGAACTTA_S65_R1_001.fastq.gz
+  pADamID_PT_0h_Dam_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_1_pADamID_mESC_PT_0h_r3_Dam_CCTCCTGA_S62_R1_001.fastq.gz
+  
+  pADamID_RAD21_0h_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_4_pADamID_mESC_RAD21_0h_r3_LMNB1_CGCATACA_S68_R1_001.fastq.gz
+  pADamID_RAD21_6h_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_6_pADamID_mESC_RAD21_6h_r3_LMNB1_CTGAGCCA_S67_R1_001.fastq.gz
+  pADamID_RAD21_24h_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_8_pADamID_mESC_RAD21_24h_r3_LMNB1_GAATCTGA_S71_R1_001.fastq.gz
+  pADamID_RAD21_0h_Dam_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_3_pADamID_mESC_RAD21_0h_r3_Dam_CGACTGGA_S64_R1_001.fastq.gz
+  pADamID_RAD21_6h_Dam_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_5_pADamID_mESC_RAD21_6h_r3_Dam_CTCAATGA_S69_R1_001.fastq.gz
+  pADamID_RAD21_24h_Dam_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_7_pADamID_mESC_RAD21_24h_r3_Dam_CTGGCATA_S70_R1_001.fastq.gz
+  
+  pADamID_NQ_WAPL_0h_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_10_pADamID_mESC_WAPL_0h_r3_LMNB1_GAGCTGAA_S63_R1_001.fastq.gz
+  pADamID_NQ_WAPL_6h_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_12_pADamID_mESC_WAPL_6h_r3_LMNB1_GCCACATA_S72_R1_001.fastq.gz
+  pADamID_NQ_WAPL_24h_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_14_pADamID_mESC_WAPL_24h_r3_LMNB1_GCTAACGA_S74_R1_001.fastq.gz
+  pADamID_NQ_WAPL_96h_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_16_pADamID_mESC_WAPL_96h_r3_LMNB1_GGAGAACA_S76_R1_001.fastq.gz
+  pADamID_NQ_WAPL_0h_Dam_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_9_pADamID_mESC_WAPL_0h_r3_Dam_GACTAGTA_S61_R1_001.fastq.gz
+  pADamID_NQ_WAPL_6h_Dam_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_11_pADamID_mESC_WAPL_6h_r3_Dam_GATAGACA_S66_R1_001.fastq.gz
+  pADamID_NQ_WAPL_24h_Dam_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_13_pADamID_mESC_WAPL_24h_r3_Dam_GCGAGTAA_S73_R1_001.fastq.gz
+  pADamID_NQ_WAPL_96h_Dam_r5:
+    - /shared/gcf/t.v.schaik/5958/fastq_files/5958_15_pADamID_mESC_WAPL_96h_r3_Dam_GCTCGGTA_S75_R1_001.fastq.gz
+  
+  
+  # ts200618
+  # Replicate "6"
+  pADamID_PT_0h_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_10_pADamID_mESC_PT_0h_r1_LMNB1_ACATTGGC_S59_R1_001.fastq.gz
+  pADamID_PT_0h_Dam_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_9_pADamID_mESC_PT_0h_r1_Dam_AAACATCG_S57_R1_001.fastq.gz
+  
+  pADamID_NQ_CTCF-WAPL_0h_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_2_pADamID_mESC_CTCFWAPL_0h_r4_LMNB1_CATCAAGT_S61_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_6h_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_4_pADamID_mESC_CTCFWAPL_6h_r4_LMNB1_AACAACCA_S64_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_6_pADamID_mESC_CTCFWAPL_24h_r4_LMNB1_AACGCTTA_S63_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_96h_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_8_pADamID_mESC_CTCFWAPL_96h_r4_LMNB1_AAGGTACA_S67_R1_001.fastq.gz
+  
+  pADamID_NQ_CTCF-WAPL_0h_Dam_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_1_pADamID_mESC_CTCFWAPL_0h_r4_Dam_AGTACAAG_S58_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_6h_Dam_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_3_pADamID_mESC_CTCFWAPL_6h_r4_Dam_AGTGGTCA_S60_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_Dam_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_5_pADamID_mESC_CTCFWAPL_24h_r4_Dam_AACCGAGA_S65_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_96h_Dam_r6:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_7_pADamID_mESC_CTCFWAPL_96h_r4_Dam_AAGACGGA_S66_R1_001.fastq.gz
+  
+  # Replicate "7"
+  pADamID_NQ_CTCF-WAPL_0h_r7:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_12_pADamID_mESC_CTCFWAPL_0h_r3_LMNB1_GTACGCAA_S68_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_6h_r7:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_14_pADamID_mESC_CTCFWAPL_6h_r3_LMNB1_GTCTGTCA_S70_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_r7:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_16_pADamID_mESC_CTCFWAPL_24h_r3_LMNB1_TAGGATGA_S72_R1_001.fastq.gz
+  
+  pADamID_NQ_CTCF-WAPL_0h_Dam_r7:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_11_pADamID_mESC_CTCFWAPL_0h_r3_Dam_GGTGCGAA_S62_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_6h_Dam_r7:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_13_pADamID_mESC_CTCFWAPL_6h_r3_Dam_GTCGTAGA_S69_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_Dam_r7:
+    - /shared/gcf/t.v.schaik/5978/fastq_files/5978_15_pADamID_mESC_CTCFWAPL_24h_r3_Dam_GTGTTCTA_S71_R1_001.fastq.gz
+  
+  
+  #############################################################################
+  ### H3K27me3 depletion + CTCF depletion #####################################
+  #############################################################################
+  
+  # ts210104 - mESC CTCF-AID +/- IAA and +/- H3K27me3 inhibition
+  # 1 day of H3K27me3 depletion only
+  pADamID_CTCF-EL_DMSO_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_30_pADamID_mESC_DMSO_r1_Dam_CCGTGAGA_S71_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_0h_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_31_pADamID_mESC_DMSO_r1_Lmnb1_CCTCCTGA_S60_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_IAA_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_32_pADamID_mESC_DMSO_IAA_r1_Dam_CGAACTTA_S73_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_IAA_0h_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_33_pADamID_mESC_DMSO_IAA_r1_Lmnb1_CGACTGGA_S74_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_EED_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_34_pADamID_mESC_EED_r1_Dam_CGCATACA_S66_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_0h_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_35_pADamID_mESC_EED_r1_Lmnb1_CTCAATGA_S75_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_IAA_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_36_pADamID_mESC_EED_IAA_r1_Dam_CTGAGCCA_S70_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_IAA_0h_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_37_pADamID_mESC_EED_IAA_r1_Lmnb1_CTGGCATA_S76_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_GSK_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_38_pADamID_mESC_GSK_r1_Dam_GAATCTGA_S77_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_0h_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_39_pADamID_mESC_GSK_r1_Lmnb1_GACTAGTA_S78_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_IAA_0h_Dam_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_40_pADamID_mESC_GSK_IAA_r1_Dam_GAGCTGAA_S79_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_IAA_0h_r1:
+    - /shared/gcf/t.v.schaik/6296/fastq_files/6296_41_pADamID_mESC_GSK_IAA_r1_Lmnb1_GATAGACA_S80_R1_001.fastq.gz
+  
+  
+  # ts210601 - mESC CTCF-AID +/- IAA and +/- H3K27me3 inhibition
+  # 3 days of H3K27me3 depletion + western validation
+  
+  # Replicate 2
+  pADamID_CTCF-EL_DMSO_0h_Dam_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_1_pADamID_mESC_CTCFEL_DMSO_r1_Dam_CTCAATGA_S83_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_0h_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_2_pADamID_mESC_CTCFEL_DMSO_r1_LMNB1_CTGAGCCA_S86_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_IAA_0h_Dam_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_3_pADamID_mESC_CTCFEL_DMSO_IAA_r1_Dam_CTGGCATA_S85_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_IAA_0h_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_4_pADamID_mESC_CTCFEL_DMSO_IAA_r1_LMNB1_GAATCTGA_S89_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_EED_0h_Dam_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_9_pADamID_mESC_CTCFEL_EED226_r1_Dam_GCGAGTAA_S94_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_0h_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_10_pADamID_mESC_CTCFEL_EED226_r1_LMNB1_GCTAACGA_S92_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_IAA_0h_Dam_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_11_pADamID_mESC_CTCFEL_EED226_IAA_r1_Dam_GCTCGGTA_S96_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_IAA_0h_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_12_pADamID_mESC_CTCFEL_EED226_IAA_r1_LMNB1_GGAGAACA_S97_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_GSK_0h_Dam_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_5_pADamID_mESC_CTCFEL_GSK126_r1_Dam_GACTAGTA_S90_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_0h_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_6_pADamID_mESC_CTCFEL_GSK126_r1_LMNB1_GAGCTGAA_S88_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_IAA_0h_Dam_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_7_pADamID_mESC_CTCFEL_GSK126_IAA_r1_Dam_GATAGACA_S93_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_IAA_0h_r2:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_8_pADamID_mESC_CTCFEL_GSK126_IAA_r1_LMNB1_GCCACATA_S95_R1_001.fastq.gz
+  
+  # Replicate 3
+  pADamID_CTCF-EL_DMSO_0h_Dam_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_13_pADamID_mESC_CTCFEL_DMSO_r2_Dam_GGTGCGAA_S82_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_0h_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_14_pADamID_mESC_CTCFEL_DMSO_r2_LMNB1_GTACGCAA_S84_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_IAA_0h_Dam_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_15_pADamID_mESC_CTCFEL_DMSO_IAA_r2_Dam_GTCGTAGA_S87_R1_001.fastq.gz
+  pADamID_CTCF-EL_DMSO_IAA_0h_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_16_pADamID_mESC_CTCFEL_DMSO_IAA_r2_LMNB1_GTCTGTCA_S98_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_EED_0h_Dam_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_21_pADamID_mESC_CTCFEL_EED226_r2_Dam_TCTTCACA_S102_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_0h_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_22_pADamID_mESC_CTCFEL_EED226_r2_LMNB1_TGAAGAGA_S103_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_IAA_0h_Dam_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_23_pADamID_mESC_CTCFEL_EED226_IAA_r2_Dam_TGGAACAA_S104_R1_001.fastq.gz
+  pADamID_CTCF-EL_EED_IAA_0h_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_24_pADamID_mESC_CTCFEL_EED226_IAA_r2_LMNB1_TGGCTTCA_S105_R1_001.fastq.gz
+  
+  pADamID_CTCF-EL_GSK_0h_Dam_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_17_pADamID_mESC_CTCFEL_GSK126_r2_Dam_GTGTTCTA_S91_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_0h_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_18_pADamID_mESC_CTCFEL_GSK126_r2_LMNB1_TAGGATGA_S99_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_IAA_0h_Dam_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_19_pADamID_mESC_CTCFEL_GSK126_IAA_r2_Dam_TATCAGCA_S100_R1_001.fastq.gz
+  pADamID_CTCF-EL_GSK_IAA_0h_r3:
+    - /shared/gcf/m.eder/6441/fastq_files/6441_20_pADamID_mESC_CTCFEL_GSK126_IAA_r2_LMNB1_TCCGTCTA_S101_R1_001.fastq.gz
+  
+  
+  # ts220110 - mESC PT +/- IAA as negative control
+  
+  # Replicate 8
+  pADamID_PT_0h_Dam_r8:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_1_pADamID_mESC_PT_0h_r1_Dam_AAACATCG_S2_R1_001.fastq.gz
+  pADamID_PT_24h_Dam_r8:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_2_pADamID_mESC_PT_24h_r1_Dam_ACATTGGC_S5_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_0h_Dam_r8:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_3_pADamID_mESC_CTCFWAPL_0h_r1_Dam_ACCACTGT_S4_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_Dam_r8:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_4_pADamID_mESC_CTCFWAPL_24h_r1_Dam_AACGTGAT_S8_R1_001.fastq.gz
+  
+  pADamID_PT_0h_r8:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_5_pADamID_mESC_PT_0h_r1_LMNB1_CGCTGATC_S9_R1_001.fastq.gz
+  pADamID_PT_24h_r8:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_6_pADamID_mESC_PT_24h_r1_LMNB1_CAGATCTG_S7_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_0h_r8:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_7_pADamID_mESC_CTCFWAPL_0h_r1_LMNB1_ATGCCTAA_S10_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_r8:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_8_pADamID_mESC_CTCFWAPL_24h_r1_LMNB1_CTGTAGCC_S11_R1_001.fastq.gz
+  
+  # Replicate 9
+  pADamID_PT_0h_Dam_r9:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_9_pADamID_mESC_PT_0h_r2_Dam_AGTACAAG_S1_R1_001.fastq.gz
+  pADamID_PT_24h_Dam_r9:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_10_pADamID_mESC_PT_24h_r2_Dam_CATCAAGT_S3_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_0h_Dam_r9:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_11_pADamID_mESC_CTCFWAPL_0h_r2_Dam_AGTGGTCA_S6_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_Dam_r9:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_12_pADamID_mESC_CTCFWAPL_24h_r2_Dam_AACAACCA_S12_R1_001.fastq.gz
+  
+  pADamID_PT_0h_r9:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_13_pADamID_mESC_PT_0h_r2_LMNB1_AACCGAGA_S13_R1_001.fastq.gz
+  pADamID_PT_24h_r9:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_14_pADamID_mESC_PT_24h_r2_LMNB1_AACGCTTA_S14_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_0h_RAD21_r9:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_15_pADamID_mESC_CTCFWAPL_0h_r2_RAD21_AAGACGGA_S15_R1_001.fastq.gz
+  pADamID_NQ_CTCF-WAPL_24h_RAD21_r9:
+    - /shared/gcf/t.v.schaik/6691/fastq_files/6691_16_pADamID_mESC_CTCFWAPL_24h_r2_RAD21_AAGGTACA_S16_R1_001.fastq.gz
+  
+  
+  
+# Bam control list, using basenames only
+dam_controls:
+  
+  # Replicate 1 - WAPL & CTCF-WAPL
+  pADamID_NQ_CTCF-WAPL_0h_r1: pADamID_NQ_CTCF-WAPL_0h_Dam_r1
+  pADamID_NQ_CTCF-WAPL_6h_r1: pADamID_NQ_CTCF-WAPL_6h_Dam_r1
+  pADamID_NQ_CTCF-WAPL_24h_r1: pADamID_NQ_CTCF-WAPL_24h_Dam_r1
+  pADamID_NQ_CTCF-WAPL_96h_r1: pADamID_NQ_CTCF-WAPL_96h_Dam_r1
+  
+  pADamID_NQ_WAPL_0h_r1: pADamID_NQ_WAPL_0h_Dam_r1
+  pADamID_NQ_WAPL_6h_r1: pADamID_NQ_WAPL_6h_Dam_r1
+  pADamID_NQ_WAPL_24h_r1: pADamID_NQ_WAPL_24h_Dam_r1
+  pADamID_NQ_WAPL_96h_r1: pADamID_NQ_WAPL_96h_Dam_r1
+  
+  # Replicate 2 - WAPL & CTCF-WAPL
+  pADamID_NQ_CTCF-WAPL_0h_r2: pADamID_NQ_CTCF-WAPL_0h_Dam_r2
+  pADamID_NQ_CTCF-WAPL_6h_r2: pADamID_NQ_CTCF-WAPL_6h_Dam_r2
+  pADamID_NQ_CTCF-WAPL_24h_r2: pADamID_NQ_CTCF-WAPL_24h_Dam_r2
+  pADamID_NQ_CTCF-WAPL_96h_r2: pADamID_NQ_CTCF-WAPL_96h_Dam_r2
+  
+  pADamID_NQ_WAPL_0h_r2: pADamID_NQ_WAPL_0h_Dam_r2
+  pADamID_NQ_WAPL_6h_r2: pADamID_NQ_WAPL_6h_Dam_r2
+  pADamID_NQ_WAPL_24h_r2: pADamID_NQ_WAPL_24h_Dam_r2
+  pADamID_NQ_WAPL_96h_r2: pADamID_NQ_WAPL_96h_Dam_r2
+  
+  
+  # Replicate 1 - CTCF (2 clones)
+  pADamID_CTCF-NQ_0h_r1: pADamID_CTCF-NQ_0h_Dam_r1
+  pADamID_CTCF-NQ_6h_r1: pADamID_CTCF-NQ_6h_Dam_r1
+  pADamID_CTCF-NQ_24h_r1: pADamID_CTCF-NQ_24h_Dam_r1
+  pADamID_CTCF-NQ_96h_r1: pADamID_CTCF-NQ_96h_Dam_r1
+  
+  pADamID_CTCF-EL_0h_r1: pADamID_CTCF-EL_0h_Dam_r1
+  pADamID_CTCF-EL_6h_r1: pADamID_CTCF-EL_6h_Dam_r1
+  pADamID_CTCF-EL_24h_r1: pADamID_CTCF-EL_24h_Dam_r1
+  pADamID_CTCF-EL_96h_r1: pADamID_CTCF-EL_96h_Dam_r1
+  
+  
+  # ts200529 - new replicates for all samples & PT & RAD21
+  # Replicate "3"
+  pADamID_RAD21_0h_r3: pADamID_RAD21_0h_Dam_r3
+  pADamID_RAD21_6h_r3: pADamID_RAD21_6h_Dam_r3
+  pADamID_RAD21_24h_r3: pADamID_RAD21_24h_Dam_r3
+  
+  # Replicate "4"
+  pADamID_PT_0h_r4: pADamID_PT_0h_Dam_r4
+  
+  pADamID_RAD21_0h_r4: pADamID_RAD21_0h_Dam_r4
+  pADamID_RAD21_6h_r4: pADamID_RAD21_6h_Dam_r4
+  pADamID_RAD21_24h_r4: pADamID_RAD21_24h_Dam_r4
+  
+  pADamID_CTCF-NQ_0h_r4: pADamID_CTCF-NQ_0h_Dam_r4
+  pADamID_CTCF-NQ_6h_r4: pADamID_CTCF-NQ_6h_Dam_r4
+  pADamID_CTCF-NQ_24h_r4: pADamID_CTCF-NQ_24h_Dam_r4
+  pADamID_CTCF-NQ_96h_r4: pADamID_CTCF-NQ_96h_Dam_r4
+  
+  pADamID_CTCF-EL_0h_r4: pADamID_CTCF-EL_0h_Dam_r4
+  pADamID_CTCF-EL_6h_r4: pADamID_CTCF-EL_6h_Dam_r4
+  pADamID_CTCF-EL_24h_r4: pADamID_CTCF-EL_24h_Dam_r4
+  pADamID_CTCF-EL_96h_r4: pADamID_CTCF-EL_96h_Dam_r4
+  
+  # Replicate "5"
+  pADamID_PT_0h_r5: pADamID_PT_0h_Dam_r5
+  
+  pADamID_RAD21_0h_r5: pADamID_RAD21_0h_Dam_r5
+  pADamID_RAD21_6h_r5: pADamID_RAD21_6h_Dam_r5
+  pADamID_RAD21_24h_r5: pADamID_RAD21_24h_Dam_r5
+  
+  pADamID_NQ_WAPL_0h_r5: pADamID_NQ_WAPL_0h_Dam_r5
+  pADamID_NQ_WAPL_6h_r5: pADamID_NQ_WAPL_6h_Dam_r5
+  pADamID_NQ_WAPL_24h_r5: pADamID_NQ_WAPL_24h_Dam_r5
+  pADamID_NQ_WAPL_96h_r5: pADamID_NQ_WAPL_96h_Dam_r5
+  
+  
+  # ts200618
+  # Replicate "6"
+  pADamID_PT_0h_r6: pADamID_PT_0h_Dam_r6
+  
+  pADamID_NQ_CTCF-WAPL_0h_r6: pADamID_NQ_CTCF-WAPL_0h_Dam_r6
+  pADamID_NQ_CTCF-WAPL_6h_r6: pADamID_NQ_CTCF-WAPL_6h_Dam_r6
+  pADamID_NQ_CTCF-WAPL_24h_r6: pADamID_NQ_CTCF-WAPL_24h_Dam_r6
+  pADamID_NQ_CTCF-WAPL_96h_r6: pADamID_NQ_CTCF-WAPL_96h_Dam_r6
+  
+  # Replicate "7"  
+  pADamID_NQ_CTCF-WAPL_0h_r7: pADamID_NQ_CTCF-WAPL_0h_Dam_r7
+  pADamID_NQ_CTCF-WAPL_6h_r7: pADamID_NQ_CTCF-WAPL_6h_Dam_r7
+  pADamID_NQ_CTCF-WAPL_24h_r7: pADamID_NQ_CTCF-WAPL_24h_Dam_r7
+  
+  
+  # ts210104 - mESC CTCF-AID +/- IAA and +/- H3K27me3 inhibition
+  # 1 day of H3K27me3 depletion
+  pADamID_CTCF-EL_DMSO_0h_r1: pADamID_CTCF-EL_DMSO_0h_Dam_r1
+  pADamID_CTCF-EL_DMSO_IAA_0h_r1: pADamID_CTCF-EL_DMSO_IAA_0h_Dam_r1
+  pADamID_CTCF-EL_EED_0h_r1: pADamID_CTCF-EL_EED_0h_Dam_r1
+  pADamID_CTCF-EL_EED_IAA_0h_r1: pADamID_CTCF-EL_EED_IAA_0h_Dam_r1
+  pADamID_CTCF-EL_GSK_0h_r1: pADamID_CTCF-EL_GSK_0h_Dam_r1
+  pADamID_CTCF-EL_GSK_IAA_0h_r1: pADamID_CTCF-EL_GSK_IAA_0h_Dam_r1
+  
+  
+  # ts210601 - mESC CTCF-AID +/- IAA and +/- H3K27me3 inhibition
+  # 3 days of H3K27me3 depletion
+  pADamID_CTCF-EL_DMSO_0h_r2: pADamID_CTCF-EL_DMSO_0h_Dam_r2
+  pADamID_CTCF-EL_DMSO_IAA_0h_r2: pADamID_CTCF-EL_DMSO_IAA_0h_Dam_r2
+  pADamID_CTCF-EL_EED_0h_r2: pADamID_CTCF-EL_EED_0h_Dam_r2
+  pADamID_CTCF-EL_EED_IAA_0h_r2: pADamID_CTCF-EL_EED_IAA_0h_Dam_r2
+  pADamID_CTCF-EL_GSK_0h_r2: pADamID_CTCF-EL_GSK_0h_Dam_r2
+  pADamID_CTCF-EL_GSK_IAA_0h_r2: pADamID_CTCF-EL_GSK_IAA_0h_Dam_r2
+  
+  pADamID_CTCF-EL_DMSO_0h_r3: pADamID_CTCF-EL_DMSO_0h_Dam_r3
+  pADamID_CTCF-EL_DMSO_IAA_0h_r3: pADamID_CTCF-EL_DMSO_IAA_0h_Dam_r3
+  pADamID_CTCF-EL_EED_0h_r3: pADamID_CTCF-EL_EED_0h_Dam_r3
+  pADamID_CTCF-EL_EED_IAA_0h_r3: pADamID_CTCF-EL_EED_IAA_0h_Dam_r3
+  pADamID_CTCF-EL_GSK_0h_r3: pADamID_CTCF-EL_GSK_0h_Dam_r3
+  pADamID_CTCF-EL_GSK_IAA_0h_r3: pADamID_CTCF-EL_GSK_IAA_0h_Dam_r3
+  
+  
+  # ts220110 - mESC PT +/- IAA as negative control
+  pADamID_PT_0h_r8: pADamID_PT_0h_Dam_r8
+  pADamID_PT_24h_r8: pADamID_PT_24h_Dam_r8
+  pADamID_NQ_CTCF-WAPL_0h_r8: pADamID_NQ_CTCF-WAPL_0h_Dam_r8
+  pADamID_NQ_CTCF-WAPL_24h_r8: pADamID_NQ_CTCF-WAPL_24h_Dam_r8
+  
+  pADamID_PT_0h_r9: pADamID_PT_0h_Dam_r9
+  pADamID_PT_24h_r9: pADamID_PT_24h_Dam_r9
+  pADamID_NQ_CTCF-WAPL_0h_RAD21_r9: pADamID_NQ_CTCF-WAPL_0h_Dam_r9
+  pADamID_NQ_CTCF-WAPL_24h_RAD21_r9: pADamID_NQ_CTCF-WAPL_24h_Dam_r9
+  
+  
+  
+  
+# Replicate experiments
+replicates:
+  
+  # CTCF replicates
+  pADamID_CTCF_0h:
+      - pADamID_CTCF-EL_0h_r1
+      - pADamID_CTCF-NQ_0h_r1
+      - pADamID_CTCF-EL_0h_r4
+      - pADamID_CTCF-NQ_0h_r4
+  pADamID_CTCF_6h:
+      - pADamID_CTCF-EL_6h_r1
+      - pADamID_CTCF-NQ_6h_r1
+      - pADamID_CTCF-EL_6h_r4
+      - pADamID_CTCF-NQ_6h_r4
+  pADamID_CTCF_24h:
+      - pADamID_CTCF-EL_24h_r1
+      - pADamID_CTCF-NQ_24h_r1
+      - pADamID_CTCF-EL_24h_r4
+      - pADamID_CTCF-NQ_24h_r4
+  pADamID_CTCF_96h:
+      - pADamID_CTCF-EL_96h_r1
+      - pADamID_CTCF-NQ_96h_r1
+      - pADamID_CTCF-EL_96h_r4
+      - pADamID_CTCF-NQ_96h_r4
+      
+  pADamID_CTCF-EL_0h:
+      - pADamID_CTCF-EL_0h_r1
+      - pADamID_CTCF-EL_0h_r4
+  pADamID_CTCF-EL_6h:
+      - pADamID_CTCF-EL_6h_r1
+      - pADamID_CTCF-EL_6h_r4
+  pADamID_CTCF-EL_24h:
+      - pADamID_CTCF-EL_24h_r1
+      - pADamID_CTCF-EL_24h_r4
+  pADamID_CTCF-EL_96h:
+      - pADamID_CTCF-EL_96h_r1
+      - pADamID_CTCF-EL_96h_r4
+      
+  pADamID_CTCF-NQ_0h:
+      - pADamID_CTCF-NQ_0h_r1
+      - pADamID_CTCF-NQ_0h_r4
+  pADamID_CTCF-NQ_6h:
+      - pADamID_CTCF-NQ_6h_r1
+      - pADamID_CTCF-NQ_6h_r4
+  pADamID_CTCF-NQ_24h:
+      - pADamID_CTCF-NQ_24h_r1
+      - pADamID_CTCF-NQ_24h_r4
+  pADamID_CTCF-NQ_96h:
+      - pADamID_CTCF-NQ_96h_r1
+      - pADamID_CTCF-NQ_96h_r4
+  
+  # WAPL replicates
+  pADamID_NQ_WAPL_0h:
+    - pADamID_NQ_WAPL_0h_r1
+    - pADamID_NQ_WAPL_0h_r2
+    - pADamID_NQ_WAPL_0h_r5
+  pADamID_NQ_WAPL_6h:
+    - pADamID_NQ_WAPL_6h_r1
+    - pADamID_NQ_WAPL_6h_r2
+    - pADamID_NQ_WAPL_6h_r5
+  pADamID_NQ_WAPL_24h:
+    - pADamID_NQ_WAPL_24h_r1
+    - pADamID_NQ_WAPL_24h_r2
+    - pADamID_NQ_WAPL_24h_r5
+  pADamID_NQ_WAPL_96h:
+    - pADamID_NQ_WAPL_96h_r1
+    - pADamID_NQ_WAPL_96h_r2
+    - pADamID_NQ_WAPL_96h_r5
+    
+  # CTCF-WAPL replicates
+  pADamID_NQ_CTCF-WAPL_0h:
+    - pADamID_NQ_CTCF-WAPL_0h_r1
+    - pADamID_NQ_CTCF-WAPL_0h_r2
+    - pADamID_NQ_CTCF-WAPL_0h_r6
+    - pADamID_NQ_CTCF-WAPL_0h_r7
+  pADamID_NQ_CTCF-WAPL_6h:
+    - pADamID_NQ_CTCF-WAPL_6h_r1
+    - pADamID_NQ_CTCF-WAPL_6h_r2
+    - pADamID_NQ_CTCF-WAPL_6h_r6
+    - pADamID_NQ_CTCF-WAPL_6h_r7
+  pADamID_NQ_CTCF-WAPL_24h:
+    - pADamID_NQ_CTCF-WAPL_24h_r1
+#    - pADamID_NQ_CTCF-WAPL_24h_r2
+    - pADamID_NQ_CTCF-WAPL_24h_r6
+    - pADamID_NQ_CTCF-WAPL_24h_r7
+  pADamID_NQ_CTCF-WAPL_96h:
+    - pADamID_NQ_CTCF-WAPL_96h_r1
+    - pADamID_NQ_CTCF-WAPL_96h_r2
+    - pADamID_NQ_CTCF-WAPL_96h_r6
+  
+  # PT replicates - only use samples with both 0h and 24h time points
+  pADamID_PT_0h:
+#    - pADamID_PT_0h_r4
+#    - pADamID_PT_0h_r5
+#    - pADamID_PT_0h_r6
+    - pADamID_PT_0h_r8
+    - pADamID_PT_0h_r9
+  pADamID_PT_24h:
+    - pADamID_PT_24h_r8
+    - pADamID_PT_24h_r9
+  pADamID_PT:
+#    - pADamID_PT_0h_r4
+#    - pADamID_PT_0h_r5
+#    - pADamID_PT_0h_r6
+    - pADamID_PT_0h_r8
+    - pADamID_PT_0h_r9
+    - pADamID_PT_24h_r8
+    - pADamID_PT_24h_r9
+  pADamID_PT_old:
+    - pADamID_PT_0h_r4
+    - pADamID_PT_0h_r5
+#    - pADamID_PT_0h_r6
+  
+  # RAD21 replicates
+  pADamID_RAD21_0h:
+#    - pADamID_RAD21_0h_r3
+    - pADamID_RAD21_0h_r4
+    - pADamID_RAD21_0h_r5
+  pADamID_RAD21_6h:
+#    - pADamID_RAD21_6h_r3
+    - pADamID_RAD21_6h_r4
+    - pADamID_RAD21_6h_r5
+  pADamID_RAD21_24h:
+#    - pADamID_RAD21_24h_r3
+    - pADamID_RAD21_24h_r4
+    - pADamID_RAD21_24h_r5
+  
+  
+  # H3K27me3 inhibition replicates - only 3 days of H3K27me3 depletion
+  pADamID_CTCF-EL_DMSO_0h:
+    - pADamID_CTCF-EL_DMSO_0h_r2
+    - pADamID_CTCF-EL_DMSO_0h_r3
+  pADamID_CTCF-EL_DMSO_IAA_0h:
+    - pADamID_CTCF-EL_DMSO_IAA_0h_r2
+    - pADamID_CTCF-EL_DMSO_IAA_0h_r3
+
+  pADamID_CTCF-EL_EED_0h:
+    - pADamID_CTCF-EL_EED_0h_r2
+    - pADamID_CTCF-EL_EED_0h_r3
+  pADamID_CTCF-EL_EED_IAA_0h:
+    - pADamID_CTCF-EL_EED_IAA_0h_r2
+    - pADamID_CTCF-EL_EED_IAA_0h_r3
+  
+  pADamID_CTCF-EL_GSK_0h:
+    - pADamID_CTCF-EL_GSK_0h_r2
+    - pADamID_CTCF-EL_GSK_0h_r3
+  pADamID_CTCF-EL_GSK_IAA_0h:
+    - pADamID_CTCF-EL_GSK_IAA_0h_r2
+    - pADamID_CTCF-EL_GSK_IAA_0h_r3
+

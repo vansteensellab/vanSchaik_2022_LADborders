@@ -1,0 +1,856 @@
+---
+title: "DamID changes versus LAD size and score"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+In a previous document, I classified LAD borders as 1) CTCF-bound or not 2) 
+shared or unique. Here, I will visualize what the effect is of CTCF depletion on
+the entire LADs.
+
+To also capture newly-formed LADs after a certain treatment, I will first 
+determine a union set of all LAD models. This consensus model will be used 
+later to correlate with external features.
+
+
+### Method
+
+Prepare consensus LAD model based on individual HMM models.
+
+Load (z-scale) DamID tracks and plot effect on different types of LAD borders.
+To do this, determine the average score of a LAD. This is a very robust 
+estimation compared to individual 10 kb bins.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(UpSetR))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(caTools))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(ggrastr))
+
+# Prepare output 
+output.dir <- "ts220113_DamID_changes_versus_LAD_size_and_score"
+dir.create(output.dir, showWarnings = FALSE)
+
+```
+
+Prepare knitr output.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, 
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output.dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+List functions.
+
+```{r functions}
+
+LoadHMM <- function(metadata, hmm.dir, black.list = NULL, min.size = 5e4) {
+  # Load LAD calls
+  
+  # Initiate GRangesList
+  grlist.hmm <- GRangesList()
+  # Get the samples names
+  sample.names <- metadata$HMM
+  
+  # Load the data
+  for (s in sample.names) {
+    gr <- import(file.path(hmm.dir, s))
+    # setdiff with black list (i.e. centromeres and NA-stretches)
+    if (! is.null(black.list)) gr <- GenomicRanges::setdiff(gr, black.list)
+    # Filter for size
+    gr <- gr[width(gr) > min.size]
+    grlist.hmm <- c(grlist.hmm, GRangesList(gr))
+  }
+  names(grlist.hmm) <- metadata$sample
+  
+  grlist.hmm
+  
+}
+
+OverlapWithBins <- function(gr, gr.list) {
+  # Overlap LADs with bins
+  
+  mcols(gr) <- NULL
+  
+  for (s in names(gr.list)) {
+    tmp <- gr.list[[s]]
+    mcols(gr)[, s] <- factor(ifelse(overlapsAny(gr, tmp),
+                                    "LAD", "iLAD"),
+                             levels = c("iLAD", "LAD"))
+  }
+  gr
+  
+}
+
+LongNAStretches <- function(gr) {
+  # Find long stretches of NAs, I don't want these as domains
+  t_nas <- as_tibble(mcols(gr)) %>% 
+    mutate_all(~!is.na(.)) %>%
+    add_column(bin = 1:length(gr)) %>%
+    gather(key, value, -bin) %>%
+    group_by(bin) %>%
+    summarise(non_na = sum(value))
+  
+  rle_nas <- rle(t_nas$non_na == 0)
+  t_nas <- t_nas %>%
+    add_column(length = rep(rle_nas$lengths, rle_nas$lengths),
+               value = rep(rle_nas$values, rle_nas$lengths)) %>%
+    filter(length > 10, value == T)
+  
+  na_stretches <- gr
+  mcols(na_stretches) <- NULL
+  na_stretches <- GenomicRanges::reduce(na_stretches[t_nas$bin])
+  
+  na_stretches
+}
+
+ConsensusLADModel <- function(LADs.gr, samples) {
+  # Get a consensus LAD model of the samples
+  
+  # Get bins that are classified as LAD in at least one sample
+  idx <- as_tibble(mcols(LADs.gr)) %>%
+    dplyr::select(samples) %>%
+    mutate(idx = rowSums(. == "LAD") > 0) %>%
+    pull(idx)
+  gr <- LADs.gr[idx]
+  
+  # Reduce to one LAD model
+  gr <- reduce(gr)
+  
+  gr
+  
+}
+
+LADScores <- function(damid, gr, samples) {
+  # Calculate mean scores per LAD, given a LAD model
+  
+  # Find overlaps
+  ovl <- findOverlaps(damid, gr, select = "first")
+  
+  # Calculation
+  tib <- as_tibble(mcols(damid)) %>%
+    dplyr::select(samples) %>%
+    add_column(LAD = ovl) %>%
+    drop_na(LAD) %>%
+    group_by(LAD) %>%
+    summarise_all(mean, na.rm = T) %>%
+    dplyr::select(-LAD)
+  
+  mcols(gr) <- tib
+  gr
+  
+}
+
+PlotLADScores <- function(gr, title, to.plot = "size") {
+  # Plot changes in LAD score versus "to.plot" parameter (size or mean score)
+  
+  # Prepare tib
+  tib <- as_tibble(gr) %>%
+    rename_at(vars(ends_with("h")), str_replace, ".*_", "t_") %>%
+    mutate(mean_score = rowMeans(dplyr::select(., starts_with("t_")))) %>%
+    rowwise() %>%
+    mutate(diff_6h = ifelse("t_6h" %in% names(.),
+                            t_6h - t_0h, NA),
+           diff_24h = ifelse("t_24h" %in% names(.),
+                            t_24h - t_0h, NA),
+           diff_96h = ifelse("t_96h" %in% names(.),
+                            t_96h - t_0h, NA)) %>%
+    ungroup() %>%
+    dplyr::select(-starts_with("t_")) %>%
+    gather(key, value, starts_with("diff_")) %>%
+    mutate(key = factor(key, levels = c("diff_6h", "diff_24h", "diff_96h")))
+  
+  # Plot
+  plt <- tib %>%
+    ggplot() +
+      facet_grid(. ~ key) +
+      ggtitle(title) +
+      ylab("DamID change with t=0h (z-score)") +
+      theme_bw() + 
+      theme(aspect.ratio = 1)
+  
+  if (to.plot == "size") {
+    plt <- plt +
+      geom_point(aes(x = width / 1e6, y = value), alpha = 0.3) +
+      xlab("LAD size (Mb)") +
+      scale_x_log10()
+  } else if (to.plot == "score") {
+    plt <- plt +
+      geom_point(aes(x = mean_score, y = value), alpha = 0.3) +
+      xlab("Mean LAD score (z-score)")
+  }
+  
+  plt +
+    geom_hline(yintercept = 0, col = "red", linetype = "dashed")
+  
+}
+
+# From Fede:
+# ggpairs custom functions
+corColor <- function(data, mapping, color = I("black"), sizeRange = c(1, 3), ...) {
+
+  x   <- eval_data_col(data, mapping$x)
+  y   <- eval_data_col(data, mapping$y)
+  r   <- cor(x, y)
+  rt  <- format(r, digits = 3)
+  tt  <- as.character(rt)
+  cex <- max(sizeRange)
+
+  # helper function to calculate a useable size
+  percent_of_range <- function(percent, range) {
+    percent * diff(range) + min(range, na.rm = TRUE)
+  }
+
+  # plot correlation coefficient
+  p <- ggally_text(label = tt, mapping = aes(), xP = 0.5, yP = 0.5,
+                   # size = I(percent_of_range(cex * abs(r), sizeRange)), 
+                   size = 6, 
+                   color = color, ...) +
+    theme(panel.grid.minor=element_blank(),
+          panel.grid.major=element_blank())
+
+  corColors <- RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")[2:6]
+
+  if (r <= boundaries[1]) {
+    corCol <- corColors[1]
+  } else if (r <= boundaries[2]) {
+    corCol <- corColors[2]
+  } else if (r < boundaries[3]) {
+    corCol <- corColors[3]
+  } else if (r < boundaries[4]) {
+    corCol <- corColors[4]
+  } else {
+    corCol <- corColors[5]
+  }
+
+  p <- p +
+    theme(panel.background = element_rect(fill = corCol))
+
+  return(p)
+}
+
+customScatter <- function (data, mapping) 
+{
+    p <- ggplot(data = data, mapping) + 
+      geom_point() +
+      geom_smooth(method = "lm", se = T, col = "red") +
+      theme_bw()
+    
+    p 
+}
+
+```
+
+
+### 1. Load data
+
+Load the required data. 
+
+#### 1.1 Previous objects
+
+First, simply objects from previous documents.
+
+```{r load previous data, cache = T}
+
+# Read .rds files
+input.dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+metadata.cells <- readRDS(file.path(input.dir, "metadata.rds"))
+LADs.cells <- readRDS(file.path(input.dir, "LADs_pA.rds"))
+CTCF.sites <- readRDS(file.path(input.dir, "CTCF_sites_pA.rds"))
+
+input.dir <- "ts220113_effect_of_CTCF_depletion_on_LAD_borders"
+metadata.damid <- readRDS(file.path(input.dir, "metadata_damid.rds"))
+bin.size <- readRDS(file.path(input.dir, "bin_size.rds"))
+damid <- readRDS(file.path(input.dir, "damid.rds"))
+
+```
+
+#### 1.2 LADs
+
+I also need LADs for this. I will load the combined calls. Normally, I make sure
+that LADs do not overlap complete centromeres. Of course, this is not an issue
+with mouse cells where centromeres are at the beginning of the chromosomes. I 
+will remove long NA-stretches of unmappable DNA. 
+
+First, determine these NA stretches.
+
+```{r NA-stretches, cache = T}
+
+# Define NA-stretches
+na.stretches <- LongNAStretches(damid)
+
+```
+
+Then, load LADs and remove NA-stretches.
+
+```{r load lads, cache = T, warning = F, message = F}
+
+# The directory with files
+hmm.dir <- file.path("../results_NQ/HMM/", paste0("bin-", bin.size))
+
+# Add the HMM files to metadata.damid
+metadata.damid <- metadata.damid %>%
+  mutate(HMM = str_replace(file, ".norm.txt.gz", "_AD.bed.gz")) #%>%
+  #filter(timepoint != "96h")
+
+# Load LADs - using .bed files and not overlapping NA-stretches
+LADs.grlist <- LoadHMM(metadata.damid, hmm.dir, black.list = na.stretches)
+
+# Get per-bin information
+LADs.gr <- OverlapWithBins(damid, LADs.grlist)
+
+```
+
+
+### 2. Overlap between LADs
+
+What is the overlap between LADs in the different samples? Comparisons to make:
+
+  * Between 0h timepoints.
+  * Between same condition.
+
+```{r overlap in LADs, cache = T, fig.width = 6, fig.height = 4.5}
+
+# Plot overlap between LADs
+PlotLADOverlap <- function(gr, samples) {
+  #
+  tib <- as_tibble(mcols(gr)) %>%
+    dplyr::select(samples)
+  
+  # Convert to binary data.frame
+  df <- data.frame(tib == "LAD") + 0
+  
+  # Plot 
+  upset(df, order.by = "freq", nintersects = 10, sets = samples, keep.order = T)
+}
+
+PlotLADOverlap(LADs.gr, samples = c("PT_0h", "CTCFEL_0h", "WAPL_0h", 
+                                    "CTCFWAPL_0h", "RAD21_0h"))
+
+PlotLADOverlap(LADs.gr, samples = c("PT_0h", "PT_24h"))
+PlotLADOverlap(LADs.gr, samples = c("CTCFEL_0h", "CTCFEL_6h", 
+                                    "CTCFEL_24h"))
+PlotLADOverlap(LADs.gr, samples = c("WAPL_0h", "WAPL_6h", 
+                                    "WAPL_24h"))
+PlotLADOverlap(LADs.gr, samples = c("CTCFWAPL_0h", "CTCFWAPL_6h", 
+                                    "CTCFWAPL_24h"))
+PlotLADOverlap(LADs.gr, samples = c("RAD21_0h", "RAD21_6h", 
+                                    "RAD21_24h"))
+
+```
+
+Overall, this should show that LADs do not change that much during the depletion
+of cohesin looping factors. Small details can be seen. For instance.
+
+  * Slightly fewer LADs in the WAPL-AID cell line, probably due to stronger CTCF
+    escaping.
+  * Decreasing LADs upon CTCF depletion, probably due to small LADs 
+    disappearing.
+  * Decreasing LADs upon WAPL depletion, probably due to stronger CTCF escaping.
+  * Increasing(!) LADs upon double depletion, probably due to increasing 
+    interactions of weak LADs.
+    
+
+### 3. LAD size and strength versus LAD change
+
+Here, I want to reproduce a previous figure that shows that strong LADs become
+stronger upon CTCF depletion while weak LADs become weaker. This will be 
+extended with the other AID cell lines.
+
+I should decide what definition of LADs to use though. For now, let's do it as 
+before: a union set of all time points (to also capture increasing LADs).
+
+First, I will calculate LAD scores.
+
+```{r calculate LAD scores, cache = T, fig.width = 8, fig.height = 3.5}
+
+# Get LAD definition per condition
+LADs.list.condition <- lapply(levels(metadata.damid$condition),
+                              function(x) {
+                                samples <- metadata.damid %>%
+                                  filter(condition == x &
+                                           timepoint != "96h") %>%
+                                  pull(sample)
+                                samples <- as.character(samples)
+                                ConsensusLADModel(LADs.gr, samples)
+                              })
+names(LADs.list.condition) <- levels(metadata.damid$condition)
+
+
+
+# Instead, prepare one consensus model that every condition uses,
+# save individual models
+LADs.list.condition.individual <- LADs.list.condition
+
+LADs.consensus.gr <- LADs.gr
+
+mcols(LADs.consensus.gr) <- tibble(PT = overlapsAny(LADs.consensus.gr, 
+                                                    LADs.list.condition[["PT"]]),
+                                   CTCFEL = overlapsAny(LADs.consensus.gr, 
+                                                        LADs.list.condition[["CTCFEL"]]),
+                                   RAD21 = overlapsAny(LADs.consensus.gr, 
+                                                       LADs.list.condition[["RAD21"]]),
+                                   WAPL = overlapsAny(LADs.consensus.gr, 
+                                                      LADs.list.condition[["WAPL"]]),
+                                   CTCFWAPL = overlapsAny(LADs.consensus.gr, 
+                                                          LADs.list.condition[["CTCFWAPL"]])) %>%
+  mutate_all(function(x) ifelse(x, "LAD", "iLAD"))
+
+
+PlotLADOverlap(LADs.consensus.gr, samples = c("PT", "CTCFEL", "RAD21", 
+                                              "WAPL", "CTCFWAPL"))
+
+
+# Get LAD definition per condition
+LADs.consensus <- ConsensusLADModel(LADs.consensus.gr, 
+                                    c("PT", "CTCFEL", "RAD21", "WAPL", "CTCFWAPL"))
+
+
+
+# Update individual LADs with the consensus model
+LADs.list.condition <- rep(list(LADs.consensus),
+                           length(levels(metadata.damid$condition)))
+names(LADs.list.condition) <- levels(metadata.damid$condition)
+
+
+
+
+
+
+# Get LAD score for every condition
+LADs.list.condition.individual <- lapply(levels(metadata.damid$condition),
+                                         function(x) {
+                                           samples <- metadata.damid %>% 
+                                             filter(condition == x) %>%
+                                             pull(sample)
+                                           samples <- as.character(samples)
+                                           gr <- LADs.list.condition.individual[[x]]
+                                           LADScores(damid, gr, samples)})
+names(LADs.list.condition.individual) <- levels(metadata.damid$condition)
+
+LADs.list.condition <- lapply(levels(metadata.damid$condition),
+                              function(x) {
+                                samples <- metadata.damid %>% 
+                                  filter(condition == x) %>%
+                                  pull(sample)
+                                samples <- as.character(samples)
+                                gr <- LADs.list.condition[[x]]
+                                LADScores(damid, gr, samples)})
+names(LADs.list.condition) <- levels(metadata.damid$condition)
+
+lapply(levels(metadata.damid$condition),
+       function(x) PlotLADScores(LADs.list.condition[[x]], x, "size"))
+
+lapply(levels(metadata.damid$condition),
+       function(x) PlotLADScores(LADs.list.condition[[x]], x, "score"))
+
+
+# Get LAD score for every condition
+samples <- metadata.damid %>% 
+  filter(condition %in% c("PT", "CTCFEL", "RAD21", "WAPL", "CTCFWAPL")) %>%
+  pull(sample)
+samples <- as.character(samples)
+
+LADs.consensus <- LADScores(damid, LADs.consensus, 
+                            samples)
+
+ 
+```
+
+Looks good. Note that these are still exploratory figures, and later analyses
+will formalize these results.
+
+I also want a plot that shows the absolute differences for every depletion
+experiment.
+
+```{r differences per condition, cache = T, fig.width = 8, fig.height = 3.5, message = F, warning = F}
+
+# Get absolute differences per condition
+DifferenceWithZero <- function(gr) {
+  tib <- as_tibble(mcols(gr)) %>%
+    rename_at(1, ~ c("t_0h")) %>%
+    mutate_at(2:ncol(.), function(x) x - .$t_0h) %>%
+    dplyr::select(-1) %>%
+    gather(key, value)
+  tib
+}
+
+tib <- purrr::reduce(lapply(LADs.list.condition, 
+                            DifferenceWithZero),
+                     bind_rows) %>%
+  separate(key, c("condition", "timepoint")) %>%
+  mutate(condition = factor(condition, levels = levels(metadata.damid$condition)),
+         timepoint = factor(timepoint, levels = levels(metadata.damid$timepoint)))
+
+# And plot
+tib %>%
+  ggplot(aes(x = condition, y = value, col = condition)) +
+  geom_quasirandom() +
+  geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+  geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+  facet_grid(. ~ timepoint) +
+  xlab("") +
+  ylab("LAD difference (z-score)") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib %>%
+  filter(! condition %in% c("CTCFNQ", "CTCF"),
+         timepoint != "96h") %>%
+  ggplot(aes(x = condition, y = value, col = condition)) +
+  geom_quasirandom() +
+  geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+  geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+  facet_grid(. ~ timepoint) +
+  xlab("") +
+  ylab("LAD difference (z-score)") +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+tib %>%
+  filter(! condition %in% c("CTCFNQ", "CTCF"),
+         timepoint != "96h") %>%
+  ggplot(aes(x = condition, y = abs(value), col = condition)) +
+  geom_quasirandom() +
+  geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+  geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+  facet_grid(. ~ timepoint) +
+  xlab("") +
+  ylab("LAD difference (absolute z-score)") +
+  scale_color_brewer(palette = "Dark2") +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Include st-dev in the plot
+sd_fun <- function(x){
+    return(data.frame(y = 1.25, label = round(sd(x), 2)))
+}
+
+tib %>%
+    filter(! condition %in% c("CTCFNQ", "CTCF"),
+           timepoint != "96h") %>%
+    ggplot(aes(x = condition, y = value, col = condition)) +
+    geom_quasirandom() +
+    geom_boxplot(fill = NA, outlier.shape = NA, col = "black") +
+    stat_summary(fun.data = sd_fun, geom = "text", col = "black") +
+    geom_hline(yintercept = 0, col = "blue", linetype = "dashed") +
+    facet_grid(. ~ timepoint) +
+    xlab("") +
+    ylab("LAD difference (z-score)") +
+    scale_color_brewer(palette = "Dark2") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+ 
+```
+
+Very clear. Nicely summarizes that CTCF/WAPL depletion has the biggest 
+genome-wide effects.
+
+
+### 4. Plot some example tracks 
+
+To explain these steps, prepare some example tracks that can be included in a 
+manuscript.
+
+```{r example tracks, cache = T, fig.width = 8, fig.height = 6}
+
+PlotDataTracks <- function(gr_norm_mean, name, samples,
+                           gr_regions,
+                           centromeres = NULL,
+                           plot_chr = "chr1", 
+                           plot_start = 1, plot_end = 100e6,
+                           smooth = 1, fill = "cell",
+                           filter_samples = NULL,
+                           free_y = T) {
+  
+  ################################
+  ## Prepare bin scores
+  
+  # Get the scores for the samples
+  tib <- as_tibble(gr_norm_mean) %>%
+    dplyr::select(seqnames, start, end, 
+                  contains("PT"),
+                  matches(name))
+  
+  if (! is.null(filter_samples)) {
+    tib <- tib %>%
+      dplyr::select(-matches(paste(filter_samples, collapse = "|")))
+  }
+  
+  if (ncol(tib) != 5) {
+    stop("Works with 2 columns only")
+  }
+  
+  if (smooth > 1) {
+    tib <- tib %>%
+      mutate_at(vars(contains("_")), 
+                runmean, k = smooth)
+  }
+  
+  # Filter for plotting window
+  tib <- tib %>%
+    filter(seqnames == plot_chr,
+           start >= plot_start,
+           end <= plot_end)
+  
+  tib_names <- names(tib)[4:5]
+  
+  # Gather
+  tib_gather <- tib %>% 
+    rename_at(4:5, ~c("control", "treatment")) %>%
+    gather(key, value, -seqnames, -start, -end) %>%
+    mutate(class = "bin")
+  
+  ################################
+  ## Prepare region scores
+  tib_regions <- as_tibble(gr_regions) %>%
+    dplyr::select(seqnames, start, end, 
+                  contains("PT"),
+                  matches(name))
+  
+  if (! is.null(filter_samples)) {
+    tib_regions <- tib_regions %>%
+      dplyr::select(-matches(paste(filter_samples, collapse = "|")))
+  }
+  
+  # Filter for plotting window
+  tib_regions <- tib_regions %>%
+    filter(seqnames == plot_chr,
+           start < plot_end,
+           end > plot_start) %>%
+    rename_at(4:5, ~c("control", "treatment")) %>%
+    mutate(diff = treatment - control)
+  
+  
+  tib_regions_gather <- tib_regions %>%
+    rename_at(4:5, ~c("control", "treatment")) %>%
+    gather(key, value, -seqnames, -start, -end) %>%
+    mutate(class = "region")
+  
+  
+  ################################
+  ## Combine into one tibble
+  tib_combined <- bind_rows(tib_gather,
+                            tib_regions_gather) %>%
+    drop_na() %>%
+    mutate(key = factor(key, c("control", "treatment", "diff")),
+           interaction = interaction(key, class),
+           interaction = factor(interaction, unique(interaction)))
+  
+  
+  # Limits
+  #ylimits_bin <- quantile(tib_gather$value, c(0, 1), na.rm = T)
+  ylimits_bin <- c(-2, 2)
+  tib_ylimits <- bind_rows(tibble(xmin = tib_gather$start[1]/1e6, 
+                                  xmax = tib_gather$start[1]/1e6 + 1,
+                                  ymin = ylimits_bin[1], ymax = ylimits_bin[2],
+                                  interaction = c("control.bin", "treatment.bin",
+                                                  "control.region", "treatment.region")),
+                           tibble(xmin = tib_gather$start[1]/1e6, 
+                                  xmax = tib_gather$start[1]/1e6 + 1,
+                                  ymin = -1, ymax = 1,
+                                  interaction = c("diff.region"))) %>%
+    mutate(interaction = factor(interaction, levels(tib_combined$interaction)))
+  
+  # Remove values higher than the limits
+  tib_combined <- tib_combined %>%
+    mutate(value = case_when(value < ylimits_bin[1] ~ ylimits_bin[1],
+                             value > ylimits_bin[2] ~ ylimits_bin[2],
+                             T ~ value))
+  
+  # Colors
+  plt <- tib_combined %>%
+    ggplot(aes(fill = key)) +
+    rasterize(geom_rect(aes(xmin = start / 1e6, xmax = end / 1e6, 
+                            ymin = 0, ymax = value)),
+              dpi = 300) +
+    geom_rect(data = tib_ylimits, 
+              aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+              fill = NA, col = NA) +
+    geom_hline(yintercept = 0, size = 0.5) +
+    coord_cartesian(xlim = c(max(c(plot_start,
+                                   min(tib_combined$start))) / 1e6,
+                             min(c(plot_end,
+                                   max(tib_combined$end))) / 1e6)) +
+    xlab(paste0(plot_chr, " (Mb)")) +
+    ylab("pA-DamID (z-score)") +
+    ggtitle(paste(tib_names[2], "vs", tib_names[1])) +
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_fill_brewer(palette = "Set1", guide = F) +
+    theme_classic() +
+    theme(aspect.ratio = 0.15)
+  
+  if (free_y) {
+    plt <- plt + 
+      facet_grid(interaction ~ ., scales = "free_y")
+  } else {
+    plt <- plt + 
+      facet_grid(interaction ~ .)
+  }
+  
+  plot(plt)
+  
+}
+
+# Plot some example tracks
+PlotDataTracks(gr_norm_mean = damid,
+               name = "PT",
+               samples = metadata.damid,
+               gr_regions = LADs.list.condition$PT,
+               plot_chr = "chr3", plot_start = 0, plot_end = 1e9, 
+               smooth = 9)
+
+PlotDataTracks(gr_norm_mean = damid,
+               name = "CTCFEL",
+               samples = metadata.damid,
+               gr_regions = LADs.list.condition$CTCFEL,
+               plot_chr = "chr3", plot_start = 0, plot_end = 1e9, 
+               smooth = 9,
+               filter_samples = c("PT", "_6h", "_96h"))
+
+PlotDataTracks(gr_norm_mean = damid,
+               name = "RAD21",
+               samples = metadata.damid,
+               gr_regions = LADs.list.condition$RAD21,
+               plot_chr = "chr3", plot_start = 0, plot_end = 1e9, 
+               smooth = 9,
+               filter_samples = c("PT", "_6h", "_96h"))
+
+PlotDataTracks(gr_norm_mean = damid,
+               name = "^WAPL",
+               samples = metadata.damid,
+               gr_regions = LADs.list.condition$WAPL,
+               plot_chr = "chr3", plot_start = 0, plot_end = 1e9, 
+               smooth = 9,
+               filter_samples = c("PT", "_6h", "_96h"))
+
+PlotDataTracks(gr_norm_mean = damid,
+               name = "CTCFWAPL",
+               samples = metadata.damid,
+               gr_regions = LADs.list.condition$CTCFWAPL,
+               plot_chr = "chr3", plot_start = 0, plot_end = 1e9, 
+               smooth = 9,
+               filter_samples = c("PT", "_6h", "_96h"))
+
+
+# gr_norm_mean = damid; 
+# name = "CTCFEL"; 
+# samples = metadata.damid;
+# gr_regions = LADs.list.condition$CTCFEL
+# centromeres = NULL;
+# plot_chr = "chr1";
+# plot_start = 1; plot_end = 100e6;
+# smooth = 1; fill = "cell";
+# filter_samples = NULL;
+# free_y = T
+ 
+```
+
+Simple, but convincing. Good.
+
+
+### Save data
+
+```{r save data}
+
+export.bed(LADs.list.condition.individual$PT, file.path(output.dir, "LADs_PT.bed"))
+export.bed(LADs.list.condition.individual$CTCF, file.path(output.dir, "LADs_CTCF.bed"))
+export.bed(LADs.list.condition.individual$WAPL, file.path(output.dir, "LADs_WAPL.bed"))
+export.bed(LADs.list.condition.individual$CTCFWAPL, file.path(output.dir, "LADs_CTCFWAPL.bed"))
+export.bed(LADs.list.condition.individual$RAD21, file.path(output.dir, "LADs_RAD21.bed"))
+
+export.bed(LADs.consensus, file.path(output.dir, "LADs_consensus.bed"))
+
+saveRDS(LADs.list.condition, file.path(output.dir, "LADs_list.rds"))
+saveRDS(LADs.list.condition.individual, file.path(output.dir, "LADs_list_individual.rds"))
+saveRDS(LADs.consensus, file.path(output.dir, "LADs_consensus.rds"))
+
+# Also, save bigwig files of differences
+lad.difference.dir <- file.path(output.dir, "bigwig_lad_difference")
+dir.create(lad.difference.dir, showWarnings = FALSE)
+
+chr.sizes <- read.table("~/mydata/data/genomes/mm10/mm10.chrom.sizes", sep = "\t")
+row.names(chr.sizes) <- chr.sizes[, 1]
+
+timepoints <- c("0h", "6h", "24h", "96h")
+for (l in names(LADs.list.condition)) {
+  gr <- LADs.list.condition[[l]]
+  for (i in 2:ncol(mcols(gr))) {
+    tmp <- gr
+    mcols(tmp) <- data.frame(score = mcols(gr)[, i] - mcols(gr)[, 1])
+    tmp <- tmp[! is.na(tmp$score)]
+    seqlengths(tmp) <- chr.sizes[seqlevels(tmp), 2]
+    export.bw(tmp, file.path(lad.difference.dir, paste0(l, "_",
+                                                        timepoints[i], 
+                                                        "_diff.bw")))
+  }
+}
+
+```
+
+
+### Conclusion
+
+I prepared a consensus LAD model and quantified the mean LaminB1 scores on 
+these LADs. In another document, I will use these data to correlate with 
+LAD features to determine which LADs are affected by the protein depletions.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+

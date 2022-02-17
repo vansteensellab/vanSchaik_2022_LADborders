@@ -1,0 +1,566 @@
+---
+title: "H3K27me3 ChIP-seq after CTCF depletion"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+Look whether H3K27me3 is affected at LAD borders after CTCF depletion in mESCs.
+
+
+### Method
+
+Deeptools.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up, warning = F, message = F}
+
+# Load dependencies
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(ggplot2)
+#library(matrixStats)
+#library(mgcv)
+library(caTools)
+
+
+# Prepare output 
+output.dir <- "ts220203_H3K27me3_ChIP_after_CTCF_depletion"
+dir.create(output.dir, showWarnings = FALSE)
+
+# Load input
+input.dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+metadata.borders <- readRDS(file.path(input.dir, "metadata.rds"))
+
+LAD.borders <- readRDS(file.path(input.dir, "LAD_borders_pA.rds"))
+LAD.borders.mesc <- LAD.borders[["mESC_pA_PT"]]
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, cache = T,
+               dev=c('png', 'pdf'), fig.path = file.path(output.dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+```{r functions}
+
+
+
+```
+
+
+### 1. Prepare LAD borders
+
+Prepare the LAD borders for deeptools.
+
+```{r prepare lad borders}
+
+# Write mESC LAD borders with / without CTCF
+LAD.borders.mesc.ctcf <- LAD.borders.mesc[LAD.borders.mesc$CTCF == "CTCF"]
+LAD.borders.mesc.nonctcf <- LAD.borders.mesc[LAD.borders.mesc$CTCF != "CTCF"]
+
+# Prepare file names and write bed files
+LAD.borders.mesc.ctcf.file <- file.path(output.dir, "LAD_borders_mESC_CTCF.bed")
+LAD.borders.mesc.nonctcf.file <- file.path(output.dir, "LAD_borders_mESC_nonCTCF.bed")
+
+export.bed(LAD.borders.mesc.ctcf, LAD.borders.mesc.ctcf.file)
+export.bed(LAD.borders.mesc.nonctcf, LAD.borders.mesc.nonctcf.file)
+
+# Prepare list of files
+LAD.borders.list <- c(LAD.borders.mesc.nonctcf.file, LAD.borders.mesc.ctcf.file)
+
+
+
+# Also, do this for inwards / outwards borders
+LAD.borders.mesc.outwards <- LAD.borders.mesc[LAD.borders.mesc$CTCF_strand == "outwards"]
+LAD.borders.mesc.inwards <- LAD.borders.mesc[LAD.borders.mesc$CTCF_strand == "inwards"]
+LAD.borders.mesc.ambiguous <- LAD.borders.mesc[LAD.borders.mesc$CTCF_strand == "ambiguous"]
+
+# Prepare file names and write bed files
+LAD.borders.mesc.outwards.file <- file.path(output.dir, "LAD_borders_mESC_outwards.bed")
+LAD.borders.mesc.inwards.file <- file.path(output.dir, "LAD_borders_mESC_inwards.bed")
+LAD.borders.mesc.ambiguous.file <- file.path(output.dir, "LAD_borders_mESC_ambiguous.bed")
+
+export.bed(LAD.borders.mesc.outwards, LAD.borders.mesc.outwards.file)
+export.bed(LAD.borders.mesc.inwards, LAD.borders.mesc.inwards.file)
+export.bed(LAD.borders.mesc.ambiguous, LAD.borders.mesc.ambiguous.file)
+
+# Prepare list of files
+LAD.borders.list.stranded <- c(LAD.borders.mesc.nonctcf.file, 
+                               LAD.borders.mesc.outwards.file,
+                               LAD.borders.mesc.inwards.file,
+                               LAD.borders.mesc.ambiguous.file)
+
+```
+
+
+### 2. Run Deeptools
+
+```{r run deeptools}
+
+# Run deeptools with various tracks
+RunDeeptools <- function(regions.bed, tracks, expname, output.dir, labels, 
+                         extend = extend, bin_size = bin_size, cores = 20) {
+  
+  # Prepare deeptools call
+  regions.bed <- paste(regions.bed, collapse = " ")
+  tracks.bw <- paste(tracks, collapse = " ")
+  labels <- paste(labels, collapse = " ")
+  
+  output.matrix <- file.path(output.dir, 
+                             paste0(expname, "-deeptoolsMatrix.gz"))
+  output.table <- file.path(output.dir, 
+                            paste0(expname, "-deeptoolsTable.tab"))
+  
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/computeMatrix",
+                          "reference-point",
+                          "-a", format(extend, scientific = FALSE), 
+                          "-b", format(extend, scientific = FALSE),
+                          "-bs", format(bin_size, scientific = FALSE), 
+                          "-p", cores,
+                          "-R", regions.bed,
+                          "-S", tracks.bw,
+                          "--referencePoint", "center",
+                          "--samplesLabel", labels,
+                          #"--outFileNameMatrix", output.table,
+                          "--outFileName", output.matrix)
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+  
+  # Return location of the table
+  output.matrix
+  
+}
+
+PlotHeatmap <- function(matrix, output.file, range = "1.5",
+                        labels = c("border_nonctcf", "border_ctcf")) {
+  
+  # Prepare deeptools call
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/plotHeatmap",
+                          "-m", matrix,
+                          "-out", output.file, 
+                          "-min", paste0("-", range),
+                          "-max", range,
+                          "--missingDataColor", "0.5",
+                          "--xAxisLabel", '"CTCF distance (bp)"',
+                          "--regionsLabel", paste(labels, collapse = " "), 
+                          "--colorMap", "RdBu")
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+    
+}
+
+PlotProfile <- function(matrix, output.file, 
+                        labels = c("border_nonctcf", "border_ctcf")) {
+  
+  # Prepare deeptools call
+  deeptools_call <- paste("/home/t.v.schaik/mydata/miniconda3/envs/deeptools/bin/plotProfile",
+                          "-m", matrix,
+                          "--perGroup",
+                          "--regionsLabel", paste(labels, collapse = " "), 
+                          
+                          "-out", output.file)
+  
+  print(deeptools_call)
+  
+  # Run deeptools
+  system(deeptools_call)
+  
+}
+
+# Deeptools input
+deeptools_dir <- file.path(output.dir, "deeptools")
+dir.create(deeptools_dir, showWarnings = F, recursive = F)
+
+
+# 1) H3K27me3 chip-seq before/after CTCF depletion
+exp_name <- "LAD_borders"
+
+track_dir <- "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CTCF_depletion_H3K27me3/"
+
+tracks <- c("/DATA/scratch/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results_mouse/tracks/normalized/bin-10kb/mESC_LMNB1-10kb-combined.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/2_Wapl-0D-antiCtcf_SF.3517_MQ15_sample.bw",
+            "/DATA/scratch/usr/t.v.schaik/proj/tests/results/ts181120_pADamID_mouse/analysis_CTCF_AID/Data_NQ/ChIP_NQ/CohesinFactors/5_WaplC6-0h_antiRad21_sample_calibrated.bw",
+            grep("pdf", 
+                 dir(track_dir, full.names = T, pattern = "AID"),
+                 value = T, invert = T))
+
+track_names <- c("LMNB1", "CTCF", "RAD21", 
+                 str_remove(str_remove(basename(tracks[4:(length(tracks))]), "E14_2i_"), 
+                            "_antiH3K27me3.*"))
+
+# # Sort tracks and names
+# idx <- c(1:4, 8, 9, 10, 5, 6, 7)
+# tracks <- tracks[idx]
+# track_names <- track_names[idx]
+
+
+extend <- 100000
+bin_size <- 5000
+deeptools_matrix <- RunDeeptools(LAD.borders.list, tracks, exp_name,
+                                 deeptools_dir, track_names,
+                                 extend = extend, bin_size = bin_size)
+
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")))
+
+
+# 2) Zoom-in
+exp_name <- "LAD_borders_zoom"
+
+
+extend <- 30000
+bin_size <- 500
+deeptools_matrix <- RunDeeptools(LAD.borders.list, tracks, exp_name,
+                                 deeptools_dir, track_names,
+                                 extend = extend, bin_size = bin_size)
+
+PlotHeatmap(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_heatmap.pdf")))
+PlotProfile(deeptools_matrix, file.path(deeptools_dir, paste0(exp_name, "_profile.pdf")))
+
+```
+
+### 3. Plot in R
+
+Let's make a better plot in R.
+
+```{r plot in R, fig.width = 7, fig.height = 8}
+
+# Load deeptools output
+extend <- 100000
+bin_size <- 5000
+
+bins <- 1:(extend*2/bin_size)
+
+tib <- read_tsv(file.path(output.dir, "deeptools/LAD_borders-deeptoolsMatrix.gz"), 
+                skip = 1, 
+                col_names = c("seqnames", "start", "end", 
+                              "name", "unknown", "strand",
+                              paste(rep(track_names, 
+                                        each = length(bins)), 
+                                    bins, sep = "_")))
+
+tib_gather <- tib %>%
+  dplyr::select(-seqnames, -start, -end, -name, -unknown, -strand) %>%
+  add_column(border = 1:nrow(.),
+             ctcf = rep(c("nonctcf", "ctcf"), 
+                        times = c(length(LAD.borders.mesc.nonctcf),
+                                  length(LAD.borders.mesc.ctcf)))) %>%
+  gather(key, value, -border, -ctcf) %>%
+  mutate(track = str_remove(key, "_[0-9]+$"),
+         bin = str_remove(key, ".*_")) %>%
+  dplyr::select(-key) %>%
+  mutate(track = factor(track, levels = track_names),
+         ctcf = factor(ctcf, levels = c("nonctcf", "ctcf")),
+         bin = as.numeric(bin),
+         bin = (bin * bin_size) - (extend + 0.5 * bin_size),
+         bin = bin / 1e3) %>%
+  mutate(value = as.double(value)) %>%
+  drop_na()
+
+# Fix outliers by setting them to a limit
+limit <- quantile(tib_gather$value, 0.999)
+tib_gather$value[tib_gather$value > limit] <- limit
+
+# Filter borders overlapping with active genes
+idx_active <- as_tibble(mcols(c(LAD.borders.mesc.nonctcf,
+                                  LAD.borders.mesc.ctcf))) %>%
+  pull(ovl_gene)
+
+# Plot
+tib_gather %>%
+  filter(border %in% which(! idx_active)) %>%
+  drop_na() %>%
+  ggplot(aes(x = bin, y = value, col = ctcf, fill = ctcf,
+             group = interaction(ctcf, track))) +
+  annotate("rect", xmin = 0, xmax = 1e3, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  stat_summary(fun = mean, geom = "line", size = 1) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_wrap(~ track, scales = "free_y", ncol = 2) +
+  xlab("Distance from LAD border (kb)") +
+  ylab("Score") +
+  coord_cartesian(xlim = c(-extend/1e3, extend/1e3)) +
+  scale_fill_brewer(palette = "Set2", name = "Border class") +
+  scale_color_brewer(palette = "Set2", name = "Border class") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Also, focus on H3K27me3 tracks
+tib_gather_h3k27me3 <- tib_gather %>%
+  filter(border %in% which(! idx_active)) %>%
+  drop_na() %>%
+  filter(grepl("AID", track)) %>%
+  mutate(timepoint = ifelse(grepl("24h", track),
+                            "24h", "0h"),
+         replicate = str_remove(track, ".*_")) %>%
+  mutate(timepoint = factor(timepoint, levels = c("0h", "24h")),
+         replicate = factor(replicate, levels = c("r1", "r2")))
+
+plt_base <- tib_gather_h3k27me3 %>%
+  ggplot(aes(x = bin, y = value)) +
+  annotate("rect", xmin = 0, xmax = 1e3, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  xlab("Distance from LAD border (kb)") +
+  ylab("Score") +
+  coord_cartesian(xlim = c(-extend/1e3, extend/1e3)) +
+  scale_fill_brewer(palette = "Set2", name = "Border class") +
+  scale_color_brewer(palette = "Set2", name = "Border class") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# By border class
+plt_base +
+  stat_summary(aes(col = ctcf, 
+                   group = interaction(ctcf, track)),
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(fill = ctcf, 
+                   group = interaction(ctcf, track)),
+               fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ track)
+
+plt_base +
+  stat_summary(aes(col = ctcf, 
+                   group = interaction(ctcf)),
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(fill = ctcf, 
+                   group = interaction(ctcf)),
+               fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ timepoint)
+
+# By timepoint
+plt_base +
+  stat_summary(aes(col = timepoint, 
+                   group = interaction(timepoint, replicate)),
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(fill = timepoint, 
+                   group = interaction(timepoint, replicate)),
+               fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ ctcf + replicate) +
+  scale_fill_brewer(palette = "Set1", name = "Border class") +
+  scale_color_brewer(palette = "Set1", name = "Border class")
+
+plt_base +
+  stat_summary(aes(col = timepoint, 
+                   group = interaction(timepoint)),
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(fill = timepoint, 
+                   group = interaction(timepoint)),
+               fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ ctcf) +
+  scale_fill_brewer(palette = "Set1", name = "Border class") +
+  scale_color_brewer(palette = "Set1", name = "Border class")
+  
+
+```
+
+
+```{r plot zoom in R, fig.width = 7, fig.height = 8}
+
+# Load deeptools output
+extend <- 30000
+bin_size <- 500
+
+bins <- 1:(extend*2/bin_size)
+
+tib <- read_tsv(file.path(output.dir, "deeptools/LAD_borders_zoom-deeptoolsMatrix.gz"), 
+                skip = 1, 
+                col_names = c("seqnames", "start", "end", 
+                              "name", "unknown", "strand",
+                              paste(rep(track_names, 
+                                        each = length(bins)), 
+                                    bins, sep = "_")))
+
+tib_gather <- tib %>%
+  dplyr::select(-seqnames, -start, -end, -name, -unknown, -strand) %>%
+  add_column(border = 1:nrow(.),
+             ctcf = rep(c("nonctcf", "ctcf"), 
+                        times = c(length(LAD.borders.mesc.nonctcf),
+                                  length(LAD.borders.mesc.ctcf)))) %>%
+  gather(key, value, -border, -ctcf) %>% 
+  mutate(track = str_remove(key, "_[0-9]+$"),
+         bin = str_remove(key, ".*_")) %>%
+  dplyr::select(-key) %>%
+  mutate(track = factor(track, levels = track_names),
+         ctcf = factor(ctcf, levels = c("nonctcf", "ctcf")),
+         bin = as.numeric(bin),
+         bin = (bin * bin_size) - (extend + 0.5 * bin_size),
+         bin = bin / 1e3) %>%
+  mutate(value = as.double(value)) %>%
+  drop_na()
+
+# Fix outliers by setting them to a limit
+limit <- quantile(tib_gather$value, 0.999)
+tib_gather$value[tib_gather$value > limit] <- limit
+
+# Filter borders overlapping with active genes
+idx_active <- as_tibble(mcols(c(LAD.borders.mesc.nonctcf,
+                                  LAD.borders.mesc.ctcf))) %>%
+  pull(ovl_gene)
+
+# Plot
+tib_gather %>%
+  filter(border %in% which(! idx_active)) %>%
+  drop_na() %>%
+  ggplot(aes(x = bin, y = value, col = ctcf, fill = ctcf,
+             group = interaction(ctcf, track))) +
+  annotate("rect", xmin = 0, xmax = 1e3, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  stat_summary(fun = mean, geom = "line", size = 1) +
+  stat_summary(fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_wrap(~ track, scales = "free_y", ncol = 2) +
+  xlab("Distance from LAD border (kb)") +
+  ylab("Score") +
+  coord_cartesian(xlim = c(-extend/1e3, extend/1e3)) +
+  scale_fill_brewer(palette = "Set2", name = "Border class") +
+  scale_color_brewer(palette = "Set2", name = "Border class") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# Also, focus on H3K27me3 tracks
+tib_gather_h3k27me3 <- tib_gather %>%
+  filter(border %in% which(! idx_active)) %>%
+  drop_na() %>%
+  filter(grepl("AID", track)) %>%
+  mutate(timepoint = ifelse(grepl("24h", track),
+                            "24h", "0h"),
+         replicate = str_remove(track, ".*_")) %>%
+  mutate(timepoint = factor(timepoint, levels = c("0h", "24h")),
+         replicate = factor(replicate, levels = c("r1", "r2")))
+
+plt_base <- tib_gather_h3k27me3 %>%
+  ggplot(aes(x = bin, y = value)) +
+  annotate("rect", xmin = 0, xmax = 1e3, ymin = -Inf, ymax = Inf, 
+           fill = "grey", alpha = 0.3) +  
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  geom_vline(xintercept = 0, col = "black", linetype = "dashed") +
+  xlab("Distance from LAD border (kb)") +
+  ylab("Score") +
+  coord_cartesian(xlim = c(-extend/1e3, extend/1e3)) +
+  scale_fill_brewer(palette = "Set2", name = "Border class") +
+  scale_color_brewer(palette = "Set2", name = "Border class") +
+  theme_bw() +
+  theme(aspect.ratio = 1, 
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# By border class
+plt_base +
+  stat_summary(aes(col = ctcf, 
+                   group = interaction(ctcf, track)),
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(fill = ctcf, 
+                   group = interaction(ctcf, track)),
+               fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ track)
+
+plt_base +
+  stat_summary(aes(col = ctcf, 
+                   group = interaction(ctcf)),
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(fill = ctcf, 
+                   group = interaction(ctcf)),
+               fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ timepoint)
+
+# By timepoint
+plt_base +
+  stat_summary(aes(col = timepoint, 
+                   group = interaction(timepoint, replicate)),
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(fill = timepoint, 
+                   group = interaction(timepoint, replicate)),
+               fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ ctcf) +
+  scale_fill_brewer(palette = "Set1", name = "Border class") +
+  scale_color_brewer(palette = "Set1", name = "Border class")
+
+plt_base +
+  stat_summary(aes(col = timepoint, 
+                   group = interaction(timepoint)),
+               fun = mean, geom = "line", size = 1) +
+  stat_summary(aes(fill = timepoint, 
+                   group = interaction(timepoint)),
+               fun.data = mean_se, geom = "ribbon", alpha = 0.25, col = NA,
+               fun.args = list(mult = 1.96)) +
+  facet_grid(. ~ ctcf) +
+  scale_fill_brewer(palette = "Set1", name = "Border class") +
+  scale_color_brewer(palette = "Set1", name = "Border class")
+  
+
+```
+
+
+
+### Conclusion
+
+
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,946 @@
+---
+title: "Gene expression"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+Question: how does differential localization matches with gene expression?
+
+That is, for the different AID depletions. Is there any link between the two?
+
+
+### Method
+
+I will use the processed counts from NQ and perform simple differential 
+analyses.
+
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up, warning = F, message = F}
+
+# Load dependencies
+library(tidyverse)
+library(GenomicRanges)
+library(rtracklayer)
+library(ggplot2)
+library(ggbeeswarm)
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(GGally)
+library(ggrastr)
+
+# Prepare output 
+output_dir <- "ts220113_GeneExpression"
+dir.create(output_dir, showWarnings = FALSE)
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, dev=c('png', 'pdf'), 
+               message = F, warning = F,
+               fig.path = file.path(output_dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+```{r functions}
+
+DifferentialAnalysis <- function(dds, contrast, exp, control, genes_results,
+                                 lfcThreshold = 0.5, alpha = 0.05) {
+  
+  main = paste(exp, "vs", control, sep = "_")
+  
+  # Run DESeq2 results
+  res <- results(dds, lfcThreshold = lfcThreshold,
+                 contrast = c(contrast, exp, control))
+  
+  # Prepare MAplot
+  tib <- as_tibble(res) %>%
+    drop_na() %>%
+    mutate(shape = case_when(log2FoldChange > 8 ~ 2,
+                             log2FoldChange < -8 ~ 2,
+                             T ~ 1),
+           log2FoldChange = case_when(log2FoldChange > 8 ~ 8,
+                                      log2FoldChange < -8 ~ -8,
+                                      T ~ log2FoldChange))
+  
+  # Prepare plot
+  plt <- tib %>%
+      ggplot(aes(x = baseMean, y = log2FoldChange)) + 
+      geom_bin2d(data = tib[tib$padj >= 0.05, ], bins = 100) +
+      xlab("Mean expression (cpm)") + 
+      ylab("Expression difference (log2)") +
+      ggtitle(main) +
+      ylim(-8, 8) +
+      scale_x_log10() +
+      scale_color_manual(values = c("red"), name = "Significant") +
+      scale_shape_discrete(guide = FALSE) +
+      scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+      theme_bw() +
+      theme(aspect.ratio = 1)
+  
+  if (any(tib$padj < 0.05)) {
+    plt <- plt +
+      geom_point(data = tib[tib$padj < 0.05, ], aes(col = T, 
+                                                    shape = factor(shape)), 
+                 size = 1, show.legend = T)
+  } 
+  plot(plt)
+  
+  # Add results to genes_results
+  mcols(genes_results)[, paste0(main, c("_baseMean", "_log2FoldChange", "_padj"))] <-
+    res[, c("baseMean", "log2FoldChange", "padj")]
+  
+  # Add differential results
+  mcols(genes_results)[, paste0(main, "_sign")] <- "stable"
+  mcols(genes_results)[which(res$log2FoldChange > 0 & res$padj < 0.05), 
+                       paste0(main, "_sign")] <- "up"
+  mcols(genes_results)[which(res$log2FoldChange < 0 & res$padj < 0.05), 
+                       paste0(main, "_sign")] <- "down"
+  
+  genes_results
+}
+
+```
+
+
+### 1) Load data
+
+Load data from NQ. These are simply gene counts.
+
+```{r load data, cache = T, warning = F, message = F}
+
+# Load genes from NQ - filter for gene entries
+genes <- import("Data_NQ/RNAseq/Mus_musculus.GRCm38.92_withChr.gtf")
+genes <- genes[genes$type == "gene"]
+
+
+# Load counts from NQ
+#tib_wapl_cw <- read_tsv("Data_NQ/RNAseq/Wapl_CtcfWapl_RNA_htseqcounts_unnormalized.txt")
+#tib_rad <- read_tsv("Data_NQ/RNAseq/Rad21_RNA_htseqcounts_unnormalized.txt")
+tib_counts <- read_tsv("Data_NQ/RNAseq_all/RNA_htseqcounts_unnormalized.txt")
+
+
+# Prepare metadata
+metadata <- tibble(file_name = names(tib_counts)) %>%
+  filter(file_name != "ensembl_id") %>%
+  rowwise() %>%
+  mutate(target = case_when(grepl("CTCF-EN", file_name) ~ "CTCFEL",
+                            grepl("CTCF-NQL", file_name) ~ "CTCFNQ",
+                            grepl("CTCFWAPL", file_name) ~ "CTCFWAPL",
+                            grepl("WAPL", file_name) ~ "WAPL",
+                            grepl("RAD21", file_name) ~ "RAD21",
+                            T ~ "WT"),
+         replicate = case_when(grepl("rep2", file_name) ~ "r2",
+                               T ~ "r1"),
+         timepoint = case_when(grepl("96h", file_name) ~ "96h",
+                               grepl("48h", file_name) ~ "48h",
+                               grepl("24h", file_name) ~ "24h",
+                               grepl("6h", file_name) ~ "6h",
+                               T ~ "0h"),
+         clone = case_when(grepl("C23", file_name) ~ "C23",
+                           grepl("C6", file_name) ~ "C6",
+                           T ~ "X")) %>%
+  # Manual fix of sample mixing
+  # Note that we confirmed that this is the case with mCherry / GFP reads that 
+  # are specific for both cell lines
+  mutate(target = case_when(replicate == "r2" & target == "CTCFEL" ~ "CTCFNQ",
+                            replicate == "r2" & target == "CTCFNQ" ~ "CTCFEL",
+                            T ~ target)) %>%
+  ungroup() %>%
+  mutate(new_name = paste(target, timepoint, replicate, 
+                          sep = "_"),
+         target_timepoint = factor(paste(target, timepoint,
+                                         sep = "_"))) %>%
+  mutate(target = factor(target, 
+                         levels = c("WT",
+                                    "CTCFEL", "CTCFNQ",
+                                    "RAD21",
+                                    "WAPL", "CTCFWAPL")),
+         timepoint = factor(timepoint,
+                            levels = c("0h", "6h", "24h",
+                                       "48h", "96h")),
+         replicate = factor(replicate,
+                            levels = c("r1", "r2")))
+
+
+# Combine counts and rename
+tib_counts <- tib_counts %>%
+  rename_all(~ c("ensembl_id", metadata$new_name)) %>%
+  filter(! str_detect(ensembl_id, "__")) %>%
+  right_join(tibble(ensembl_id = genes$gene_id))
+
+# Re-order counts
+tib_counts <- tib_counts[match(genes$gene_id, tib_counts$ensembl_id), ]
+
+
+# Export as table for GEO submission
+write_tsv(tib_counts %>%
+            rename_all(function(x) str_replace(x, "WT", "PT")) %>%
+            # Order columns
+            dplyr::select(ensembl_id,
+                          contains("PT"),
+                          contains("CTCFEL_"),
+                          contains("RAD21"),
+                          starts_with("WAPL"),
+                          contains("CTCFWAPL")) %>%
+            rename_all(function(x) str_replace(x, "CTCFEL", "CTCF")),
+          file = file.path(output_dir, "rnaseq_gene_counts.tsv"))
+
+
+# Only work with protein_coding genes and "normal" chromosomes
+idx <- which(genes$gene_biotype %in% c("protein_coding") &
+               seqnames(genes) %in% c(paste0("chr", 1:19), "chrX"))
+
+genes <- genes[idx]
+tib_counts <- tib_counts[idx, ]
+
+
+```
+
+
+### 2) Initialize DESeq2
+
+Load counts into DESeq2.
+
+```{r initially deseq2, cache = T, fig.width = 5, fig.height = 3.5}
+
+set.seed(1)
+
+# Convert tibble to named data.frame
+df_counts <- as.data.frame(tib_counts %>%
+                             dplyr::select(-ensembl_id))
+row.names(df_counts) <- tib_counts$ensembl_id
+
+# Load this into DESeq2
+dds <- DESeqDataSetFromMatrix(countData = df_counts,
+                                     colData = data.frame(metadata),
+                                     design= ~ target_timepoint)
+dds <- DESeq(dds)
+
+# Get the "transformed" values and create PCA plot
+dds_vsd <- vst(dds, blind = FALSE)
+dds_vsd <- normTransform(dds, pc = 0.001)
+
+pca <- plotPCA(dds_vsd, intgroup = c("target"), ntop = 5000, 
+               returnData = F)
+
+# Add metadata and plot
+as_tibble(pca$data) %>% 
+  bind_cols(metadata %>% dplyr::select(-target)) %>%
+  ggplot(aes(x = PC1, y = PC2, col = timepoint, shape = target)) +
+  geom_point(size = 3) +
+  xlab(pca$labels$x) +
+  ylab(pca$labels$y) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+as_tibble(pca$data) %>% 
+  bind_cols(metadata %>% dplyr::select(-target)) %>%
+  filter(target != "CTCFNQ") %>%
+  ggplot(aes(x = PC1, y = PC2, col = timepoint, shape = target)) +
+  geom_point(size = 3) +
+  xlab(pca$labels$x) +
+  ylab(pca$labels$y) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+```
+
+Okay, now we have the RNAseq samples (gene counts) loaded the PCA plot confirms
+that the samples are not too bad. 
+
+
+### 3) FPKM values
+
+I want FPKM values to use as measure of gene expression. Get these.
+
+To do this, I need to determine "gene length" for all the genes. Of course, 
+RNA-seq only captures exons, so I need to gather the length of only exons.
+
+```{r calculate FPKM values, cache = T}
+
+# Call to determine gene length:
+#python /home/t.v.schaik/mydata/proj/sManzo_pADamID/ts190515_pADamID_RPE_Top1_DRB/bin/gtftools.py -l Data_NQ/Mus_musculus.GRCm38.92_withChr_geneLength.bed Data_NQ/Mus_musculus.GRCm38.92_withChr.gtf
+
+# Read gene lengths
+tib_geneLength <- read_tsv("Data_NQ/RNAseq/Mus_musculus.GRCm38.92_withChr_geneLength.bed") %>%
+  dplyr::rename(gene_id = "gene")
+
+# Add to genes
+tib_geneLength <- tibble(gene_id = genes$gene_id) %>%
+  left_join(tib_geneLength)
+genes$length <- tib_geneLength$mean
+
+# Add genelength
+mcols(dds)$basepairs <- genes$length
+
+# Get FPKM
+tib_fpkm <- as_tibble(fpkm(dds)) %>%
+  add_column(ensembl_id = tib_counts$ensembl_id)
+
+# Get mean FPKM per sample
+tmp <- do.call(cbind, tapply(metadata$new_name,
+                             interaction(metadata$target, 
+                                         metadata$timepoint),
+                             function(x) {
+                               if (length(x) > 1) {
+                                 rowMeans(tib_fpkm[, x]) 
+                               } else {
+                                 tib_fpkm[, x]
+                               }}))
+
+tib_fpkm_mean <- tib_fpkm %>%
+  dplyr::select(ensembl_id) %>%
+  bind_cols(as_tibble(tmp) %>%
+              rename_all(function(x) gsub("\\.", "_", x)))
+
+
+# Save as RDS
+saveRDS(tib_fpkm, 
+        file.path(output_dir,
+                  "genes_fpkm.rds"))
+saveRDS(tib_fpkm_mean, 
+        file.path(output_dir,
+                  "genes_fpkm_mean.rds"))
+saveRDS(genes, 
+        file.path(output_dir,
+                  "genes.rds"))
+
+
+# Also, write bigwig files of the FPKM 
+bigwig_dir <- file.path(output_dir,
+                        "bigwig")
+dir.create(bigwig_dir, showWarnings = F)
+
+genes_ranges <- genes
+mcols(genes_ranges) <- NULL
+start(genes_ranges) <- end(genes_ranges) <- ifelse(strand(genes_ranges) == "+",
+                                                   start(genes_ranges),
+                                                   end(genes_ranges))
+
+# Add seqinfo
+chrom_info <- read.table("~/mydata/data/genomes/mm10/mm10.chrom.sizes",
+                         sep = "\t", stringsAsFactors = F)
+row.names(chrom_info) <- chrom_info[, 1]
+seqlengths(genes_ranges) <- chrom_info[seqlevels(genes_ranges), 2]
+
+# Export bigwigs
+for (n in names(tib_fpkm_mean)) {
+  
+  # Not for the gene ID of course
+  if (n == "ensembl_id") next
+  
+  # Temporary ranges
+  genes_tmp <- genes_ranges
+  genes_tmp$score <- tib_fpkm_mean %>% pull(n)
+  
+  # Remove duplicates ranges
+  genes_tmp <- genes_tmp[! duplicated(paste0(seqnames(genes_tmp),
+                                             start(genes_tmp)))]
+  
+  # Remove NAs
+  genes_tmp <- genes_tmp[! is.na(genes_tmp$score)]
+  
+  # Remove seqlevels without seqlenghts
+  genes_tmp <- genes_tmp[seqnames(genes_tmp) %in% seqlevels(genes_tmp)[! is.na(seqlengths(genes_tmp))]]
+  seqlevels(genes_tmp) <- as.character(unique(seqnames(genes_tmp)))
+  
+  # Export as bigwig
+  export.bw(genes_tmp, file.path(bigwig_dir, 
+                                 paste0(n, ".bw")))
+}
+
+```
+
+
+### 4) Differential analysis
+
+I want gene lists to play with. Up and downregulated genes versus stable
+genes. Let's do some simple one-to-one differential tests.
+
+```{r differential analysis, cache = T, fig.width = 5, fig.height = 3.5}
+
+# Prepare genes object with output of differential analyses
+genes_results <- genes
+mcols(genes_results) <- NULL
+
+# Differential analysis - make MAplot and save results
+# 1) WT timecourse
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "WT_96h", "WT_0h",
+                                      genes_results)
+
+# 2) AID versus WT
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFEL_0h", "WT_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFNQ_0h", "WT_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "WAPL_0h", "WT_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFWAPL_0h", "WT_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "RAD21_0h", "WT_0h",
+                                      genes_results)
+
+# 3) CTCF timecourse
+# 3a) CTCF-EL
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFEL_6h", "CTCFEL_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFEL_24h", "CTCFEL_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFEL_96h", "CTCFEL_0h",
+                                      genes_results)
+
+# 3b) CTCF-NQ
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFNQ_6h", "CTCFNQ_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFNQ_24h", "CTCFNQ_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFNQ_96h", "CTCFNQ_0h",
+                                      genes_results)
+
+# 4) WAPL timecourse
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "WAPL_6h", "WAPL_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "WAPL_24h", "WAPL_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "WAPL_48h", "WAPL_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "WAPL_96h", "WAPL_0h",
+                                      genes_results)
+
+# 5) CTCF-WAPL timecourse
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFWAPL_6h", "CTCFWAPL_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFWAPL_24h", "CTCFWAPL_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFWAPL_48h", "CTCFWAPL_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "CTCFWAPL_96h", "CTCFWAPL_0h",
+                                      genes_results)
+
+# 6) RAD21 timecourse
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "RAD21_6h", "RAD21_0h",
+                                      genes_results)
+genes_results <- DifferentialAnalysis(dds, "target_timepoint",
+                                      "RAD21_24h", "RAD21_0h",
+                                      genes_results)
+
+# Save as rds
+saveRDS(genes_results, 
+        file.path(output_dir,
+                  "genes_results.rds"))
+
+```
+
+Which genes are differentially expressed? First, look at the expression levels
+of the up and down-regulated genes.
+
+```{r differential class versus wildtype expression, cache = T, fig.width = 6, fig.height = 6}
+
+tib <- as_tibble(mcols(genes_results)) %>%
+  dplyr::select(WT_96h_vs_WT_0h_baseMean,
+                contains("sign")) %>%
+  gather(key, value, -contains("baseMean")) %>%
+  mutate(key = str_remove(key, "_sign"),
+         key = factor(key, levels = unique(key)),
+         value = factor(value, levels = c("down", "stable", "up"))) %>%
+  separate(key, c("condition", "timepoint"), remove = F) %>%
+  filter(condition != "WT" & ! timepoint %in% c("0h", "6h")) %>%
+  mutate(condition = factor(condition, levels = levels(metadata$target)),
+         timepoint = factor(timepoint, levels = levels(metadata$timepoint)))
+
+plt <- tib %>%
+  ggplot(aes(x = WT_96h_vs_WT_0h_baseMean+1, col = value, fill = value)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  facet_grid(condition ~ timepoint, scales = "free_y") +
+  scale_color_manual(values = c(c("blue", "darkgrey", "red"))) +
+  scale_fill_manual(values = c(c("blue", "darkgrey", "red"))) +
+  xlab("Wildtype expression (cpm)") +
+  ylab("Density") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+plot(plt)
+
+```
+
+As expected, upregulated are generally more lowly expressed in the wildtype, and
+vice-versa for downregulated genes.
+
+Let's make some sort of overview table with all the differential results. 
+Similar as Nora et al., made but then with all the samples.
+
+```{r differential analysis overview figures, cache = T, fig.width = 6, fig.height = 6}
+
+# Create one table with all the differential analysis results
+tib <- as_tibble(mcols(genes_results)) %>%
+  dplyr::select(contains("sign"),
+                -matches("0h.*0h"),
+                -contains("NQ"))
+  # dplyr::select(contains("sign"),
+  #               -matches("0h.*0h"))
+
+gene_idx <- rowSums(tib != "stable") > 0
+
+tib <- tib %>%
+  filter(gene_idx) %>%
+  rename_all(function(x) str_remove(x, "_sign")) %>%
+  rename_all(function(x) str_remove(x, "_vs.*")) %>%
+  mutate_all(function(x) {
+    x = case_when(x == "up" ~ 1,
+                  x == "down" ~ -1,
+                  T ~ 0)
+  })
+
+# Repeat for log2
+tib_log2 <- as_tibble(mcols(genes_results)) %>%
+  dplyr::select(contains("log2"),
+                -matches("0h.*0h"),
+                -contains("NQ")) %>%
+  # dplyr::select(contains("log2"),
+  #               -matches("0h.*0h")) %>%
+  filter(gene_idx) %>%
+  rename_all(function(x) str_remove(x, "_log.*")) %>%
+  rename_all(function(x) str_remove(x, "_vs.*"))
+
+# Limit extreme values to 0.99 percentiles
+quantiles <- quantile(unlist(tib_log2), c(0.025, 0.975))
+tib_log2_cutoff <- tib_log2 %>%
+  mutate_all(function(x) {
+    x = case_when(x > quantiles[2] ~ quantiles[2],
+                  x < quantiles[1] ~ quantiles[1],
+                  T ~ x)
+  })
+
+# Plot
+# 1) Significant calls
+# 1a) Prepare clusters
+hclust_gene <- hclust(dist(tib), method = "complete")
+
+# 1b) Column groups
+my_sample_col <- data.frame(class = c("WT_timecourse",
+                                      #rep("AID_vs_WT", 5),
+                                      rep("CTCFEL_timecourse", 3),
+                                      #rep("CTCFNQ_timecourse", 3),
+                                      rep("WAPL_timecourse", 4),
+                                      rep("CTCFWAPL_timecourse", 4),
+                                      rep("RAD21_timecourse", 2)),
+                            target = c("WT", 
+                                       #c("CTCFEL", "CTCFNQ", 
+                                       #  "WAPL", "CTCFWAPL", "RAD21"),
+                                       rep("CTCFEL", 3),
+                                       #rep("CTCFNQ", 3),
+                                       rep("WAPL", 4),
+                                       rep("CTCFWAPL", 4),
+                                       rep("RAD21", 2)))
+my_sample_col$target <- factor(my_sample_col$target, 
+                               levels = c("WT", "CTCFEL", "RAD21",
+                                          "WAPL", "CTCFWAPL"))
+my_sample_col$class <- factor(my_sample_col$class, 
+                              levels = paste0(levels(my_sample_col$target),
+                                              "_timecourse"))
+row.names(my_sample_col) <- my_sample_col$name <- names(tib)
+
+# Change order of objects
+idx <- c(1:4, 13:14, 5:12)
+tib <- tib[, idx]
+tib_log2_cutoff <- tib_log2_cutoff[, idx]
+my_sample_col <- my_sample_col[idx, ]
+
+# # 1c) heatmap
+# pheatmap(as.matrix(tib)[hclust_gene$order, ], 
+#          cluster_cols = F, cluster_rows = F,
+#          show_rownames = F, annotation_col = my_sample_col)
+# 
+# # 2) Log2FoldChanges
+# pheatmap(as.matrix(tib_log2_cutoff)[hclust_gene$order, ], 
+#          cluster_cols = F, cluster_rows = F,
+#          show_rownames = F, annotation_col = my_sample_col)
+
+# Plot with ggplot
+tib[hclust_gene$order, ] %>%
+  mutate(gene = 1:nrow(.)) %>%
+  gather(key, value, -gene) %>%
+  mutate(key = factor(key, levels = my_sample_col$name)) %>%
+  ggplot(aes(x = key, y = -gene, fill = value)) +
+  rasterize(geom_tile(),
+            dpi = 300) +
+  scale_fill_distiller(palette = "RdYlBu") +
+  #scale_fill_gradient2(low = "#4575B4", mid = "#FFFFBF", high = "#D73027") +
+  theme_classic() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+tib_log2_cutoff[hclust_gene$order, ] %>%
+  mutate(gene = 1:nrow(.)) %>%
+  gather(key, value, -gene) %>%
+  mutate(key = factor(key, levels = my_sample_col$name)) %>%
+  ggplot(aes(x = key, y = -gene, fill = value)) +
+  rasterize(geom_tile(),
+            dpi = 300) +
+  scale_fill_distiller(palette = "RdYlBu", limits = c(-3.75, 3.75)) +
+  #scale_fill_gradient2(low = "#4575B4", mid = "#FFFFBF", high = "#D73027") +
+  theme_classic() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+How many genes are overlapping? Can I confirm that the observed overlap is more
+than you would expect by chance?
+
+To answer this, I will determine the (expected) random overlap and the actual 
+overlap of the affected genes. Note that the sign (up / down) is taken into 
+account. If the genes are affected in opposite orientation, this is not seen
+as overlap.
+
+  * To determine the random overlap, I will determine the fraction of 
+    differentially up and down-regulated genes. Multiplication of this fraction
+    would be the random overlap. 
+  * The actual overlap is the overlap of up and down-regulated genes.
+
+```{r overlap differential results}
+
+# Create one table with all the differential analysis results
+tib <- as_tibble(mcols(genes_results)) %>%
+  dplyr::select(contains("sign"),
+                -matches("0h.*0h"),
+                -contains("NQ"))
+  # dplyr::select(contains("sign"),
+  #               -matches("0h.*0h"))
+
+tib <- tib %>%
+  rename_all(function(x) str_remove(x, "_sign")) %>%
+  rename_all(function(x) str_remove(x, "_vs.*")) %>%
+  mutate_all(function(x) {
+    x = case_when(x == "up" ~ 1,
+                  x == "down" ~ -1,
+                  T ~ 0)
+  })
+
+# Only select active genes
+idx_active <- tib_fpkm_mean %>%
+  dplyr::select(-ensembl_id,
+                -contains("NQ")) %>%
+  mutate(n_active = rowSums(. > 1),
+         idx_active = n_active >= 1) %>%
+  pull(idx_active)
+
+tib <- tib[idx_active, ]
+  
+
+# Focus on 96h - most extreme effects
+tib_endpoint <- tib %>%
+  dplyr::select(# WT_96h,
+                CTCFEL_96h,
+                RAD21_24h,
+                WAPL_96h,
+                CTCFWAPL_96h)
+
+# Determine expected overlap
+# 1) how many differentially expressed genes (in this object)
+percentage_up <- tib_endpoint %>% 
+  dplyr::summarise_all(function(x) mean(x == 1))
+
+percentage_down <- tib_endpoint %>% 
+  dplyr::summarise_all(function(x) mean(x == -1))
+
+
+# 2) expected overlap
+up_expected <- as_tibble(expand.grid(t(percentage_up)[, 1],
+                                     t(percentage_up)[, 1])) %>%
+  mutate(sample1 = rep(names(percentage_up), 4),
+         sample2 = rep(names(percentage_up), each = 4),
+         direction = "up") %>%
+  filter(sample1 != sample2) 
+
+down_expected <- as_tibble(expand.grid(t(percentage_down)[, 1],
+                                     t(percentage_down)[, 1])) %>%
+  mutate(sample1 = rep(names(percentage_down), 4),
+         sample2 = rep(names(percentage_down), each = 4),
+         direction = "down") %>%
+  filter(sample1 != sample2) 
+
+overlap_expected <- bind_rows(up_expected,
+                              down_expected) %>%
+  mutate(expected_fraction = Var1 * Var2) %>%
+  group_by(sample1, sample2) %>%
+  dplyr::summarise(expected_fraction = sum(expected_fraction)) %>%
+  mutate(expected_number = expected_fraction * nrow(tib))
+
+# 3) actual overlap
+calc_gene_overlap <- function(s1, s2) {
+  
+  # Get the values
+  x1 <- tib %>% pull(s1)
+  x2 <- tib %>% pull(s2)
+  
+  # Determine the amount of overlap
+  up <- sum(x1 == 1 & x2 == 1)
+  down <- sum(x1 == -1 & x2 == -1)
+    
+  # Return combined
+  sum(up, down)
+  
+}
+
+overlap_expected <- overlap_expected %>%
+  rowwise() %>%
+  mutate(actual_number = calc_gene_overlap(sample1, sample2)) %>%
+  ungroup() %>%
+  mutate(actual_fraction = actual_number / nrow(tib))
+
+# 4) enrichment
+expr_levels <- names(tib_endpoint)
+expr_levels_new <- paste0(expr_levels,
+                          " (",
+                          colSums(tib_endpoint != 0),
+                          ")")
+
+overlap_expected <- overlap_expected %>%
+  mutate(enrichment = log2(actual_fraction / expected_fraction)) %>%
+  mutate(sample1 = factor(sample1, 
+                          levels = names(percentage_up)),
+         sample2 = factor(sample2, levels = names(percentage_up)))
+
+levels(overlap_expected$sample1) <- levels(overlap_expected$sample2) <-
+  expr_levels_new
+
+# 5) plot
+overlap_expected %>%
+  ggplot(aes(x = sample1, y = sample2, fill = expected_number,
+             label = round(expected_number, 0))) +
+  geom_tile() +
+  geom_label(label.size = NA, size = 3) +
+  xlab("") +
+  ylab("") +
+  scale_fill_gradient(low = "white", high = "red",
+                      limits = c(0, 1500)) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+overlap_expected %>%
+  ggplot(aes(x = sample1, y = sample2, fill = actual_number,
+             label = round(actual_number, 0))) +
+  geom_tile() +
+  geom_label(label.size = NA, size = 3) +
+  xlab("") +
+  ylab("") +
+  scale_fill_gradient(low = "white", high = "red",
+                      limits = c(0, 1500)) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+overlap_expected %>%
+  ggplot(aes(x = sample1, y = sample2, fill = enrichment,
+             label = actual_number)) +
+  geom_tile() +
+  geom_label(label.size = NA, size = 3) +
+  xlab("") +
+  ylab("") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limits = c(-3.5, 3.5)) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+overlap_expected %>%
+  ggplot(aes(x = sample1, y = sample2, fill = enrichment,
+             label = round(enrichment, 2))) +
+  geom_tile() +
+  geom_label(label.size = NA, size = 3) +
+  xlab("") +
+  ylab("") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", 
+                       midpoint = 0, limits = c(-3.5, 3.5)) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+Yes, there is a clear enrichment. I could also show this in a correlation 
+matrix of the affected genes. 
+
+```{r correlation between differential results, fig.width = 12, fig.height = 12, warning = F, message = F, cache = T}
+
+# From Fede:
+# ggpairs custom functions
+corColor <- function(data, mapping, color = I("black"), sizeRange = c(1, 3), ...) {
+
+  x   <- eval_data_col(data, mapping$x)
+  y   <- eval_data_col(data, mapping$y)
+  r   <- cor(x, y)
+  rt  <- format(r, digits = 3)
+  tt  <- as.character(rt)
+  cex <- max(sizeRange)
+
+  # helper function to calculate a useable size
+  percent_of_range <- function(percent, range) {
+    percent * diff(range) + min(range, na.rm = TRUE)
+  }
+
+  # plot correlation coefficient
+  p <- ggally_text(label = tt, mapping = aes(), xP = 0.5, yP = 0.5,
+                   # size = I(percent_of_range(cex * abs(r), sizeRange)), 
+                   size = 6, 
+                   color = color, ...) +
+    theme(panel.grid.minor=element_blank(),
+          panel.grid.major=element_blank())
+
+  corColors <- RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")[2:6]
+
+  if (r <= boundaries[1]) {
+    corCol <- corColors[1]
+  } else if (r <= boundaries[2]) {
+    corCol <- corColors[2]
+  } else if (r < boundaries[3]) {
+    corCol <- corColors[3]
+  } else if (r < boundaries[4]) {
+    corCol <- corColors[4]
+  } else {
+    corCol <- corColors[5]
+  }
+
+  p <- p +
+    theme(panel.background = element_rect(fill = corCol))
+
+  return(p)
+}
+
+customScatter <- function (data, mapping) 
+{
+    p <- ggplot(data = data, mapping) + 
+      geom_point(alpha = 0.2, size = 0.5) +
+      geom_smooth(method = "lm", se = T, col = "red") +
+      theme_bw()
+    
+    p 
+}
+
+
+# Use GGally to make correlation plots
+boundaries <- seq(from = 0.1, to = 0.7, length.out = 4)
+plt <- ggpairs(tib_log2 %>% drop_na(),
+               upper = list(continuous = corColor),
+               lower = list(continuous = customScatter),
+               diag = list(continuous = function(data, mapping, ...) {
+                   ggally_densityDiag(data = data, mapping = mapping, alpha = 0.3, fill = "red") +
+                   theme_bw()})) +
+  ggtitle("Correlating differential results") +
+  xlab("") +
+  ylab("")
+
+print(plt)
+
+```
+
+Let's save bed files of the significant genes.
+
+```{r save results}
+
+# Bed file dir
+diff_dir <- file.path(output_dir, "differential_analysis")
+dir.create(diff_dir, showWarnings = F)
+
+# Get the first base of every gene
+genes_start <- genes_results
+mcols(genes_start) <- NULL
+start(genes_start) <- end(genes_start) <- ifelse(strand(genes_start) == "+",
+                                                 start(genes_start),
+                                                 end(genes_start))
+
+# Loop over comparisons
+for (n in names(mcols(genes_results))) {
+  
+  if (! grepl("sign", n)) next
+
+  # Get the results
+  n_res <- mcols(genes_results)[, n]
+  
+  # Save differential genes
+  export.bed(genes_start[n_res == "up"], 
+             file.path(diff_dir,
+                       paste0(n, "_up.bed")))
+  export.bed(genes_start[n_res == "down"], 
+             file.path(diff_dir,
+                       paste0(n, "_down.bed")))
+  
+  # Save gene lists
+  write_tsv(tibble(gene = genes$gene_id[n_res == "up"]), col_names = F,
+            file.path(diff_dir, paste0(n, "_up_list.txt")))
+  write_tsv(tibble(gene = genes$gene_id[n_res == "down"]), col_names = F,
+            file.path(diff_dir, paste0(n, "_down_list.txt")))
+  
+}
+
+write_tsv(tibble(gene = genes$gene_id), col_names = F,
+          file.path(diff_dir, "genes_all_list.txt"))
+
+```
+
+
+### Conclusion
+
+All depletions affect a partially overlapping set of genes. I saved these 
+results to compare with other data in different documents.
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+

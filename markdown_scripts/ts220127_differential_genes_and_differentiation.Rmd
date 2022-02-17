@@ -1,0 +1,457 @@
+---
+title: "Differential genes and differentiation"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+I observed that all depletion experiments affect roughly the same set of genes.
+We also know that WAPL depletion induces a differentiation-like phenotype. So,
+it's not unlikely that all depletions induce this phenotype. Can I confirm this?
+
+
+### Method
+
+Use differentiation data from Riising.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(metap))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(pheatmap))
+
+# Prepare output 
+output_dir <- "ts220127_differential_genes_and_differentiation"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Prepare bin size and scaling
+bin.size <- "10kb"
+bin.size <- as.numeric(gsub("kb", "", bin.size)) * 1e3
+
+scaling = 1e6 / bin.size
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, cache = T,
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+```{r functions}
+
+```
+
+
+### 1. Load data
+
+#### 1.1 DamID data
+
+Load the required data. First, DamID.
+
+```{r load damid data, cache = T}
+
+# Read .rds files
+input.dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+CTCF.sites <- readRDS(file.path(input.dir, "CTCF_sites.rds"))
+LAD.borders <- readRDS(file.path(input.dir, "LAD_borders_pA.rds"))[[1]]
+LAD.borders$CTCF_strand <- factor(LAD.borders$CTCF_strand,
+                                  levels = c("outwards", "inwards", 
+                                             "ambiguous", "nonCTCF"))
+
+input.dir <- "ts220113_effect_of_CTCF_depletion_on_LAD_borders"
+bin.size <- readRDS(file.path(input.dir, "bin_size.rds"))
+metadata <- readRDS(file.path(input.dir, "metadata_damid.rds"))
+damid <- readRDS(file.path(input.dir, "damid.rds"))
+
+input.dir <- "ts220113_CTCF_sites_within_LADs"
+LADs <- readRDS(file.path(input.dir, "LADs.rds"))
+
+```
+
+
+#### 1.1 RNAseq data
+
+Load the required data. Now, RNAseq. Both my data and publicly available
+data.
+
+```{r load rnaseq data, cache = T}
+
+# Read .rds files
+input.dir <- "ts220113_GeneExpression"
+genes <- readRDS(file.path(input.dir, "genes.rds"))
+tib_fpkm <- readRDS(file.path(input.dir, "genes_fpkm_mean.rds"))
+gr_results <- readRDS(file.path(input.dir, "genes_results.rds"))
+
+# Also prepare gr_results with only "significant" comparisons
+input.dir <- "ts220117_Positioning_DifferentialGenes"
+significant_tests <- readRDS(file.path(input.dir, "significant_tests.rds"))
+genes_combined <- readRDS(file.path(input.dir, "genes_combined.rds"))
+
+gr_results_filtered <- gr_results
+mcols(gr_results_filtered) <- as_tibble(mcols(gr_results)) %>%
+  dplyr::select(matches(paste(significant_tests, collapse = "|")),
+                -contains("padj"))
+
+
+# Also, filter for active genes only (as done previously)
+cutoff <- 1
+
+idx <- tib_fpkm %>%
+  mutate(n = rowSums(.[, 2:ncol(.)] > cutoff),
+         idx = n > 0) %>%
+  pull(idx)
+
+
+
+# Load polycomb expression data
+mesc_differentiation_expression <- read_csv(file.path(output_dir, 
+                                                      "Riising_2014_mESC_differentiation.csv")) %>% 
+  rename_at(1, ~ "gene_id") %>%
+  rename_at(10:11, function(x) str_replace(x, 
+                                           "versus_.*",
+                                           "sign_differentiation")) %>%
+  rename_all(function(x) str_replace(x, "-", "_")) %>%
+  mutate(E14_WT_0h_sign_differentiation = case_when(E14_WT_0h_sign_differentiation == T &
+                                                      E14_WT_72h > E14_WT_0h ~ "up",
+                                                    E14_WT_0h_sign_differentiation == T &
+                                                      E14_WT_72h < E14_WT_0h ~ "down",
+                                                    T ~ "stable"),
+         Suz12_KO_0h_sign_differentiation = case_when(Suz12_KO_0h_sign_differentiation == T &
+                                                        Suz12_KO_72h > Suz12_KO_0h ~ "up",
+                                                      Suz12_KO_0h_sign_differentiation == T &
+                                                        Suz12_KO_72h < Suz12_KO_0h ~ "down",
+                                                      T ~ "stable"))
+
+
+```
+
+
+### 2. Comparison differentiation genes versus depletion effects
+
+Next, I can compare whether our data shows an overlap in the affected genes
+compared to the differentiation.
+
+```{r comparison differentiation genes versus depletion effects, fig.width = 8, fig.height = 3.5}
+
+# Get E14 differentiation data 
+tib <- as_tibble(mcols(gr_results)) %>%
+  dplyr::select(contains("sign"),
+                -matches("0h.*0h"),
+                -contains("NQ")) %>%
+  mutate(gene_id = genes$gene_id) %>%
+  # dplyr::select(contains("sign"),
+  #               -matches("0h.*0h")) 
+  left_join(mesc_differentiation_expression %>%
+              dplyr::select(gene_id,
+                            contains("sign"), -contains("Suz"))) %>%
+  rename_all(function(x) str_remove(x, "_sign")) %>%
+  dplyr::select(one_of(significant_tests), contains("E14")) %>%
+  mutate_all(function(x) {
+    x = case_when(x == "up" ~ 1,
+                  x == "down" ~ -1,
+                  T ~ 0)})
+
+
+
+# log2 fold change tibble of my results
+tib_log2 <- as_tibble(mcols(gr_results)) %>%
+  dplyr::select(contains("log2"),
+                -matches("0h.*0h"),
+                -contains("NQ")) %>%
+  # dplyr::select(contains("log2"),
+  #               -matches("0h.*0h")) %>%
+  mutate(gene_id = genes$gene_id) %>%
+  left_join(mesc_differentiation_expression) %>%
+  mutate(E14_diff_72h_log2 = log2((E14_WT_72h+1) / (E14_WT_0h+1)),
+         E14_diff_72h_log2 = replace_na(E14_diff_72h_log2, 0)) %>%
+  dplyr::select(contains("log2")) %>%
+  rename_all(function(x) str_remove(x, "_log.*")) %>%
+  dplyr::select(one_of(significant_tests), contains("E14"))
+
+# Limit extreme values to 0.99 percentiles
+quantiles <- quantile(unlist(tib_log2), c(0.01, 0.99), na.rm = T)
+tib_log2_cutoff <- tib_log2 %>%
+  mutate_all(function(x) {
+    x = case_when(x > quantiles[2] ~ quantiles[2],
+                  x < quantiles[1] ~ quantiles[1],
+                  T ~ x)
+  })
+
+
+
+# Prepare plots
+tib_log2 <- tib_log2 %>%
+  add_column(E14 = tib$E14_WT_0h_differentiation) %>%
+  mutate(E14 = case_when(E14 == -1 ~ "down",
+                         E14 == 1 ~ "up",
+                         T ~ "stable"),
+         E14 = factor(E14, c("down", "stable", "up")))
+  
+tib_E14 <- tib_log2 %>%
+  gather(key, value, -contains("E14")) %>%
+  mutate(key = str_remove(key, "_vs.*")) %>%
+  separate(key, c("condition", "timepoint"), remove = F) %>%
+  mutate(condition = factor(condition, c("CTCFEL", "RAD21", "WAPL", "CTCFWAPL"))) %>%
+  arrange(condition, timepoint) %>%
+  mutate(key = factor(key, unique(key)))
+
+tib_E14 %>%
+  ggplot(aes(x = key, y = value, fill = E14)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  #facet_grid(. ~ key) +
+  coord_cartesian(ylim = c(-5, 7)) +
+  scale_fill_manual(values = c("blue", "grey", "red")) +
+  xlab("Test") +
+  ylab("Log2-fold-change") +
+  theme_bw() +
+  theme(aspect.ratio = 1/2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Significance testing
+library(broom)
+
+test_up <- tib_E14 %>%
+  filter(E14 != "down") %>%
+  group_by(condition, timepoint, key) %>%
+  drop_na() %>%
+  dplyr::summarise(tidy(wilcox.test(value ~ E14))) %>%
+  mutate(test = "up") 
+
+test_down <- tib_E14 %>%
+  filter(E14 != "up") %>%
+  group_by(condition, timepoint, key) %>%
+  drop_na() %>%
+  dplyr::summarise(tidy(wilcox.test(value ~ E14))) %>%
+  mutate(test = "down") 
+
+test <- bind_rows(test_up, test_down) %>%
+  mutate(padj = p.adjust(p.value),
+         sign = padj < 0.05) %>%
+  print(n = 100)
+
+
+# Scatter plots
+tib_E14 %>%
+  ggplot(aes(x = E14_diff_72h, y = value)) +
+  geom_bin2d(bins = 100) +
+  geom_smooth(method = "lm", col = "red") +
+  facet_grid(. ~ key) +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+```
+
+There is a strong enrichment. Good.
+
+Next, show that this enrichment is higher than expected (as done between the
+protein depletions). 
+
+```{r overlap differential results, fig.width = 4.5, fig.height = 4.5}
+
+# Create one table with all the differential analysis results
+tib_sign <- tib %>%
+  dplyr::select(all_of(significant_tests),
+                contains("E14"))
+
+tib_sign <- tib_sign %>%
+  rename_all(function(x) str_remove(x, "_WT_0h")) %>%
+  rename_all(function(x) str_remove(x, "_vs.*")) #%>%
+  # mutate_all(function(x) {
+  #   x = case_when(x == "up" ~ 1,
+  #                 x == "down" ~ -1,
+  #                 T ~ 0)
+  # })
+
+# Only select active genes
+idx_active <- tib_fpkm %>%
+  dplyr::select(-ensembl_id,
+                -contains("NQ")) %>%
+  mutate(n_active = rowSums(. > 1),
+         idx_active = n_active >= 1) %>%
+  pull(idx_active)
+
+tib_sign <- tib_sign[idx_active, ]
+  
+
+# Determine expected overlap
+# 1) how many differentially expressed genes (in this object)
+percentage_up <- tib_sign %>% 
+  dplyr::summarise_all(function(x) mean(x == 1))
+
+percentage_down <- tib_sign %>% 
+  dplyr::summarise_all(function(x) mean(x == -1))
+
+
+# 2) expected overlap
+up_expected <- as_tibble(expand.grid(t(percentage_up)[, 1],
+                                     t(percentage_up)[, 1])) %>%
+  mutate(sample1 = rep(names(percentage_up), length(percentage_up)),
+         sample2 = rep(names(percentage_up), each = length(percentage_up)),
+         direction = "up") %>%
+  filter(sample1 != sample2) 
+
+down_expected <- as_tibble(expand.grid(t(percentage_down)[, 1],
+                                     t(percentage_down)[, 1])) %>%
+  mutate(sample1 = rep(names(percentage_down), length(percentage_up)),
+         sample2 = rep(names(percentage_down), each = length(percentage_up)),
+         direction = "down") %>%
+  filter(sample1 != sample2) 
+
+overlap_expected <- bind_rows(up_expected,
+                              down_expected) %>%
+  mutate(expected_fraction = Var1 * Var2) %>%
+  group_by(sample1, sample2) %>%
+  dplyr::summarise(expected_fraction = sum(expected_fraction)) %>%
+  mutate(expected_number = expected_fraction * nrow(tib))
+
+# 3) actual overlap
+calc_gene_overlap <- function(s1, s2) {
+  
+  # Get the values
+  x1 <- tib_sign %>% pull(s1)
+  x2 <- tib_sign %>% pull(s2)
+  
+  # Determine the amount of overlap
+  up <- sum(x1 == 1 & x2 == 1)
+  down <- sum(x1 == -1 & x2 == -1)
+    
+  # Return combined
+  sum(up, down)
+  
+}
+
+overlap_expected <- overlap_expected %>%
+  rowwise() %>%
+  mutate(actual_number = calc_gene_overlap(sample1, sample2)) %>%
+  ungroup() %>%
+  mutate(actual_fraction = actual_number / nrow(tib_sign))
+
+# 4) enrichment
+expr_levels <- names(tib_sign)
+expr_levels_new <- paste0(expr_levels,
+                          " (",
+                          colSums(tib_sign != 0),
+                          ")")
+
+overlap_expected <- overlap_expected %>%
+  mutate(enrichment = log2(actual_fraction / expected_fraction)) %>%
+  mutate(sample1 = factor(sample1, 
+                          levels = names(percentage_up)),
+         sample2 = factor(sample2, levels = names(percentage_up)))
+
+levels(overlap_expected$sample1) <- levels(overlap_expected$sample2) <-
+  expr_levels_new
+
+# 5) plot all
+overlap_expected %>%
+  ggplot(aes(x = sample1, y = sample2, fill = expected_number,
+             label = round(expected_number, 0))) +
+  geom_tile() +
+  geom_label(label.size = NA, size = 3) +
+  xlab("") +
+  ylab("") +
+  scale_fill_gradient(low = "white", high = "red",
+                      limits = c(0, 2000)) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+overlap_expected %>%
+  ggplot(aes(x = sample1, y = sample2, fill = actual_number,
+             label = round(actual_number, 0))) +
+  geom_tile() +
+  geom_label(label.size = NA, size = 3) +
+  xlab("") +
+  ylab("") +
+  scale_fill_gradient(low = "white", high = "red",
+                      limits = c(0, 2000)) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+# 6) plot specifically E14
+overlap_expected %>%
+  filter(grepl("E14", sample1)) %>%
+  gather(key, value, contains("number")) %>%
+  ggplot(aes(x = sample2, y = key, fill = value,
+             label = round(value, 0))) + 
+  geom_tile() +
+  geom_label(label.size = NA, size = 3) +
+  xlab("") +
+  ylab("") +
+  scale_fill_gradient(low = "white", high = "red",
+                      limits = c(0, 2000)) +
+  theme_bw() +
+  theme(aspect.ratio = 2/7,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+overlap_expected %>%
+  filter(grepl("E14", sample1)) %>%
+  gather(key, value, contains("number")) %>%
+  ggplot(aes(x = key, y = sample2, fill = value,
+             label = round(value, 0))) + 
+  geom_tile() +
+  geom_label(label.size = NA, size = 3) +
+  xlab("") +
+  ylab("") +
+  scale_fill_gradient(low = "white", high = "red",
+                      limits = c(0, 2000)) +
+  theme_bw() +
+  theme(aspect.ratio = 7/2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+
+```
+
+
+### x. Save data
+
+No data to save.
+
+
+### Conclusion
+
+Yes, all depletion experiments seem to induce differentiation based on the 
+overlay of RNA-seq data. Good to know.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```

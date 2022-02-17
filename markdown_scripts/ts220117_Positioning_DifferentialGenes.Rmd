@@ -1,0 +1,1271 @@
+---
+title: "Positioning of differential genes"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Project description
+
+Effect of cohesin looping on genome architecture, from the perspective of the 
+nuclear lamina.
+
+
+### Introduction
+
+Here I want to look into the positioning of differential genes. Ask question
+like: 
+
+  * Are differential genes enriched or depleted from LADs?
+  * Are they close to CTCF sites?
+  * ...
+
+
+### Method
+
+Use previous objects and correlate the two.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(metap))
+suppressPackageStartupMessages(library(ggbeeswarm))
+
+# # Prepare output 
+output_dir <- "ts220117_Positioning_DifferentialGenes"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Prepare bin size and scaling
+bin.size <- "10kb"
+bin.size <- as.numeric(gsub("kb", "", bin.size)) * 1e3
+
+scaling = 1e6 / bin.size
+
+```
+
+Prepare knitr.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, cache = T,
+               message = F, warning = F,
+               dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+Functions.
+
+```{r functions}
+
+
+```
+
+
+### 1. Load data
+
+#### 1.1 DamID data
+
+Load the required data. First, DamID.
+
+```{r load damid data, cache = T}
+
+# Read .rds files
+input.dir <- "ts220113_CTCF_enrichment_at_LAD_borders"
+CTCF.sites <- readRDS(file.path(input.dir, "CTCF_sites.rds"))
+LAD.borders <- readRDS(file.path(input.dir, "LAD_borders_pA.rds"))[[1]]
+LAD.borders$CTCF_strand <- factor(LAD.borders$CTCF_strand,
+                                  levels = c("outwards", "inwards", 
+                                             "ambiguous", "nonCTCF"))
+
+input.dir <- "ts220113_effect_of_CTCF_depletion_on_LAD_borders"
+bin.size <- readRDS(file.path(input.dir, "bin_size.rds"))
+metadata <- readRDS(file.path(input.dir, "metadata_damid.rds"))
+damid <- readRDS(file.path(input.dir, "damid.rds"))
+
+input.dir <- "ts220113_CTCF_sites_within_LADs"
+LADs <- readRDS(file.path(input.dir, "LADs.rds"))
+
+```
+
+
+#### 1.2 RNAseq data
+
+Load the required data. Now, RNAseq.
+
+```{r load rnaseq data, cache = T}
+
+# Read .rds files
+input.dir <- "ts210202_GeneExpression"
+genes <- readRDS(file.path(input.dir, "genes.rds"))
+tib_fpkm <- readRDS(file.path(input.dir, "genes_fpkm_mean.rds"))
+gr_results <- readRDS(file.path(input.dir, "genes_results.rds"))
+
+# Also prepare gr_results with only "late" comparisons
+gr_results_late <- gr_results
+mcols(gr_results_late) <- as_tibble(mcols(gr_results)) %>%
+  dplyr::select(matches("_24h_|_48h_|_96h_"))
+
+```
+
+
+### 2. LAD positioning
+
+Question: are the differentially expressed genes enriched or depleted from
+LADs?
+
+```{r lad enrichment, cache = T, fig.width = 8, fig.height = 4}
+
+PlotFeatureEnrichment <- function(genes, results, feature, main = "", 
+                                  ymax_fraction = 0.5, which_tests = NULL, i = 1) {
+  
+  # Overlap genes with features
+  genes$feature <- overlapsAny(genes, feature)
+  
+  # Gather significant results and process
+  tib <- as_tibble(mcols(results)) %>% 
+    dplyr::select(contains("_sign")) %>%
+    rename_all(function(x) str_remove(x, "_sign"))
+  
+  tib <- tib %>% 
+    add_column(feature = genes$feature,
+               gene_id = genes$gene_id) %>%
+    gather(key, value, -feature, -gene_id) %>%
+    group_by(key, value) %>%
+    summarise(feature = mean(feature),
+              n = n()) %>%
+    ungroup() %>%
+    mutate(key = factor(key, levels = names(tib))) %>%
+    arrange(key, value) #%>%
+    # filter(n > 5)
+  
+  # Plot
+  plt <- tib %>%
+    ggplot(aes(x = value, y = feature, fill = value, label = n)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 1)) +
+    geom_text(angle = 90, position = position_dodge(width = 1),
+              hjust = 0, size = 2) +
+    facet_grid(. ~ key) +
+    coord_cartesian(ylim = c(0, 1)) +
+    ggtitle(main) +
+    xlab("") +
+    ylab("Fraction in feature") +
+    scale_fill_manual(values = c("blue", "darkgrey", "red")) +
+    theme_classic() +
+    theme(aspect.ratio = 4,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  plot(plt)
+  
+  
+  # Also, prepare a more concise plot
+  lad_percentage <- mean(genes$feature)
+  
+  tib_enrichment <- tib %>%
+    filter(value != "stable",
+           ! grepl("WT", key),
+           ! grepl("NQ", key)) %>%
+    group_by(key) %>%
+    mutate(n_sum = sum(n)) %>%
+    ungroup()
+  
+  if (is.null(which_tests)) {
+    tib_enrichment <- tib_enrichment %>%
+      filter(n_sum > 50) 
+  } else {
+    tib_enrichment <- tib_enrichment %>%
+      filter(key %in% which_tests)
+  }
+    
+  tib_enrichment <- tib_enrichment %>%
+    mutate(condition = str_remove(key, "_.*"),
+           timepoint = str_remove(str_remove(key, "_vs.*"),
+                                  ".*_")) %>%
+    mutate(condition = factor(condition, levels = c("CTCFEL", "RAD21", "WAPL", "CTCFWAPL")),
+           timepoint = factor(timepoint, levels = paste0(c(0, 6, 24, 48, 96), "h"))) %>%
+    arrange(condition, timepoint) %>%
+    mutate(sample = paste(condition, timepoint, sep = "_"),
+           sample = factor(sample, levels = unique(sample)),
+           n_lad = (n * feature) / i)
+  
+  
+  plt <- tib_enrichment %>%
+    ggplot(aes(x = sample, y = feature, fill = condition, label = n_lad)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 1)) +
+    geom_text(angle = 90, position = position_dodge(width = 1),
+              hjust = 0, size = 2) +
+    geom_hline(yintercept = lad_percentage, col = "black", linetype = "dashed") +
+    facet_grid(. ~ value) +
+    coord_cartesian(ylim = c(0, ymax_fraction)) +
+    ggtitle(main) +
+    xlab("") +
+    ylab("Fraction in feature") +
+    scale_fill_manual(values = c("red2", "blue2", "green3", "purple")) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  plot(plt)
+  
+  
+  # Can I add some statistics to show that this is significantly increased?
+  tib_statistics <- tib %>%
+    mutate(n_lad = n * feature / i,
+           n_ilad = round(n * (1-feature) / i))
+  
+  tests <- unique(as.character(tib_enrichment$key))
+  tib_tests <- tibble()
+  
+  for (test in tests) {
+    
+    tmp <- tib_statistics %>%
+      filter(key == test) %>%
+      mutate(value = factor(value, c("up", "down", "stable"))) %>%
+      arrange(value)
+    
+    for (direction in c("up", "down")) {
+      
+      tmp_direction <- tmp %>%
+        filter(value %in% c(direction, "stable")) %>%
+        dplyr::select(n_lad, n_ilad)
+      
+      fisher_test <- fisher.test(tmp_direction)
+      tib_tests <- bind_rows(tib_tests,
+                             tibble(test = test,
+                                    direction = direction,
+                                    pvalue = fisher_test$p.value,
+                                    odds = fisher_test$estimate,
+                                    n = tmp_direction$n_lad[1]))
+    }
+  }
+  
+  # Gather data and prepare for plotting
+  tib_tests <- tib_tests %>%
+    mutate(padj = p.adjust(pvalue),
+           sign = padj < 0.05) %>%
+    separate(test, c("target", "timepoint"), remove = F) %>%
+    mutate(target = factor(target, c("CTCFEL", "RAD21", "WAPL", "CTCFWAPL")),
+           timepoint = factor(timepoint, c("24h", "48h", "96h"))) %>%
+    arrange(target, timepoint) %>%
+    mutate(sample = paste(target, timepoint, sep = "_"),
+           sample = factor(sample, unique(sample)))
+  
+  # Plot this
+  plt <- tib_tests %>%
+    ggplot(aes(x = sample, y = odds, fill = sign)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(y = odds + 0.005, label = n), 
+              position = position_dodge(width = 1), angle = 90, hjust = 0) +
+    geom_hline(yintercept = 1, col = "red", linetype = "dashed") +
+    facet_grid(. ~ direction) +
+    scale_fill_manual(values = c("grey80", "grey30")) +
+    coord_cartesian(ylim = c(0, max(tib_tests$odds) + 0.5)) +
+    xlab("") +
+    ylab("Odds ratio") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  invisible(tests)
+
+}
+
+# Plot barplot of LAD overlap
+PlotFeatureEnrichment(genes, gr_results, LADs, main = "LADs")
+PlotFeatureEnrichment(genes, gr_results_late, LADs, main = "LADs")
+
+# Also filter for active genes only
+cutoff <- 1
+
+idx <- tib_fpkm %>%
+  mutate(n = rowSums(.[, 2:ncol(.)] > cutoff),
+         idx = n > 0) %>%
+  pull(idx)
+
+tests <- PlotFeatureEnrichment(genes[idx], gr_results[idx], LADs, 
+                               main = "LADs (active genes)")
+
+# Also, plot the cutoff values
+tib_fpkm %>%
+  ggplot(aes(x = log2(WT_0h+1))) +
+  geom_vline(xintercept = log2(cutoff+1), col = "red", linetype = "dashed") +
+  geom_histogram() +
+  xlab("FPKM (log2)") +
+  ylab("#genes") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+tib_fpkm %>%
+  mutate(LAD = ifelse(overlapsAny(genes, LADs),
+                      "LAD", "iLAD")) %>%
+  ggplot(aes(x = log2(WT_0h+1))) +
+  geom_vline(xintercept = log2(cutoff+1), col = "red", linetype = "dashed") +
+  geom_histogram() +
+  xlab("FPKM (log2)") +
+  ylab("#genes") +
+  facet_grid(. ~ LAD) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+# tib_fpkm %>%
+#   mutate(LAD = ifelse(overlapsAny(genes, LADs),
+#                       "LAD", "iLAD")) %>%
+#   ggplot(aes(x = LAD, y = log2(WT_0h+1))) +
+#   geom_hline(yintercept = log2(cutoff+1), col = "red", linetype = "dashed") +
+#   geom_quasirandom() +
+#   xlab("FPKM (log2)") +
+#   ylab("#genes") +
+#   theme_bw() +
+#   theme(aspect.ratio = 1)
+
+# Question: how many LADs genes do I have, with and without the cutoff?
+table(ifelse(overlapsAny(genes, LADs), "LAD", "iLAD"))
+table(ifelse(overlapsAny(genes[idx], LADs), "LAD", "iLAD"))
+  
+```
+
+It seems that upregulated genes are enriched within LADs, and downregulated genes
+depleted from LADs. 
+
+Let's also look at positioning relative to the LAD border. If CTCF plays a role
+in insulating LADs, there might be an effect depending on the presence of CTCF.
+
+```{r distance to lad, cache = T, warning = F, fig.width = 8, fig.height = 6}
+
+PlotDistanceToFeature <- function(plt_genes, plt_results, plt_feature, xmax = 10,
+                                  overlap = NULL, class = NULL, main = "") {
+  
+  if (! is.null(overlap)) {
+    plt_genes$overlap <- plt_genes %over% overlap
+  } else {
+    plt_genes$overlap <- "-"
+  }
+  
+  # Get distances
+  ovl <- distanceToNearest(plt_genes, plt_feature, ignore.strand = T)
+  
+  plt_genes$distance <- NA
+  plt_genes$distance[queryHits(ovl)] <- mcols(ovl)$distance
+  
+  if (! is.null(class)) {
+    plt_genes$class <- class[subjectHits(ovl)]
+  } else {
+    plt_genes$class <- "-"
+  }
+  
+  # Gather significant results and process
+  tib <- as_tibble(mcols(plt_results)) %>% 
+    dplyr::select(contains("_sign")) %>%
+    rename_all(function(x) str_remove(x, "_sign"))
+  
+  tib <- tib %>% 
+    add_column(distance = plt_genes$distance,
+               gene_id = plt_genes$gene_id,
+               overlap = plt_genes$overlap,
+               class = plt_genes$class) %>%
+    gather(key, value, -distance, -gene_id, -overlap, -class) %>%
+    mutate(key = factor(key, levels = names(tib)),
+           condition = str_remove(key, "_.*"),
+           condition = factor(condition, levels = levels(metadata$condition)))
+  
+  # Plot
+  plt <- tib %>%
+    ggplot(aes(x = distance / 1e6, col = value, linetype = overlap)) +
+    stat_ecdf() +
+    coord_cartesian(xlim = c(0, xmax)) +
+    facet_wrap( ~ key, nrow = 2) +
+    scale_color_manual(values = c("blue", "darkgrey", "red")) +
+    ggtitle(main) +
+    xlab("Distance to feature (Mb)") +
+    ylab("Cum. density") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  plot(plt)
+  
+  # Plot with fewer samples
+  plt <- tib %>%
+    filter(grepl("48|96|RAD21_24h", key),
+           ! grepl("WT_96h|NQ", key)) %>%
+    ggplot(aes(x = distance / 1e6, col = value, linetype = overlap)) +
+    stat_ecdf() +
+    coord_cartesian(xlim = c(0, xmax)) +
+    facet_grid(class ~ key) +
+    scale_color_manual(values = c("blue", "darkgrey", "red")) +
+    ggtitle(main) +
+    xlab("Distance to feature (Mb)") +
+    ylab("Cum. density") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  plot(plt)
+  
+  plt <- tib %>%
+    filter(grepl("48|96|RAD21_24h", key),
+           ! grepl("WT_96h|NQ", key)) %>%
+    ggplot(aes(x = distance / 1e6, col = value, linetype = overlap)) +
+    stat_ecdf() +
+    coord_cartesian(xlim = c(0, xmax)) +
+    facet_grid(class ~ condition) +
+    scale_color_manual(values = c("blue", "darkgrey", "red")) +
+    ggtitle(main) +
+    xlab("Distance to feature (Mb)") +
+    ylab("Cum. density") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  plot(plt)
+    
+}
+
+# Plot barplot of LAD overlap
+PlotDistanceToFeature(genes, gr_results, LADs, xmax = 10, main = "LADs")
+PlotDistanceToFeature(genes, gr_results, LADs, xmax = 1, main = "LADs")
+
+# Repeat for active genes
+PlotDistanceToFeature(genes[idx], gr_results[idx], LADs, xmax = 1, main = "LADs (active genes)")
+
+# For LAD borders
+PlotDistanceToFeature(genes, gr_results, LAD.borders, xmax = 0.5, 
+                      main = "LADs borders", overlap = LADs, 
+                      class = LAD.borders$CTCF_strand)
+
+PlotDistanceToFeature(genes[idx], gr_results[idx], LAD.borders, xmax = 0.5, 
+                      main = "LADs borders (active genes)", overlap = LADs, 
+                      class = LAD.borders$CTCF_strand)
+
+```
+
+Again, there is a trend that upregulated genes are enriched compared to all 
+(active) genes. Also near LAD borders. 
+
+I want to extend a bit on these inwards borders. As if these protect LAD genes 
+from being upregulated. Can I show this in a concise plot?
+
+```{r lad borders and upregulated genes, cache = T, fig.width = 8, fig.height = 6}
+
+# Prepare a function for this
+LADBorderClasses <- function(plt_genes, plt_results, plt_borders, plt_LADs,
+                             plt_fpkm, tests, main = "") {
+  
+  # Overlap with LADs?
+  plt_genes$overlap <- plt_genes %over% plt_LADs
+  
+  # Get distances to LAD borders
+  ovl <- distanceToNearest(plt_genes, plt_borders, ignore.strand = T)
+  
+  plt_genes$distance <- NA
+  plt_genes$distance[queryHits(ovl)] <- mcols(ovl)$distance
+  
+  # Add class of closest LAD border
+  plt_genes$class <- plt_borders$CTCF_strand[subjectHits(ovl)]
+  
+  # Gather significant results and process
+  tib <- as_tibble(mcols(plt_results)) %>% 
+    dplyr::select(contains("_sign")) %>%
+    rename_all(function(x) str_remove(x, "_sign"))
+  
+  tib <- tib %>% 
+    add_column(distance = plt_genes$distance,
+               gene_id = plt_genes$gene_id,
+               overlap = plt_genes$overlap,
+               class = plt_genes$class) %>%
+    gather(key, value, -distance, -gene_id, -overlap, -class) %>%
+    mutate(key = factor(key, levels = names(tib))) %>%
+    # Remove samples with few diff genes
+    filter(key %in% tests) %>%
+    mutate(condition = str_remove(key, "_.*"),
+           condition = factor(condition, levels = levels(metadata$condition)))
+  
+  
+  # Summarise
+  tib_summary <- tib %>%
+    group_by(condition, value, overlap, class) %>%
+    dplyr::summarise(dis_50kb = mean(distance < 5e4),
+                     dis_200kb = mean(distance < 2e5),
+                     dis_500kb = mean(distance < 5e5),
+                     n = n()) %>%
+    ungroup()
+  
+  # Simple barplot
+  plt <- tib_summary %>%
+    ggplot(aes(x = condition, y = dis_200kb, fill = class)) +
+    geom_bar(stat = "identity", position = position_dodge(preserve = "single")) +
+    facet_grid(overlap ~ value) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  # Enrichment over stable
+  distance_limit <- 5e5
+  
+  tib_200kb <- tib %>%
+    filter(distance < distance_limit) %>%
+    mutate(key = str_remove(key, "_vs.*"),
+           key = factor(key, 
+                        levels = c("CTCFEL_96h", "RAD21_24h",
+                                   "WAPL_48h", "WAPL_96h",
+                                   "CTCFWAPL_24h",
+                                   "CTCFWAPL_48h",
+                                   "CTCFWAPL_96h"))) %>%
+    group_by(key, overlap, class) %>%
+    dplyr::summarise(down = mean(value == "down"),
+                     stable = mean(value == "stable"),
+                     up = mean(value == "up"),
+                     n = n()) %>%
+    ungroup() 
+  
+  tib_summary <- tib_200kb %>%
+    # gather(effect, value, down, stable, up)
+    gather(effect, value, down, up)
+  
+  tib_significance <- tib_200kb %>%
+    mutate(up = up * n,
+           down = down * n,
+           stable = stable * n) %>%
+    gather(key_count, count, down, up, stable) %>%
+    dplyr::select(-n) %>%
+    spread(class, count)
+  
+  plt <- tib_summary %>%
+    ggplot(aes(x = key, y = value, fill = class)) +
+    geom_bar(stat = "identity", position = position_dodge(preserve = "single")) +
+    # geom_text(aes(x = key, y = value + 0.01, label = paste0(n * value, "/", n), 
+    #               group = class), 
+    #           position = position_dodge(width = 1), angle = 90, hjust = 0) +
+    geom_text(aes(x = key, y = value + 0.005, label = n * value, 
+                  group = class), 
+              position = position_dodge(width = 1), angle = 90, hjust = 0) +
+    facet_grid(effect ~ overlap, scales = "free_y") +
+    xlab("") +
+    ylab("Fraction differentially expressed genes within 200kb of LAD border") +
+    theme_bw() +
+    theme(aspect.ratio = 2/3,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  
+  
+  # I also want to focus only on the LAD genes, and then plot the odds as before
+  # Can I add some statistics to show that this is significantly increased?
+  tib_statistics <- tib_200kb %>%
+    drop_na(key) %>%
+    gather(key_gene, gene_fraction, down, stable, up) %>%
+    mutate(n_direction = as.integer(gene_fraction * n),
+           overlap = ifelse(overlap, "LAD", "iLAD"),
+           overlap = factor(overlap, c("LAD", "iLAD"))) %>%
+    arrange(key, overlap, class, key_gene) %>%
+    dplyr::select(-gene_fraction) %>%
+    spread(key_gene, n_direction)
+  
+  tib_tests <- tibble()
+  
+  for (test in str_remove(tests, "_vs.*")) {
+    for (lad_status in unique(tib_statistics$overlap)) {
+      for (border in c("outwards", "inwards")) {
+        
+        tmp <- tib_statistics %>%
+          filter(key == test & 
+                   class %in% c(border, "nonCTCF") &
+                   overlap == lad_status)
+        
+        for (direction in c("up", "down")) {
+          
+          tmp_direction <- tmp %>%
+            dplyr::select(direction, stable)
+          
+          fisher_test <- fisher.test(tmp_direction)
+          tib_tests <- bind_rows(tib_tests,
+                                 tibble(test = test,
+                                        class = border,
+                                        overlap = lad_status,
+                                        direction = direction,
+                                        pvalue = fisher_test$p.value,
+                                        odds = fisher_test$estimate,
+                                        n = (tmp_direction %>% pull(direction))[1]))
+        }
+      }
+    }
+  }
+  
+  # Gather data and prepare for plotting
+  tib_tests <- tib_tests %>%
+    #filter(overlap == "LAD" & direction == "up") %>%
+    mutate(padj = p.adjust(pvalue),
+           sign = padj < 0.05) %>%
+    separate(test, c("target", "timepoint"), remove = F) %>%
+    mutate(target = factor(target, c("CTCFEL", "RAD21", "WAPL", "CTCFWAPL")),
+           timepoint = factor(timepoint, c("24h", "48h", "96h"))) %>%
+    arrange(target, timepoint) %>%
+    mutate(sample = paste(target, timepoint, sep = "_"),
+           sample = factor(sample, unique(sample)),
+           class = factor(class, levels(tib_statistics$class)))
+  
+  # Plot this
+  plt <- tib_tests %>%
+    filter(overlap == "LAD") %>%
+    ggplot(aes(x = sample, y = odds, fill = sign)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(y = odds + 0.005, label = n), 
+              position = position_dodge(width = 1), angle = 90, hjust = 0) +
+    geom_hline(yintercept = 1, col = "red", linetype = "dashed") +
+    facet_grid(direction ~ class) +
+    scale_fill_manual(values = c("grey80", "grey30")) +
+    coord_cartesian(ylim = c(0, max(tib_tests$odds) + 0.5)) +
+    xlab("") +
+    ylab("Odds ratio") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  
+  # Combine p-values in one (Fisher's method)
+  # Note: this assumes sample indepedence, which we do not have
+  tib_tests_fisher <- tib_tests %>% 
+    group_by(class, overlap, direction) %>%
+    dplyr::summarise(fisher_pvalue = sumlog(pvalue)$p,
+                     odds = mean(odds),
+                     n_combined = sum(n)) %>%
+    ungroup() %>%
+    mutate(sample = paste(class, direction, sep = "_"),
+           padj = p.adjust(fisher_pvalue),
+           sign = padj < 0.05)
+  
+  plt <- tib_tests_fisher %>%
+    ggplot(aes(x = sample, y = -log(padj), fill = odds > 1)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(y = -log(padj) + 0.1, label = n_combined), 
+              position = position_dodge(width = 1), angle = 90, hjust = 0) +
+    facet_grid(. ~ overlap) +
+    scale_fill_manual(values = c("grey80", "grey30")) +
+    coord_cartesian(ylim = c(0, max(-log(tib_tests_fisher$padj)) + 0.5)) +
+    ylab("Adjusted Fisher's combined p-value") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  
+  ################################################
+  ## Combined analysis
+  
+  # Also, do this for combined samples to prevent multiple testing problems
+  tib_combined <- tib %>%
+    mutate(key = str_remove(key, "_vs.*"),
+           key = factor(key, 
+                        levels = c("CTCFEL_96h", "RAD21_24h",
+                                   "WAPL_48h", "WAPL_96h",
+                                   "CTCFWAPL_24h",
+                                   "CTCFWAPL_48h",
+                                   "CTCFWAPL_96h"))) %>%
+    group_by(gene_id, distance, overlap, class) %>%
+    dplyr::summarise(up = sum(value == "up"),
+                     down = sum(value == "down")) %>%
+    ungroup() %>%
+    mutate(expression = case_when(up > down ~ "up",
+                                  down > up ~ "down",
+                                  T ~ "stable")) 
+  
+  # Plot the overlap
+  my_labels = c(1, 3, 10, 30, 100, 300, 1000)
+  plt <- tib_combined %>%
+    group_by(up, down) %>%
+    dplyr::summarise(n = n()) %>%
+    ungroup() %>%
+    mutate(class = case_when(down == 0 & up == 0 ~ "stable",
+                             up > down ~ "up",
+                             down > up ~ "down",
+                             T ~ "unknown"),
+           class = factor(class, c("down", "stable", "up", "unknown"))) %>%
+    ggplot(aes(x = up, y = down, fill = n, label = n)) +
+    geom_tile(aes(col = class), size = 1) +
+    geom_text() +
+    scale_fill_gradient(trans = "log", labels = my_labels, breaks = my_labels,
+                        low = "grey90", high = "black", 
+                        name = "# genes") +
+    scale_color_manual(values = c("blue", "grey60", "red", "yellow")) +
+    xlab("upregulation (# significant tests)") +
+    ylab("downregulation (# significant tests)") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  plot(plt)
+  
+  
+  # Continue with combined analysis
+  tib_200kb_combined <- tib_combined %>%
+    filter(distance < distance_limit) %>%
+    group_by(overlap, class) %>%
+    dplyr::summarise(up = sum(expression == "up"),
+                     down = sum(expression == "down"),
+                     stable = sum(expression == "stable")) %>%
+    ungroup()
+  
+  
+  # tib_200kb
+  
+  
+  # Do the tests
+  tib_tests <- tibble()
+  
+  for (lad_status in unique(tib_200kb_combined$overlap)) {
+    for (border in c("outwards", "inwards")) {
+      
+      tmp <- tib_200kb_combined %>%
+        filter(class %in% c(border, "nonCTCF") &
+                 overlap == lad_status)
+      
+      for (direction in c("up", "down")) {
+        
+        tmp_direction <- tmp %>%
+          dplyr::select(direction, stable)
+        
+        fisher_test <- fisher.test(tmp_direction)
+        tib_tests <- bind_rows(tib_tests,
+                               tibble(class = border,
+                                      overlap = lad_status,
+                                      direction = direction,
+                                      pvalue = fisher_test$p.value,
+                                      odds = fisher_test$estimate,
+                                      n = (tmp_direction %>% pull(direction))[1]))
+      }
+    }
+  }
+  
+  # Gather data and prepare for plotting
+  tib_tests <- tib_tests %>%
+    mutate(padj = p.adjust(pvalue),
+           sign = padj < 0.05,
+           overlap = ifelse(overlap, "LAD", "iLAD"),
+           overlap = factor(overlap, c("iLAD", "LAD")),
+           class = factor(class, levels(tib_statistics$class)),
+           direction = factor(direction, c("down", "up"))) %>%
+    arrange(class, direction, overlap) %>%
+    mutate(sample = paste(class, direction, sep = "_"),
+           sample = factor(sample, unique(sample)))
+  
+  # Plot
+  plt <- tib_tests %>%
+    ggplot(aes(x = sample, y = odds, fill = sign)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(y = odds + 0.005, label = n), 
+              position = position_dodge(width = 1), angle = 90, hjust = 0) +
+    geom_hline(yintercept = 1, col = "red", linetype = "dashed") +
+    facet_grid(. ~ overlap) +
+    scale_fill_manual(values = c("grey80", "grey30")) +
+    coord_cartesian(ylim = c(0, max(tib_tests$odds) + 0.5)) +
+    xlab("") +
+    ylab("Odds ratio compared to non-CTCF borders") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  
+  # Plot the expression of the LAD genes, inwards facing
+  tib_combined_fpkm <- tib_combined %>%
+    filter(distance < distance_limit) %>%
+    left_join(plt_fpkm %>%
+                dplyr::select(ensembl_id, WT_0h),
+              by = c("gene_id" = "ensembl_id"))
+  
+  plt <- tib_combined_fpkm %>%
+    filter(overlap == T & class != "ambiguous") %>%
+    ggplot(aes(x = class, y = log2(WT_0h+1), fill = expression)) +
+    geom_boxplot(outlier.shape = NA) +
+    xlab("") +
+    ylab("log2(FPKM+1)") +
+    scale_fill_manual(values = c("blue", "grey50", "red"),
+                      name = "Class") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  plt <- tib_combined_fpkm %>%
+    filter(overlap == T & class != "ambiguous") %>%
+    ggplot(aes(x = expression, y = log2(WT_0h+1), col = expression, group = expression)) +
+    geom_quasirandom(position = position_dodge(width = 1)) +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "black") +
+    facet_grid(. ~ class) +
+    xlab("") +
+    ylab("log2(FPKM+1)") +
+    scale_color_manual(values = c("blue", "grey50", "red"),
+                       name = "Class", guide = F) +
+    theme_bw() +
+    theme(aspect.ratio = 2,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  plt <- tib_combined_fpkm %>%
+    filter(overlap == T & class != "ambiguous") %>%
+    ggplot(aes(x = class, y = log2(WT_0h+1), col = class, group = class)) +
+    geom_quasirandom(position = position_dodge(width = 1)) +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "black") +
+    facet_grid(. ~ expression) +
+    xlab("") +
+    ylab("log2(FPKM+1)") +
+    scale_color_brewer(palette = "Set2", guide = F) +
+    theme_bw() +
+    theme(aspect.ratio = 2,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  plot(plt)
+  
+  
+  
+  # Return
+  
+  
+  # # Distance plot
+  # bin_size <- 2e5
+  # 
+  # tib_binned <- tib %>%
+  #   mutate(distance = ifelse(overlap == T, distance, -distance))
+  # 
+  # min_distance <- round(min(tib_binned$distance), -4)
+  # max_distance <- round(max(tib_binned$distance), -4)
+  # 
+  # tib_binned <- tib_binned %>%
+  #   mutate(bin = cut(distance, seq(min_distance,
+  #                                  max_distance,
+  #                                  by = bin_size)),
+  #          bin = as.numeric(bin),
+  #          bin = min_distance - bin_size/2 + bin_size * bin) %>%
+  #   group_by(bin, class, condition) %>%
+  #   dplyr::summarise(total = n(),
+  #                    stable = sum(value == "stable"),
+  #                    up = sum(value == "up"),
+  #                    down = sum(value == "down")) %>%
+  #   ungroup() %>%
+  #   filter(total > 10) %>%
+  #   mutate(fraction_up = up / total,
+  #          fraction_down = down / total)
+  # 
+  # tib_gather <- tib_binned %>%
+  #   gather(key, value, contains("fraction"))
+  #   
+  # plt <- tib_gather %>%  
+  #   ggplot(aes(x = bin / 1e3, y = value, col = class)) +
+  #   geom_line() +
+  #   facet_grid(key ~ condition) +
+  #   coord_cartesian(xlim = c(-500, 500)) +
+  #   theme_bw() +
+  #   theme(aspect.ratio = 1,
+  #         axis.text.x = element_text(angle = 90, hjust = 1))
+  # plot(plt)
+  
+  list(tib, tib_combined)
+  
+}
+
+output_list <- LADBorderClasses(plt_genes = genes[idx], 
+                                plt_results = gr_results[idx],
+                                plt_borders = LAD.borders,
+                                plt_LADs = LADs,
+                                plt_fpkm = tib_fpkm[idx, ],
+                                tests = tests,
+                                main = "LAD borders (active genes)")
+
+tib_genes <- output_list[[1]]
+tib_combined <- output_list[[2]]
+
+# Save combined genes
+saveRDS(tib_combined, file.path(output_dir, "genes_combined.rds"))
+
+
+# Print upregulated + inwards genes for visual inspection
+gene_bed_dir <- file.path(output_dir, "geneLists_bed")
+dir.create(gene_bed_dir, showWarnings = F)
+
+gr_genes <- genes
+
+for (test in c("CTCFEL", "RAD21", "CTCFWAPL")) {
+  for (LAD_status in c("inLAD")) {
+    for (gene_class in c("up", "down")) {
+      for (border_class in c("inwards", "outwards", "nonCTCF", "ambiguous")) {
+        
+        tib_filtered <- tib_genes %>%
+          filter(distance < 2e5) %>%
+          filter(condition == test) %>%
+          filter(overlap == (LAD_status == "inLAD")) %>%
+          filter(value == gene_class) %>%
+          filter(class == border_class)
+        
+        genes_filtered <- genes[genes$gene_id %in% tib_filtered$gene_id]
+        write_tsv(as_tibble(genes_filtered) %>% 
+                    dplyr::select(1:3),
+                  file.path(gene_bed_dir, 
+                            paste0(test, "_", border_class, "_", 
+                                   LAD_status, "_", gene_class, ".bed")),
+                  col_names = F)
+        
+      }
+    }
+  }
+}
+
+
+
+
+
+
+
+# Also, write differential genes for GO analysis
+gene_list_dir <- file.path(output_dir, "geneLists")
+dir.create(gene_list_dir, showWarnings = F)
+
+all_genes <- unique(tib_genes$gene_id)
+lad_genes <- unique(tib_genes %>% filter(overlap == T) %>% pull(gene_id))
+ilad_genes <- unique(tib_genes %>% filter(overlap == F) %>% pull(gene_id))
+lad_border_genes <- unique(tib_genes %>% 
+                             filter(overlap == T, distance < 2e5) %>% 
+                             pull(gene_id))
+
+# write_tsv(tibble(all_genes), col_names = F, 
+#           file.path(gene_list_dir, "all_genes.txt"))
+# write_tsv(tibble(lad_genes), col_names = F, 
+#           file.path(gene_list_dir, "lad_genes.txt"))
+# write_tsv(tibble(ilad_genes), col_names = F, 
+#           file.path(gene_list_dir, "ilad_genes.txt"))
+# write_tsv(tibble(lad_border_genes), col_names = F, 
+#           file.path(gene_list_dir, "lad_border_genes.txt"))
+
+for (c in unique(tib_genes$key)) {
+  tmp <- tib_genes %>%
+    filter(key == c)
+  
+  c_short <- str_remove(c, "_vs.*")
+  
+  # All differential genes
+  tmp_up <- tmp %>% filter(value == "up") %>% pull(gene_id)
+  tmp_down <- tmp %>% filter(value == "down") %>% pull(gene_id)
+  
+  # write_tsv(tibble(tmp_up), col_names = F, 
+  #         file.path(gene_list_dir, paste0(c_short, "_up.txt")))
+  # write_tsv(tibble(tmp_down), col_names = F, 
+  #         file.path(gene_list_dir, paste0(c_short, "_down.txt")))
+  
+  # LAD differential genes
+  tmp_lad_up <- tmp %>% 
+    filter(value == "up", overlap == T) %>% 
+    pull(gene_id)
+  tmp_lad_down <- tmp %>% 
+    filter(value == "down", overlap == T) %>% 
+    pull(gene_id)
+  
+  # write_tsv(tibble(tmp_lad_up), col_names = F, 
+  #         file.path(gene_list_dir, paste0(c_short, "_lad_up.txt")))
+  # write_tsv(tibble(tmp_lad_down), col_names = F, 
+  #         file.path(gene_list_dir, paste0(c_short, "_lad_down.txt")))
+  
+  # LAD upregulated genes near borders
+  tmp_lad_up_nonCTCF <- tmp %>% 
+    filter(value == "up", overlap == T, class == "nonCTCF", distance < 2e5) %>% 
+    pull(gene_id)
+  tmp_lad_up_inwards <- tmp %>% 
+    filter(value == "up", overlap == T, class == "inwards", distance < 2e5) %>% 
+    pull(gene_id)
+  tmp_lad_up_outwards <- tmp %>% 
+    filter(value == "up", overlap == T, class == "outwards", distance < 2e5) %>% 
+    pull(gene_id)
+  tmp_lad_up_ambiguous <- tmp %>% 
+    filter(value == "up", overlap == T, class == "ambiguous", distance < 2e5) %>% 
+    pull(gene_id)
+  
+  # write_tsv(tibble(tmp_lad_up_nonCTCF), col_names = F, 
+  #         file.path(gene_list_dir, paste0(c_short, "_lad_nonCTCF_up.txt")))
+  # write_tsv(tibble(tmp_lad_up_inwards), col_names = F, 
+  #         file.path(gene_list_dir, paste0(c_short, "_lad_inwards_up.txt")))
+  # write_tsv(tibble(tmp_lad_up_outwards), col_names = F, 
+  #         file.path(gene_list_dir, paste0(c_short, "_lad_outwards_up.txt")))
+  # write_tsv(tibble(tmp_lad_up_ambiguous), col_names = F, 
+  #         file.path(gene_list_dir, paste0(c_short, "_lad_ambiguous_up.txt")))
+  
+}
+
+```
+
+
+
+This is a lot of information. Yes, there is some enrichment of upregulated genes
+near LAD borders. Specifically outwards oriented borders seem relevant.
+
+
+### 3. CTCF positioning
+
+A more logical feature that plays a role is CTCF sites. So, let's repeat the 
+analysis above with CTCF peaks. Can I indeed find that differential genes are
+often positioned near CTCF peaks?
+
+```{r ctcf positioning, cache = T, warning = F, fig.width = 8, fig.height = 4}
+
+# Get a set of strong peaks
+CTCF.filtered <- CTCF.sites[[1]]
+CTCF.filtered <- CTCF.filtered[CTCF.filtered$score > 100]
+
+# Plot as before
+# - first, extend CTCF peaks a bit
+CTCF.filtered.extend <- flank(CTCF.filtered, width = 1e3, both = T)
+
+PlotFeatureEnrichment(genes, gr_results, CTCF.filtered.extend, 
+                      main = "CTCF peaks")
+
+PlotDistanceToFeature(genes, gr_results, CTCF.filtered, xmax = 1, 
+                      main = "CTCF peaks")
+PlotDistanceToFeature(genes, gr_results, CTCF.filtered, xmax = 0.1, 
+                      main = "CTCF peaks")
+
+PlotDistanceToFeature(genes, gr_results_late, CTCF.filtered, xmax = 0.1, 
+                      main = "CTCF peaks")
+
+```
+
+This is a very clear result. Yes, differential genes are often positioned close
+to CTCF sites. An intruiging question now would be to see whether the effect is
+more pronounced for LAD genes than for iLAD genes. Let's try to find out.
+
+```{r ctcf and lads, cache = T, warning = F, fig.width = 8, fig.height = 4}
+
+# CTCF peaks split on LAD overlap
+PlotDistanceToFeature(genes, gr_results, CTCF.filtered, xmax = 0.1,
+                      overlap = LADs, main = "CTCF peaks over LADs")
+
+# LADs split on CTCF overlap
+PlotDistanceToFeature(genes, gr_results, LADs, xmax = 10,
+                      overlap = CTCF.filtered.extend, 
+                      main = "LADs over CTCF peaks")
+
+```
+
+Combined, this shows that:
+
+  1. LAD genes are depleted in CTCF sites - and therefore genes positioned 
+     further from CTCF sites.
+  2. Genes positioned close to CTCF sites are most affected by the AID treatment,
+     often in both directions.
+  3. LAD genes are not as strongly affected as non-LAD genes. Possibly due to
+     reasons (1) and (2) combined.
+     
+     
+### 4. Differential expression versus baseline expression
+
+Here, I want to test whether all of the above analysis are meaningless. LAD
+genes are typically lowly expressed, and upregulated are typically lowly
+expressed (because then it's easier to be upregulated). 
+
+```{r baseline expression versus change, cache = T, fig.width = 8, fig.height = 5.5}
+
+# Plot as boxplots?
+tib_baseline <- as_tibble(mcols(gr_results)) %>%
+  dplyr::select(matches(paste(tests, collapse = "|"))) %>%
+  dplyr::select(contains("sign")) %>%
+  mutate(ensembl_id = tib_fpkm$ensembl_id,
+         baseline = tib_fpkm$WT_0h, 
+         LAD = ifelse(overlapsAny(genes, LADs,),
+                      "LAD", "iLAD")) %>%
+  filter(ensembl_id %in% tib_fpkm$ensembl_id[idx]) %>%
+  gather(key, value, contains("sign")) %>%
+  separate(key, c("target", "timepoint"), remove = F) %>%
+  mutate(target = replace(target, target == "CTCFEL", "CTCF"),
+         target = factor(target, c("CTCF", "RAD21", "WAPL", "CTCFWAPL")),
+         timepoint = factor(timepoint, c("0h", "24h", "48h", "96h"))) %>%
+  arrange(target, timepoint) %>%
+  mutate(sample = paste(target, timepoint, sep = "_"),
+         sample = factor(sample, unique(sample)))
+
+tib_baseline %>%
+  ggplot(aes(x = sample, y = log2(baseline+1), fill = value)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  xlab("") +
+  ylab("log2(fpkm+1)") +
+  scale_fill_manual(values = c("blue", "grey50", "red"),
+                    name = "Class") +
+  facet_grid(LAD ~ .) +
+  theme_bw() +
+  theme(aspect.ratio = 1/2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+Yes, very clear. Upregulated genes are simply more lowly expressed in the base
+condition.
+
+
+### 5. Repeat with matched expression set
+
+In another document, I describe how the affected genes are very similar to genes
+that change during mNPC differentiation. Also, the LAD enrichment is seen during
+differentiation. Most likely, this is somehow related to the enrichment of 
+downregulated genes in LADs, that in turn are increasingly upregulated.
+
+Here, I will repeat the analysis with a matched expression set. This should at
+least take care of this effect, and might result in no enrichment at all. 
+(Which is a fine conclusion, if you ask me.)
+
+```{r LAD enrichment of matched expression set, fig.width = 8, fig.height = 4}
+
+## Function by Christ Leemans
+## Create a matched set
+##
+## get a table with matching sets
+## table = complete table to take matching sets from
+## class_col = column name of class of interest
+## class = name of class to match the set on
+## order_on = column name to order on
+## bs = bin size to sample equal number of items from
+matchSet <- function(table, class_col, class, order_on, bs=10){
+  # order by value of interest
+  o_vec = order(table[,order_on])
+  o_table = table[o_vec, ]
+  set_A = which(o_table[,class_col]==class)
+  
+  # define bins that cover the range of set A
+  n = length(o_vec)
+  bin_n = floor((n - set_A[1] - 1) / bs)
+  seq_vec = seq(n-bin_n*bs, n, bs)
+  
+  # take a matching set B
+  set_B = c()
+  for(i in 1:(length(seq_vec)-1)){
+    sub_table = o_table[(seq_vec[i] + 1):seq_vec[i + 1], ]
+    sub_A = which(sub_table[,class_col]==class)
+    if (length(sub_A) < bs/2){
+      sub_B = sample(which(sub_table[,class_col]!=class), length(sub_A))
+    } else {
+      sub_B = which(sub_table[,class_col]!=class)
+    }
+    set_B = c(set_B, sub_B + seq_vec[i])
+  }
+  ## can also return o_table[c(setA, setB), ]
+  ## but this way order is perserved.
+  i_vec = o_vec[c(set_A, set_B)]
+  return(table[i_vec[order(i_vec)], ])
+}
+
+
+# Also filter for active genes only
+cutoff <- 1
+
+idx <- tib_fpkm %>%
+  mutate(n = rowSums(.[, 2:ncol(.)] > cutoff),
+         idx = n > 0) %>%
+  pull(idx)
+
+
+# Select only active genes
+tib_fpkm$overlap_LAD = genes %over% LADs
+
+genes_active <- genes[idx]
+gr_results_active <- gr_results[idx]
+tib_fpkm_active <- tib_fpkm[idx, ]
+
+# For increased reproducibility, repeat the random gene matching a few times
+tib_fpkm_matched <- tibble()
+
+set.seed(123)
+i_total <- 10
+for (i in 1:i_total) {
+  tmp <- matchSet(table = as.data.frame(tib_fpkm_active), 
+                  class_col = "overlap_LAD", 
+                  class = T, 
+                  order_on = "WT_0h")
+  tmp <- as_tibble(tmp) %>%
+    mutate(match = i)
+  tib_fpkm_matched <- bind_rows(tib_fpkm_matched, tmp)
+}
+
+
+
+# Visualize the matched expression
+bind_rows(tib_fpkm %>%
+            add_column(class = "all_genes"),
+          tib_fpkm[idx, ] %>%
+            add_column(class = "active_genes"),
+          tib_fpkm_matched %>%
+            add_column(class = "matched_genes")) %>%
+  mutate(class = factor(class, c("all_genes", "active_genes", "matched_genes")),
+         overlap_LAD = ifelse(overlap_LAD, "LAD", "iLAD"),
+         overlap_LAD = factor(overlap_LAD, c("iLAD", "LAD"))) %>%
+  ggplot(aes(x = overlap_LAD, y = log2(WT_0h+1), fill = overlap_LAD)) +
+  geom_violin() +
+  geom_hline(yintercept = log2(cutoff+1), linetype = "dashed", col = "red") +
+  xlab("Gene positioning") +
+  ylab("log2(FPKM + 1)") +
+  scale_fill_grey(guide = F) +
+  facet_grid(. ~ class) +
+  theme_bw() + 
+  theme(aspect.ratio = 1)
+
+
+
+# Match the matched set with the other objects 
+idx_match <- match(tib_fpkm_matched$ensembl_id, genes_active$gene_id)
+genes_matched <- genes_active[idx_match]
+gr_results_matched <- gr_results[idx_match]
+
+PlotFeatureEnrichment(genes_matched, gr_results_matched, LADs, 
+                      main = "LADs (matched genes)", ymax_fraction = 1, 
+                      which_tests = tests, i = i_total)
+
+output_list <- LADBorderClasses(plt_genes = genes_matched, 
+                                plt_results = gr_results_matched,
+                                plt_borders = LAD.borders,
+                                plt_LADs = LADs,
+                                plt_fpkm = tib_fpkm_matched,
+                                tests = tests,
+                                main = "LAD borders (matched genes)")
+
+```
+
+Yes, this is very clear. Analyses are easily biased because LAD genes are
+different from iLAD genes. However, when working with a matched expression set,
+I no longer find that LAD genes are enriched in the affected genes. This is a
+fine (negative) conclusion.
+
+
+### x. Save data
+
+```{r save data}
+
+# Save the significant tests for another document
+saveRDS(tests, file.path(output_dir, "significant_tests.rds"))
+saveRDS(idx, file.path(output_dir, "genes_expression_idx.rds"))
+
+```
+     
+
+### Conclusion
+
+LADs are depleted in CTCF sites, which seems the reason that LAD genes are not
+as strongly affected by AID depletions of cohesin looping factors.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```
